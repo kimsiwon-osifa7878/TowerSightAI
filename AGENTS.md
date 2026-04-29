@@ -1,0 +1,68 @@
+# AGENTS.md
+
+This repository implements TowerSightAI, an AI safety monitoring system for a parking machine. All agents must preserve the safety-first behavior described in `docs/주차기_AI_안전감시_시스템_설계안.md`.
+
+## Required Context
+
+Read these before implementation work:
+
+- `docs/주차기_AI_안전감시_시스템_설계안.md`
+- `docs/implementation/system-architecture.md`
+- `docs/implementation/camera-and-config.md`
+- `docs/implementation/hailo-gstreamer.md`
+- `docs/implementation/ai-stages.md`
+- `docs/implementation/ui-and-calibration.md`
+- `docs/implementation/testing-strategy.md`
+- `docs/implementation/implementation-roadmap.md`
+
+Reference hardware experiments:
+
+- `refers/detection.py`: single-stream Hailo pipeline pattern.
+- `refers/callback_template.py`: `hailopython` callback contract.
+- `refers/multi_stream_detection_rtsp.sh`: official-style multi-RTSP Hailo pipeline shape.
+- `refers/test02.py`: low-latency RTSP-to-appsink preview pattern.
+- `refers/multi.py` and `refers/test01.py`: experimental references only; verify before reuse.
+
+## Project Rules
+
+- Default to NG when uncertain. Never send PLC OK on missing camera frames, low confidence, invalid calibration, unknown PLC state, or possible human/obstacle presence.
+- Do not commit or introduce real camera credentials, RTSP URLs with passwords, PLC secrets, `.env`, or local Hailo install paths.
+- Keep all deployment-specific values in `.env`, `.env.example`, or typed config files. `.env.example` must contain placeholders only.
+- Product code must target Ubuntu. Windows may be used for editing and non-hardware tests only.
+- Keep `refers/` unchanged unless the user explicitly asks to edit reference code.
+
+## Architecture Boundaries
+
+- Camera ingest owns RTSP/GStreamer connectivity and health.
+- Hailo inference owns HEF/postprocess configuration and normalized detection events.
+- AI stage logic owns vehicle, plate, alignment, person, obstacle, and in-vehicle occupancy decisions.
+- State machine owns legal transitions and conservative gating.
+- PLC adapter owns external communication and must be mockable.
+- UI owns driver display, settings, camera preview, and calibration interaction.
+
+## Implementation Order
+
+Follow `docs/implementation/implementation-roadmap.md` as the source of truth for implementation order. In short:
+
+1. Configuration schema and `.env.example`.
+2. Camera ingest and health checks.
+3. Hailo multi-stream inference and callback result normalization.
+4. State machine and PLC adapter interface.
+5. Driver UI and calibration tools.
+6. Stage-specific AI decision logic.
+7. Hardware smoke scripts and deployment notes.
+
+## Test Rules
+
+- Add tests with each feature. Do not leave major behavior untested.
+- Unit tests should run without live RTSP cameras, Hailo-8, or PLC.
+- Hardware tests must be clearly marked and skippable.
+- Every state transition that can affect PLC OK/NG must have tests for success, failure, and uncertainty.
+
+## External References
+
+- Hailo-8 M.2: https://hailo.ai/products/ai-accelerators/hailo-8-m2-ai-acceleration-module/
+- TAPPAS multi-stream detection: https://github.com/hailo-ai/tappas/tree/master/apps/h8/gstreamer/general/multistream_detection
+- Hailo `hailopython`: https://github.com/hailo-ai/tappas/blob/master/docs/elements/hailo_python.rst
+- Hailo `hailoroundrobin`: https://github.com/hailo-ai/tappas/blob/master/docs/elements/hailo_roundrobin.rst
+- Hailo `hailostreamrouter`: https://github.com/hailo-ai/tappas/blob/master/docs/elements/hailo_stream_router.rst
