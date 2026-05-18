@@ -23,13 +23,35 @@ TowerSightAI는 주차기 내부의 4대 카메라와 Hailo 기반 객체 인식
 
 현재 코드는 제품 골격과 안전 게이트의 기초만 포함합니다. 다음 기능은 아직 실제 동작 구현이 아닙니다.
 
-- `.env` 파일을 자동으로 읽어 `Settings`를 생성하는 로더
-- 실제 RTSP 연결/프레임 수신 및 카메라 health tracking
 - 실제 Hailo `hailopython` callback과 detection event 정규화
 - 차량/번호판/정렬/사람/장애물/차내 탑승자 AI 판정 로직
 - 실제 PLC 통신 어댑터
 - 운전자 UI, 설정 화면, 캘리브레이션 도구
 - Ubuntu/Hailo 장비용 하드웨어 smoke test 스크립트
+
+
+## 실제 설정 확인 CLI
+
+로컬 장비 또는 Ubuntu/Hailo 타깃에서 실제 `.env`를 읽어 설정, 카메라, Hailo 설치 상태를 점검할 수 있습니다. 이 명령은 **점검 전용**이며 PLC OK 신호를 승인하지 않습니다. 실패하거나 불확실한 항목은 NG로 표시합니다.
+
+```bash
+# .env 구조와 카메라 설정을 마스킹된 값으로 확인
+python -m towersightai.cli.check_settings --env .env
+
+# 정상 설정된 카메라의 GStreamer 프리뷰 창 실행
+python -m towersightai.cli.check_settings --env .env --preview-cameras
+
+# 정상 설정된 카메라별 1프레임 수신 health check
+python -m towersightai.cli.check_settings --env .env --health-check-cameras
+
+# HailoRT, Hailo GStreamer 요소, HEF/postprocess 경로 확인
+python -m towersightai.cli.check_settings --env .env --check-hailo
+
+# 프리뷰 대상만 마스킹하여 확인하고 실제 창은 띄우지 않음
+python -m towersightai.cli.check_settings --env .env --preview-cameras --dry-run
+```
+
+카메라 설정 확인은 부분 설정을 허용합니다. 예를 들어 4대 중 1대만 `CAMERA_N_ID`, `CAMERA_N_ROLE`, `CAMERA_N_RTSP_URL`이 채워져 있어도 해당 카메라만 프리뷰/health check 대상으로 선택할 수 있습니다. 반면 제품 런타임용 `Settings` 검증은 기존처럼 4대 카메라와 필수 역할이 모두 유효해야 통과합니다.
 
 ## 프로젝트 구조
 

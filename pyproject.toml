@@ -14,3 +14,6 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[project.scripts]
+towersightai-check-settings = "towersightai.cli.check_settings:main"
