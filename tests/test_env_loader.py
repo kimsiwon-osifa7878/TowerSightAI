@@ -37,6 +37,7 @@ CAMERA_3_RTSP_URL=rtsp://user:secret@192.0.2.3/stream1
 CALIBRATION_PATH=data/calibration/site.json
 PLC_ENDPOINT=tcp://127.0.0.1:502
 UI_FULLSCREEN=false
+UI_CAMERA_RESOLUTION=1024x576
 """.strip(),
         encoding="utf-8",
     )
@@ -55,6 +56,8 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
 
     assert settings.log_level == "DEBUG"
     assert settings.ui_fullscreen is False
+    assert settings.ui_camera_resolution.width == 1024
+    assert settings.ui_camera_resolution.height == 576
     assert [camera.id for camera in settings.cameras] == ["ceiling", "front", "rear_side", "opposite_side"]
 
 
@@ -73,4 +76,15 @@ def test_invalid_bool_raises(tmp_path: Path):
     env_path.write_text(env_path.read_text(encoding="utf-8").replace("UI_FULLSCREEN=false", "UI_FULLSCREEN=maybe"), encoding="utf-8")
 
     with pytest.raises(ValueError, match="Invalid boolean"):
+        load_settings_from_env(env_path)
+
+
+def test_invalid_ui_camera_resolution_raises(tmp_path: Path):
+    env_path = _write_env(tmp_path / ".env")
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace("UI_CAMERA_RESOLUTION=1024x576", "UI_CAMERA_RESOLUTION=wide"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="WIDTHxHEIGHT"):
         load_settings_from_env(env_path)

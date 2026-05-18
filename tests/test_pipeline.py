@@ -1,12 +1,30 @@
 from pathlib import Path
 
-from towersightai.camera.pipeline import redact_rtsp
+from towersightai.camera.pipeline import build_preview_pipeline, redact_rtsp
 from towersightai.config.settings import Settings
 from towersightai.inference.pipeline import build_multistream_hailo_pipeline
 
 
 def test_redact_rtsp_password():
     assert redact_rtsp("rtsp://user:secret@192.168.0.1/stream") == "rtsp://***:***@192.168.0.1/stream"
+
+
+def test_preview_pipeline_uses_default_display_resolution():
+    s = Settings(
+        tappas_workspace=Path("/opt/hailo/tappas"),
+        hailo_hef_path=Path("/opt/hailo/model.hef"),
+        hailo_postprocess_so=Path("/opt/hailo/post.so"),
+        camera_1={"id": "front", "role": "front", "rtsp_url": "rtsp://a"},
+        camera_2={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://b"},
+        camera_3={"id": "rear_side", "role": "rear_side", "rtsp_url": "rtsp://c"},
+        camera_4={"id": "opposite_side", "role": "opposite_side", "rtsp_url": "rtsp://d"},
+        calibration_path=Path("data/calibration/site.json"),
+        plc_endpoint="tcp://127.0.0.1:502",
+    )
+
+    pipeline = build_preview_pipeline(s.camera_1)
+
+    assert "video/x-raw,format=RGB,width=1280,height=720" in pipeline
 
 
 def test_multistream_pipeline_includes_hailo_elements(tmp_path: Path):

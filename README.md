@@ -114,6 +114,7 @@ python -m pip install -e . pytest
    - `HAILO_POSTPROCESS_SO`: Hailo postprocess `.so` 경로
    - `CALIBRATION_PATH`: 캘리브레이션 JSON 경로
    - `PLC_ENDPOINT`: PLC 또는 simulator endpoint
+   - `UI_CAMERA_RESOLUTION`: 운전자 표시/preview 카메라 해상도. `WIDTHxHEIGHT` 형식이며 기본값은 `1280x720`입니다.
 
 3. 실제 비밀번호, 실제 RTSP URL, PLC secret, 로컬 Hailo 설치 경로는 커밋하지 마세요. `.env.example`에는 placeholder만 유지해야 합니다.
 
@@ -165,7 +166,7 @@ print(pipeline)
 `build_preview_pipeline()`은 다음 형태의 preview/appsink 파이프라인 문자열을 만듭니다.
 
 ```text
-rtspsrc location=<rtsp-url> latency=<ms> ! rtph264depay ! h264parse ! decodebin ! videoconvert ! video/x-raw,format=RGB ! appsink sync=false drop=true max-buffers=2
+rtspsrc location=<rtsp-url> latency=<ms> ! rtph264depay ! h264parse ! decodebin ! videoconvert ! videoscale ! video/x-raw,format=RGB,width=1280,height=720 ! appsink sync=false drop=true max-buffers=2
 ```
 
 ### 3. Hailo 멀티스트림 파이프라인 생성

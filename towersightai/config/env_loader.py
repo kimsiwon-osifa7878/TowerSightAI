@@ -94,6 +94,7 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
         calibration_path=Path(values["CALIBRATION_PATH"]),
         plc_endpoint=values["PLC_ENDPOINT"],
         ui_fullscreen=_parse_bool(values.get("UI_FULLSCREEN", "true")),
+        ui_camera_resolution=values.get("UI_CAMERA_RESOLUTION", "1280x720"),
     )
 
 

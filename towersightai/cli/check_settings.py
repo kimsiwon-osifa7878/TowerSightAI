@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Iterable
 
 from towersightai.camera.preview import launch_camera_previews, run_camera_health_check
-from towersightai.config.env_loader import CameraInspection, inspect_env, load_settings_from_env
+from towersightai.config.env_loader import CameraInspection, inspect_env, load_settings_from_env, parse_env_file
+from towersightai.config.settings import CameraResolution, parse_camera_resolution
 from towersightai.inference.hailo_check import check_hailo_installation
 
 
@@ -20,12 +21,18 @@ def main(argv: list[str] | None = None) -> int:
     _print_camera_report(inspection.cameras)
 
     selected_cameras = _select_cameras(inspection.configured_cameras, args.camera)
+    ui_camera_resolution = _read_ui_camera_resolution(args.env)
     exit_code = 0
 
     if args.health_check_cameras:
         print("\n[CAMERA HEALTH]")
         for camera in selected_cameras:
-            result = run_camera_health_check(camera, timeout_seconds=args.timeout, latency_ms=args.latency_ms)
+            result = run_camera_health_check(
+                camera,
+                timeout_seconds=args.timeout,
+                latency_ms=args.latency_ms,
+                resolution=ui_camera_resolution,
+            )
             status = "OK" if result.healthy else "NG"
             detail = "frame received" if result.healthy else result.error
             print(f"{result.camera_id:<14} {result.role:<14} {status:<3} {detail}")
@@ -42,7 +49,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{camera.id or camera.index}: {camera.redacted_rtsp_url}")
         else:
             print("Launching GStreamer preview windows. Press Ctrl+C to stop.")
-            processes = launch_camera_previews(selected_cameras, latency_ms=args.latency_ms)
+            processes = launch_camera_previews(
+                selected_cameras,
+                latency_ms=args.latency_ms,
+                resolution=ui_camera_resolution,
+            )
             try:
                 while any(process.poll() is None for process in processes):
                     time.sleep(0.5)
@@ -110,6 +121,14 @@ def _select_cameras(cameras: Iterable[CameraInspection], selectors: list[str] | 
         return camera_list
     selector_set = set(selectors)
     return [camera for camera in camera_list if camera.id in selector_set or camera.role in selector_set]
+
+
+def _read_ui_camera_resolution(env_path: Path) -> CameraResolution:
+    try:
+        values = parse_env_file(env_path)
+    except FileNotFoundError:
+        return CameraResolution()
+    return parse_camera_resolution(values.get("UI_CAMERA_RESOLUTION", "1280x720"))
 
 
 if __name__ == "__main__":

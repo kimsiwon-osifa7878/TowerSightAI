@@ -51,6 +51,7 @@ CAMERA_4_PASSWORD=password
 CALIBRATION_PATH=data/calibration/site.json
 PLC_ENDPOINT=tcp://127.0.0.1:502
 UI_FULLSCREEN=true
+UI_CAMERA_RESOLUTION=1280x720
 ```
 
 If the RTSP URL already embeds credentials, keep separate username/password only when needed by setup tools. Product logs must redact credentials from URLs.
@@ -65,7 +66,7 @@ rtph264depay ! h264parse ! decodebin !
 videoconvert ! video/x-raw,format=RGB
 ```
 
-For preview-only paths, `appsink sync=false drop=true max-buffers=<small>` is acceptable. For Hailo inference paths, normalize to the model input size and format required by the HEF.
+For preview-only and driver-display paths, scale decoded frames to `UI_CAMERA_RESOLUTION`; the default is `1280x720`. `appsink sync=false drop=true max-buffers=<small>` is acceptable for preview-only paths. For Hailo inference paths, normalize to the model input size and format required by the HEF.
 
 ## Health Checks
 
