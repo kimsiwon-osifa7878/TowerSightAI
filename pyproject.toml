@@ -12,8 +12,19 @@ dependencies = [
   "pydantic-settings>=2.2",
 ]
 
+[project.optional-dependencies]
+ui = [
+  "opencv-python>=4.8",
+  "PyQt6>=6.6",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.setuptools.packages.find]
+include = ["towersightai*"]
+exclude = ["refers*"]
+
 [project.scripts]
 towersightai-check-settings = "towersightai.cli.check_settings:main"
+towersightai-operator-ui = "towersightai.cli.operator_ui:main"
