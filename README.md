@@ -80,6 +80,10 @@ UI 런타임에는 `PyQt6`와 `opencv-python`이 필요합니다. OpenCV가 GStr
 - 오른쪽 상태 패널은 런타임 카메라 상태를 반영해 `카메라 2/4 차단`처럼 표시
 - RTSP 초기 연결 실패 또는 프레임 지연 시 worker가 종료되지 않고 재연결 시도
 
+![TowerSightAI operator UI camera preview](docs/assets/operator-ui-camera-preview.png)
+
+위 캡처는 `.venv` 환경에서 `towersightai-operator-ui --env .env --windowed` 실행 후 실제 화면을 검증한 결과입니다. 상단의 `천장 버드뷰`, `정면` 카메라는 RTSP 프레임을 정상 수신하고, 하단의 좌측면/우측면 카메라는 연결 이상으로 NG 표시됩니다. 상태 패널은 현재 카메라 상태를 `카메라 2/4 차단`으로 요약하며, PLC/Hailo/캘리브레이션이 확인되지 않았기 때문에 전체 안전 상태는 계속 `NG`로 유지됩니다.
+
 ## 화면 캡처 기반 UI 검증
 
 Ubuntu 데스크톱 세션에서 `gnome-screenshot`, `xdotool`, `imagemagick`을 설치하면 실제 화면 검증 루프를 실행할 수 있습니다.
