@@ -32,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout,
                 latency_ms=args.latency_ms,
                 resolution=ui_camera_resolution,
+                transport=args.rtsp_transport,
             )
             status = "OK" if result.healthy else "NG"
             detail = "frame received" if result.healthy else result.error
@@ -53,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
                 selected_cameras,
                 latency_ms=args.latency_ms,
                 resolution=ui_camera_resolution,
+                transport=args.rtsp_transport,
             )
             try:
                 while any(process.poll() is None for process in processes):
@@ -93,6 +95,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Print redacted targets without launching preview processes.")
     parser.add_argument("--timeout", type=int, default=10, help="Timeout in seconds for health and Hailo checks.")
     parser.add_argument("--latency-ms", type=int, default=100, help="RTSP latency for generated GStreamer pipelines.")
+    parser.add_argument(
+        "--rtsp-transport",
+        choices=("tcp", "udp"),
+        default="tcp",
+        help="RTSP transport for camera checks and previews. TCP is reliable; UDP can reduce LAN latency.",
+    )
     return parser
 
 

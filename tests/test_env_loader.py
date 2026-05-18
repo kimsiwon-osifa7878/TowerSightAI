@@ -61,6 +61,25 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
     assert [camera.id for camera in settings.cameras] == ["ceiling", "front", "rear_side", "opposite_side"]
 
 
+def test_load_settings_from_env_expands_home_and_config_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    env_path = _write_env(tmp_path / ".env")
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        .replace("TAPPAS_WORKSPACE=/opt/hailo/tappas", "TAPPAS_WORKSPACE=~/hailotappas/tappas")
+        .replace("HAILO_HEF_PATH=/opt/hailo/model.hef", "HAILO_HEF_PATH=${TAPPAS_WORKSPACE}/model.hef")
+        .replace("HAILO_POSTPROCESS_SO=/opt/hailo/post.so", "HAILO_POSTPROCESS_SO=$TAPPAS_WORKSPACE/post.so"),
+        encoding="utf-8",
+    )
+
+    settings = load_settings_from_env(env_path)
+
+    assert settings.tappas_workspace == home / "hailotappas" / "tappas"
+    assert settings.hailo_hef_path == home / "hailotappas" / "tappas" / "model.hef"
+    assert settings.hailo_postprocess_so == home / "hailotappas" / "tappas" / "post.so"
+
+
 def test_inspect_env_allows_partial_camera_configuration(tmp_path: Path):
     result = inspect_env(_write_env(tmp_path / ".env", omit_camera_4=True))
 

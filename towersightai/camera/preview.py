@@ -4,9 +4,11 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol, Sequence
+from typing import Literal, Protocol, Sequence
 
 from towersightai.config.settings import CameraResolution, parse_camera_resolution
+
+RtspTransport = Literal["tcp", "udp"]
 
 
 class CameraInspectionLike(Protocol):
@@ -32,11 +34,14 @@ def build_display_preview_pipeline(
     rtsp_url: str,
     latency_ms: int = 100,
     resolution: CameraResolution | tuple[int, int] | str = CameraResolution(),
+    transport: RtspTransport = "tcp",
 ) -> str:
     camera_resolution = _as_resolution(resolution)
+    rtsp_source = _rtsp_source(rtsp_url, latency_ms, transport)
     return (
-        f"rtspsrc location={rtsp_url} latency={latency_ms} protocols=tcp ! "
-        "rtph264depay ! h264parse ! avdec_h264 ! videoscale ! "
+        f"{rtsp_source} rtph264depay ! h264parse ! avdec_h264 ! "
+        "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+        "videoscale ! "
         f"video/x-raw,{camera_resolution.caps} ! videoconvert ! "
         "fpsdisplaysink video-sink=autovideosink sync=false text-overlay=true"
     )
@@ -46,9 +51,11 @@ def build_health_check_pipeline(
     rtsp_url: str,
     latency_ms: int = 100,
     resolution: CameraResolution | tuple[int, int] | str | None = None,
+    transport: RtspTransport = "tcp",
 ) -> str:
+    rtsp_source = _rtsp_source(rtsp_url, latency_ms, transport)
     return (
-        f"rtspsrc location={rtsp_url} latency={latency_ms} protocols=tcp ! "
+        f"{rtsp_source} "
         "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
         "video/x-raw,format=RGB ! fakesink sync=false num-buffers=1"
     )
@@ -60,14 +67,25 @@ def configured_camera_command(
     preview: bool,
     latency_ms: int = 100,
     resolution: CameraResolution | tuple[int, int] | str = CameraResolution(),
+    transport: RtspTransport = "tcp",
     gst_launch: str = "gst-launch-1.0",
 ) -> list[str]:
     if not camera.configured or not camera.rtsp_url:
         raise ValueError(f"Camera {camera.index} is not fully configured")
     pipeline = (
-        build_display_preview_pipeline(camera.rtsp_url, latency_ms=latency_ms, resolution=resolution)
+        build_display_preview_pipeline(
+            camera.rtsp_url,
+            latency_ms=latency_ms,
+            resolution=resolution,
+            transport=transport,
+        )
         if preview
-        else build_health_check_pipeline(camera.rtsp_url, latency_ms=latency_ms, resolution=resolution)
+        else build_health_check_pipeline(
+            camera.rtsp_url,
+            latency_ms=latency_ms,
+            resolution=resolution,
+            transport=transport,
+        )
     )
     return [gst_launch, "-q", *pipeline.split()]
 
@@ -78,6 +96,7 @@ def run_camera_health_check(
     timeout_seconds: int = 10,
     latency_ms: int = 100,
     resolution: CameraResolution | tuple[int, int] | str = CameraResolution(),
+    transport: RtspTransport = "tcp",
     gst_launch: str = "gst-launch-1.0",
 ) -> CameraHealthResult:
     checked_at = datetime.now(timezone.utc)
@@ -94,6 +113,7 @@ def run_camera_health_check(
         preview=False,
         latency_ms=latency_ms,
         resolution=resolution,
+        transport=transport,
         gst_launch=gst_launch,
     )
     try:
@@ -112,6 +132,7 @@ def launch_camera_previews(
     *,
     latency_ms: int = 100,
     resolution: CameraResolution | tuple[int, int] | str = CameraResolution(),
+    transport: RtspTransport = "tcp",
     gst_launch: str = "gst-launch-1.0",
 ) -> list[subprocess.Popen[str]]:
     if shutil.which(gst_launch) is None:
@@ -126,10 +147,20 @@ def launch_camera_previews(
             preview=True,
             latency_ms=latency_ms,
             resolution=resolution,
+            transport=transport,
             gst_launch=gst_launch,
         )
         processes.append(subprocess.Popen(command, text=True))
     return processes
+
+
+def _rtsp_source(rtsp_url: str, latency_ms: int, transport: RtspTransport) -> str:
+    if transport not in ("tcp", "udp"):
+        raise ValueError(f"unsupported RTSP transport: {transport}")
+    return (
+        f"rtspsrc location={rtsp_url} latency={latency_ms} protocols={transport} "
+        "drop-on-latency=true !"
+    )
 
 
 def _as_resolution(resolution: CameraResolution | tuple[int, int] | str) -> CameraResolution:

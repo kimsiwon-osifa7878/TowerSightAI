@@ -41,6 +41,9 @@ python -m towersightai.cli.check_settings --env .env
 # 정상 설정된 카메라의 GStreamer 프리뷰 창 실행
 python -m towersightai.cli.check_settings --env .env --preview-cameras
 
+# 안정적인 LAN에서 RTSP UDP 전송으로 preview 지연을 비교
+python -m towersightai.cli.check_settings --env .env --preview-cameras --rtsp-transport udp
+
 # 정상 설정된 카메라별 1프레임 수신 health check
 python -m towersightai.cli.check_settings --env .env --health-check-cameras
 
@@ -166,8 +169,10 @@ print(pipeline)
 `build_preview_pipeline()`은 다음 형태의 preview/appsink 파이프라인 문자열을 만듭니다.
 
 ```text
-rtspsrc location=<rtsp-url> latency=<ms> ! rtph264depay ! h264parse ! decodebin ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! video/x-raw,format=RGB ! appsink sync=false drop=true max-buffers=2
+rtspsrc location=<rtsp-url> latency=<ms> protocols=tcp drop-on-latency=true ! rtph264depay ! h264parse ! decodebin ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! video/x-raw,format=RGB ! appsink sync=false drop=true max-buffers=1
 ```
+
+Tapo-C310은 카메라 사양상 15fps 장비이므로 preview FPS가 약 15로 보이면 정상 상한일 수 있습니다. 이 경우 목표는 FPS를 30으로 올리는 것이 아니라 프레임 적체 없이 최신 프레임을 안정적으로 표시하는 것입니다.
 
 ### 3. Hailo 멀티스트림 파이프라인 생성
 

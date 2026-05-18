@@ -24,8 +24,11 @@ def test_preview_pipeline_uses_default_display_resolution():
 
     pipeline = build_preview_pipeline(s.camera_1)
 
+    assert "protocols=tcp drop-on-latency=true" in pipeline
+    assert "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream" in pipeline
     assert "video/x-raw,width=1280,height=720" in pipeline
     assert "video/x-raw,format=RGB" in pipeline
+    assert "appsink sync=false drop=true max-buffers=1" in pipeline
 
 
 def test_multistream_pipeline_includes_hailo_elements(tmp_path: Path):

@@ -5,7 +5,8 @@ from towersightai.config.env_loader import CameraInspection
 def test_display_preview_pipeline_uses_autovideosink():
     pipeline = build_display_preview_pipeline("rtsp://camera/stream", latency_ms=50)
 
-    assert "rtspsrc location=rtsp://camera/stream latency=50 protocols=tcp" in pipeline
+    assert "rtspsrc location=rtsp://camera/stream latency=50 protocols=tcp drop-on-latency=true" in pipeline
+    assert "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream" in pipeline
     assert "video/x-raw,width=1280,height=720" in pipeline
     assert "fpsdisplaysink" in pipeline
     assert "autovideosink" in pipeline
@@ -21,8 +22,15 @@ def test_health_check_pipeline_reads_one_frame_to_fakesink():
     pipeline = build_health_check_pipeline("rtsp://camera/stream")
 
     assert "width=1280,height=720" not in pipeline
+    assert "drop-on-latency=true" in pipeline
     assert "fakesink" in pipeline
     assert "num-buffers=1" in pipeline
+
+
+def test_display_preview_pipeline_can_use_udp_transport():
+    pipeline = build_display_preview_pipeline("rtsp://camera/stream", transport="udp")
+
+    assert "protocols=udp" in pipeline
 
 
 def test_configured_camera_command_rejects_incomplete_camera():

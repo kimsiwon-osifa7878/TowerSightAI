@@ -13,13 +13,19 @@ def build_preview_pipeline(
     camera: CameraConfig,
     latency_ms: int = 100,
     resolution: CameraResolution | tuple[int, int] | str = CameraResolution(),
+    transport: str = "tcp",
 ) -> str:
+    if transport not in ("tcp", "udp"):
+        raise ValueError(f"unsupported RTSP transport: {transport}")
     camera_resolution = _as_resolution(resolution)
     return (
-        f"rtspsrc location={camera.rtsp_url} latency={latency_ms} ! "
-        "rtph264depay ! h264parse ! decodebin ! videoscale ! "
+        f"rtspsrc location={camera.rtsp_url} latency={latency_ms} protocols={transport} "
+        "drop-on-latency=true ! "
+        "rtph264depay ! h264parse ! decodebin ! "
+        "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+        "videoscale ! "
         f"video/x-raw,{camera_resolution.caps} ! videoconvert ! "
-        "video/x-raw,format=RGB ! appsink sync=false drop=true max-buffers=2"
+        "video/x-raw,format=RGB ! appsink sync=false drop=true max-buffers=1"
     )
 
 

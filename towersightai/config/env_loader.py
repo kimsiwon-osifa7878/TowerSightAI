@@ -83,15 +83,15 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
     return Settings(
         app_env=values.get("APP_ENV", "development"),
         log_level=values.get("LOG_LEVEL", "INFO"),
-        tappas_workspace=Path(values["TAPPAS_WORKSPACE"]),
-        hailo_hef_path=Path(values["HAILO_HEF_PATH"]),
-        hailo_postprocess_so=Path(values["HAILO_POSTPROCESS_SO"]),
+        tappas_workspace=_expand_config_path(values["TAPPAS_WORKSPACE"], values),
+        hailo_hef_path=_expand_config_path(values["HAILO_HEF_PATH"], values),
+        hailo_postprocess_so=_expand_config_path(values["HAILO_POSTPROCESS_SO"], values),
         hailo_network_name=values.get("HAILO_NETWORK_NAME", "yolov5"),
         camera_1=_camera_dict(values, 1),
         camera_2=_camera_dict(values, 2),
         camera_3=_camera_dict(values, 3),
         camera_4=_camera_dict(values, 4),
-        calibration_path=Path(values["CALIBRATION_PATH"]),
+        calibration_path=_expand_config_path(values["CALIBRATION_PATH"], values),
         plc_endpoint=values["PLC_ENDPOINT"],
         ui_fullscreen=_parse_bool(values.get("UI_FULLSCREEN", "true")),
         ui_camera_resolution=values.get("UI_CAMERA_RESOLUTION", "1280x720"),
@@ -168,6 +168,20 @@ def _parse_bool(value: str) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     raise ValueError(f"Invalid boolean value: {value}")
+
+
+def _expand_config_path(value: str, values: Mapping[str, str]) -> Path:
+    expanded = _expand_mapping_variables(value, values)
+    return Path(expanded).expanduser()
+
+
+def _expand_mapping_variables(value: str, values: Mapping[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        braced_name, plain_name = match.groups()
+        name = braced_name or plain_name
+        return values.get(name, match.group(0))
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, value)
 
 
 def _redact_rtsp(rtsp_url: str) -> str:

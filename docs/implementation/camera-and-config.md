@@ -68,6 +68,8 @@ videoconvert ! video/x-raw,format=RGB
 
 For preview-only and driver-display paths, scale decoded frames to `UI_CAMERA_RESOLUTION`; the default is `1280x720`. Apply width/height caps separately from RGB conversion to keep GStreamer negotiation compatible with RTSP decoders. Health-check paths should stay minimal and only verify that a fresh frame can be decoded. `appsink sync=false drop=true max-buffers=<small>` is acceptable for preview-only paths. For Hailo inference paths, normalize to the model input size and format required by the HEF.
 
+Tapo-C310 cameras are specified at 15 fps, so a healthy `stream1` preview may report about 15 fps even when the GStreamer pipeline is working correctly. Optimize preview paths for low latency and stable freshness rather than assuming a 30 fps source. Use `drop-on-latency=true`, small/leaky preview queues, and `appsink sync=false drop=true max-buffers=1` for preview-only frame capture. TCP remains the default transport for reliability; UDP may be tested on a stable LAN when lower latency matters more than packet-loss recovery.
+
 ## Health Checks
 
 Each camera must expose:
