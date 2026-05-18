@@ -2,7 +2,7 @@
 
 TowerSightAI는 주차기 내부의 4대 카메라와 Hailo 기반 객체 인식을 이용해 차량 진입, 주차 위치 정렬, 사람/장애물 존재 여부를 보수적으로 판단하기 위한 **AI 안전감시 시스템 코어**입니다.
 
-현재 저장소는 전체 제품 중 초기 구현 단계로, 실제 RTSP 카메라·Hailo-8·PLC 장비 없이도 검증할 수 있는 설정 모델, GStreamer/Hailo 파이프라인 문자열 생성, 상태 전이 코어, Fake PLC 어댑터와 단위 테스트를 포함합니다.
+현재 저장소는 전체 제품 중 초기 구현 단계로, 실제 RTSP 카메라 일부를 표시할 수 있는 운전자 UI, 설정 모델, GStreamer/Hailo 파이프라인 문자열 생성, 상태 전이 코어, Fake PLC 어댑터와 단위 테스트를 포함합니다. Hailo-8·PLC 장비 없이도 기본 검증이 가능하도록 하드웨어 의존 영역은 분리되어 있습니다.
 
 > 안전 원칙: 입력이 불확실하거나 누락된 경우에는 OK를 내보내지 않고 NG/대기 상태를 유지해야 합니다. 카메라 프레임 누락, 낮은 신뢰도, 잘못된 캘리브레이션, 알 수 없는 PLC 상태, 사람/장애물 가능성이 있는 경우 모두 최종 OK를 차단하는 방향으로 구현해야 합니다.
 
@@ -17,7 +17,9 @@ TowerSightAI는 주차기 내부의 4대 카메라와 Hailo 기반 객체 인식
 | Hailo 추론 파이프라인 | `towersightai/inference/pipeline.py` | 4개 RTSP 입력을 `hailoroundrobin -> hailonet -> hailofilter -> hailopython -> hailostreamrouter`로 연결하는 멀티스트림 파이프라인 문자열 생성 |
 | 상태 머신 | `towersightai/state_machine/core.py` | 설계 문서의 공개 상태 정의와 허용된 전이만 통과시키는 `SafetyStateMachine` 구현 |
 | PLC 어댑터 | `towersightai/plc/adapter.py` | 실제 PLC 프로토콜 확정 전 테스트용 `FakePLCAdapter` 제공 |
-| 테스트 | `tests/` | 설정 검증, RTSP 마스킹, Hailo 파이프라인 요소 포함 여부, 정상/불법 상태 전이 테스트 |
+| 운전자 UI | `towersightai/ui/`, `towersightai/cli/operator_ui.py` | PyQt6 기반 2x2 카메라 화면, RTSP 프레임 표시, 카메라 NG/정상 상태 표시, 보수적 최종 OK 차단 UI |
+| UI 검증 도구 | `tools/verify_operator_ui_screenshot.sh` | operator UI 실행, 화면 캡처, ImageMagick 메타데이터 확인을 한 번에 수행 |
+| 테스트 | `tests/` | 설정 검증, RTSP 마스킹, Hailo 파이프라인 요소 포함 여부, 정상/불법 상태 전이, UI 모델 안전 게이트 테스트 |
 
 ### 아직 구현되지 않은 주요 기능
 
@@ -26,7 +28,7 @@ TowerSightAI는 주차기 내부의 4대 카메라와 Hailo 기반 객체 인식
 - 실제 Hailo `hailopython` callback과 detection event 정규화
 - 차량/번호판/정렬/사람/장애물/차내 탑승자 AI 판정 로직
 - 실제 PLC 통신 어댑터
-- 운전자 UI, 설정 화면, 캘리브레이션 도구
+- 설정 화면, 캘리브레이션 도구
 - Ubuntu/Hailo 장비용 하드웨어 smoke test 스크립트
 
 
@@ -56,6 +58,48 @@ python -m towersightai.cli.check_settings --env .env --preview-cameras --dry-run
 
 카메라 설정 확인은 부분 설정을 허용합니다. 예를 들어 4대 중 1대만 `CAMERA_N_ID`, `CAMERA_N_ROLE`, `CAMERA_N_RTSP_URL`이 채워져 있어도 해당 카메라만 프리뷰/health check 대상으로 선택할 수 있습니다. 반면 제품 런타임용 `Settings` 검증은 기존처럼 4대 카메라와 필수 역할이 모두 유효해야 통과합니다.
 
+## 운전자 UI 실행
+
+operator UI는 `.env`를 읽어 4개 카메라 타일을 구성하고, 연결 가능한 RTSP 카메라는 실제 프레임을 표시합니다. 연결되지 않거나 프레임이 지연되는 카메라는 NG 상태로 유지됩니다. PLC, Hailo, 캘리브레이션이 확인되지 않은 상태에서는 카메라가 수신되어도 최종 OK를 표시하지 않습니다.
+
+```bash
+# venv 사용 권장
+source .venv/bin/activate
+towersightai-operator-ui --env .env --windowed
+
+# 또는 모듈 직접 실행
+.venv/bin/python -m towersightai.cli.operator_ui --env .env --windowed
+```
+
+UI 런타임에는 `PyQt6`와 `opencv-python`이 필요합니다. OpenCV가 GStreamer backend 없이 빌드된 환경에서도 FFmpeg RTSP fallback으로 프레임 표시를 시도합니다. GStreamer backend가 있는 환경에서는 `towersightai.camera.pipeline.build_preview_pipeline()`이 생성한 low-latency appsink pipeline을 우선 사용합니다.
+
+현재 검증된 동작:
+
+- `.env`의 `ceiling`, `front` 카메라 2대가 연결 가능한 경우 상단 2개 타일에 영상 표시
+- `rear_side`, `opposite_side` 등 미연결 카메라는 `NG: 카메라 연결 이상` 표시
+- 오른쪽 상태 패널은 런타임 카메라 상태를 반영해 `카메라 2/4 차단`처럼 표시
+- RTSP 초기 연결 실패 또는 프레임 지연 시 worker가 종료되지 않고 재연결 시도
+
+## 화면 캡처 기반 UI 검증
+
+Ubuntu 데스크톱 세션에서 `gnome-screenshot`, `xdotool`, `imagemagick`을 설치하면 실제 화면 검증 루프를 실행할 수 있습니다.
+
+```bash
+sudo apt update
+sudo apt install -y gnome-screenshot xdotool imagemagick
+WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-verification
+```
+
+검증 스크립트는 다음을 수행합니다.
+
+- `PyQt6`와 `cv2`를 모두 import할 수 있는 Python runtime 선택
+- operator UI를 windowed mode로 실행
+- 창이 뜬 뒤 `gnome-screenshot`으로 전체 화면 캡처
+- `identify`로 PNG 메타데이터 확인
+- 앱 종료
+
+생성된 스크린샷은 `tmp/operator-ui-verification/` 아래에 저장됩니다. 이 경로는 로컬 검증 산출물이므로 커밋하지 않습니다.
+
 ## 프로젝트 구조
 
 ```text
@@ -69,7 +113,8 @@ TowerSightAI/
     ├── config/                          # typed 설정 모델과 안전 검증
     ├── inference/                       # Hailo 멀티스트림 파이프라인 빌더
     ├── plc/                             # PLC 어댑터 인터페이스의 초기 fake 구현
-    └── state_machine/                   # 주차기 AI 안전 상태 머신
+    ├── state_machine/                   # 주차기 AI 안전 상태 머신
+    └── ui/                              # PyQt6 operator display model and app
 ```
 
 ## 요구 사항
@@ -79,6 +124,7 @@ TowerSightAI/
 - Python 3.11 이상
 - `pip`
 - 테스트용 의존성: `pytest`
+- UI 의존성: `PyQt6`, `opencv-python`
 
 `pyproject.toml`의 런타임 의존성은 현재 `pydantic`, `pydantic-settings`를 선언하지만, 현 코드의 `Settings`는 아직 dataclass 기반 수동 생성 방식입니다.
 
@@ -99,7 +145,7 @@ cd /workspace/TowerSightAI
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e . pytest
+python -m pip install -e ".[ui]" pytest
 ```
 
 ## 환경 설정
@@ -121,7 +167,7 @@ python -m pip install -e . pytest
 
 3. 실제 비밀번호, 실제 RTSP URL, PLC secret, 로컬 Hailo 설치 경로는 커밋하지 마세요. `.env.example`에는 placeholder만 유지해야 합니다.
 
-> 참고: 현재 코드에는 `.env` 자동 로더가 아직 없으므로, 파이썬 코드에서는 `Settings(...)`를 직접 생성해서 사용합니다.
+> 참고: CLI는 `--env .env`로 `.env`를 직접 읽습니다. 테스트나 라이브러리 코드에서는 `Settings(...)`를 직접 생성하거나 `load_settings_from_env()`를 사용할 수 있습니다.
 
 ## 사용 예시
 
@@ -254,6 +300,7 @@ pytest
 - RTSP URL credential 마스킹
 - Hailo 멀티스트림 파이프라인 필수 요소 포함 검증
 - 정상 상태 전이와 불법 상태 전이 검증
+- UI 카메라 레이아웃, 한국어 안내 문구, credential redaction, 최종 OK 안전 게이트 검증
 
 ## 개발 시 주의사항
 
@@ -270,7 +317,7 @@ pytest
 - Phase 1(Project Skeleton): 일부 구현됨
   - 설정 모델, `.env.example`, Fake PLC, 기본 테스트가 존재합니다.
 - Phase 2(Camera Ingest): 초기 일부 구현됨
-  - preview pipeline 문자열 빌더와 RTSP 마스킹만 존재합니다.
+  - preview pipeline 문자열 빌더, RTSP 마스킹, UI용 RTSP 프레임 표시와 재연결 로직이 존재합니다.
 - Phase 3(Hailo Inference): 초기 일부 구현됨
   - 멀티스트림 Hailo pipeline 문자열 빌더만 존재합니다.
-- Phase 4 이후(State Machine/PLC/UI/AI logic/Field hardening): 상태 머신의 기본 전이만 구현되어 있고, 실제 안전 게이트와 UI/AI/PLC 연동은 후속 작업입니다.
+- Phase 4 이후(State Machine/PLC/UI/AI logic/Field hardening): 상태 머신의 기본 전이와 operator display model은 구현되어 있고, 실제 AI 판정/PLC 프로토콜/캘리브레이션 UI 연동은 후속 작업입니다.
