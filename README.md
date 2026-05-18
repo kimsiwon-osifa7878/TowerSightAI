@@ -166,7 +166,7 @@ print(pipeline)
 `build_preview_pipeline()`은 다음 형태의 preview/appsink 파이프라인 문자열을 만듭니다.
 
 ```text
-rtspsrc location=<rtsp-url> latency=<ms> ! rtph264depay ! h264parse ! decodebin ! videoconvert ! videoscale ! video/x-raw,format=RGB,width=1280,height=720 ! appsink sync=false drop=true max-buffers=2
+rtspsrc location=<rtsp-url> latency=<ms> ! rtph264depay ! h264parse ! decodebin ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! video/x-raw,format=RGB ! appsink sync=false drop=true max-buffers=2
 ```
 
 ### 3. Hailo 멀티스트림 파이프라인 생성

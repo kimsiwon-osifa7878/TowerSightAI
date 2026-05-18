@@ -36,8 +36,8 @@ def build_display_preview_pipeline(
     camera_resolution = _as_resolution(resolution)
     return (
         f"rtspsrc location={rtsp_url} latency={latency_ms} protocols=tcp ! "
-        "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videoscale ! "
-        f"video/x-raw,format=RGB,{camera_resolution.caps} ! "
+        "rtph264depay ! h264parse ! avdec_h264 ! videoscale ! "
+        f"video/x-raw,{camera_resolution.caps} ! videoconvert ! "
         "fpsdisplaysink video-sink=autovideosink sync=false text-overlay=true"
     )
 
@@ -45,13 +45,12 @@ def build_display_preview_pipeline(
 def build_health_check_pipeline(
     rtsp_url: str,
     latency_ms: int = 100,
-    resolution: CameraResolution | tuple[int, int] | str = CameraResolution(),
+    resolution: CameraResolution | tuple[int, int] | str | None = None,
 ) -> str:
-    camera_resolution = _as_resolution(resolution)
     return (
         f"rtspsrc location={rtsp_url} latency={latency_ms} protocols=tcp ! "
-        "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videoscale ! "
-        f"video/x-raw,format=RGB,{camera_resolution.caps} ! fakesink sync=false num-buffers=1"
+        "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
+        "video/x-raw,format=RGB ! fakesink sync=false num-buffers=1"
     )
 
 

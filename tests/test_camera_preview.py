@@ -6,7 +6,7 @@ def test_display_preview_pipeline_uses_autovideosink():
     pipeline = build_display_preview_pipeline("rtsp://camera/stream", latency_ms=50)
 
     assert "rtspsrc location=rtsp://camera/stream latency=50 protocols=tcp" in pipeline
-    assert "video/x-raw,format=RGB,width=1280,height=720" in pipeline
+    assert "video/x-raw,width=1280,height=720" in pipeline
     assert "fpsdisplaysink" in pipeline
     assert "autovideosink" in pipeline
 
@@ -14,13 +14,13 @@ def test_display_preview_pipeline_uses_autovideosink():
 def test_display_preview_pipeline_accepts_configured_resolution():
     pipeline = build_display_preview_pipeline("rtsp://camera/stream", resolution="1024x576")
 
-    assert "video/x-raw,format=RGB,width=1024,height=576" in pipeline
+    assert "video/x-raw,width=1024,height=576" in pipeline
 
 
 def test_health_check_pipeline_reads_one_frame_to_fakesink():
     pipeline = build_health_check_pipeline("rtsp://camera/stream")
 
-    assert "video/x-raw,format=RGB,width=1280,height=720" in pipeline
+    assert "width=1280,height=720" not in pipeline
     assert "fakesink" in pipeline
     assert "num-buffers=1" in pipeline
 

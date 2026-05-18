@@ -17,8 +17,9 @@ def build_preview_pipeline(
     camera_resolution = _as_resolution(resolution)
     return (
         f"rtspsrc location={camera.rtsp_url} latency={latency_ms} ! "
-        "rtph264depay ! h264parse ! decodebin ! videoconvert ! videoscale ! "
-        f"video/x-raw,format=RGB,{camera_resolution.caps} ! appsink sync=false drop=true max-buffers=2"
+        "rtph264depay ! h264parse ! decodebin ! videoscale ! "
+        f"video/x-raw,{camera_resolution.caps} ! videoconvert ! "
+        "video/x-raw,format=RGB ! appsink sync=false drop=true max-buffers=2"
     )
 
 

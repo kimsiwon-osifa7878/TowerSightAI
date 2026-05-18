@@ -66,7 +66,7 @@ rtph264depay ! h264parse ! decodebin !
 videoconvert ! video/x-raw,format=RGB
 ```
 
-For preview-only and driver-display paths, scale decoded frames to `UI_CAMERA_RESOLUTION`; the default is `1280x720`. `appsink sync=false drop=true max-buffers=<small>` is acceptable for preview-only paths. For Hailo inference paths, normalize to the model input size and format required by the HEF.
+For preview-only and driver-display paths, scale decoded frames to `UI_CAMERA_RESOLUTION`; the default is `1280x720`. Apply width/height caps separately from RGB conversion to keep GStreamer negotiation compatible with RTSP decoders. Health-check paths should stay minimal and only verify that a fresh frame can be decoded. `appsink sync=false drop=true max-buffers=<small>` is acceptable for preview-only paths. For Hailo inference paths, normalize to the model input size and format required by the HEF.
 
 ## Health Checks
 
