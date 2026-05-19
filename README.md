@@ -325,3 +325,31 @@ pytest
 - Phase 3(Hailo Inference): 초기 일부 구현됨
   - 멀티스트림 Hailo pipeline 문자열 빌더만 존재합니다.
 - Phase 4 이후(State Machine/PLC/UI/AI logic/Field hardening): 상태 머신의 기본 전이와 operator display model은 구현되어 있고, 실제 AI 판정/PLC 프로토콜/캘리브레이션 UI 연동은 후속 작업입니다.
+
+## 예시 이미지 Hailo 디텍션 검증
+
+실제 Hailo-8/TAPPAS가 설치된 Ubuntu 타깃에서는 RTSP 카메라 연결 전에도, 안전하게 준비한 예시 이미지 1장을 Hailo 파이프라인에 통과시켜 callback과 detection 정규화가 동작하는지 확인할 수 있습니다. 이 명령은 검증 전용이며 PLC OK를 절대 승인하지 않습니다.
+
+```bash
+# 먼저 실행될 GStreamer 파이프라인만 확인합니다. 실제 Hailo는 실행하지 않습니다.
+towersightai-hailo-image-smoke --env .env --image data/samples/sanitized-car.jpg
+
+# Hailo 설치 상태까지 같이 확인합니다.
+towersightai-hailo-image-smoke --env .env --image data/samples/sanitized-car.jpg --check-installation
+
+# Ubuntu/Hailo 타깃에서 실제 실행합니다. 하드웨어 smoke는 명시적 opt-in이 필요합니다.
+RUN_HARDWARE_TESTS=1 towersightai-hailo-image-smoke \
+  --env .env \
+  --image data/samples/sanitized-car.jpg \
+  --run \
+  --event-path artifacts/hailo/sample-detections.jsonl \
+  --output-image artifacts/hailo/sample-detection.png
+```
+
+검증 파이프라인은 다음 순서로 구성됩니다.
+
+```text
+sample image -> decode/scale/convert RGB 640x640 -> hailonet -> hailofilter -> hailopython -> hailooverlay -> PNG/display/fakesink
+```
+
+`hailopython` callback은 Hailo raw detection을 `camera_id`, `label`, `confidence`, normalized `bbox`, `timestamp`, `source="hailo"` 형태의 JSONL 이벤트로 저장합니다. 이벤트가 없거나 신뢰도가 낮은 경우는 안전 판단에서 OK가 아니라 NG/대기 상태로 취급해야 합니다.
