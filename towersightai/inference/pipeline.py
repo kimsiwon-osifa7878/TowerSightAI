@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from towersightai.config.settings import Settings
+from towersightai.inference.image_smoke import HAILO_CALLBACK_MODULE
 
 
 def build_multistream_hailo_pipeline(settings: Settings) -> str:
@@ -15,7 +16,7 @@ def build_multistream_hailo_pipeline(settings: Settings) -> str:
         "hailoroundrobin name=robin ! "
         f"hailonet hef-path={settings.hailo_hef_path} batch-size=4 ! "
         f"hailofilter function-name={settings.hailo_network_name} so-path={settings.hailo_postprocess_so} qos=false ! "
-        "hailopython module=towersightai.inference.callback qos=false ! "
+        f"hailopython module={HAILO_CALLBACK_MODULE} qos=false ! "
         "hailostreamrouter name=router"
     )
 

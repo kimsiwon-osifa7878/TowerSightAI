@@ -6,5 +6,5 @@ Do not commit site camera frames, people-identifiable images, license plates, or
 Suggested local filename used in README examples:
 
 ```text
-data/samples/sanitized-car.jpg
+data/samples/test-car.png
 ```

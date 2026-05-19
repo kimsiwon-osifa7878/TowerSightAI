@@ -9,6 +9,12 @@ from towersightai.config.settings import CameraConfig, CameraRole
 from towersightai.state_machine.core import ParkingState
 
 
+class UiMode(str, Enum):
+    DRIVER = "DRIVER"
+    OPERATOR = "OPERATOR"
+    TESTS = "TESTS"
+
+
 class AlignmentResult(str, Enum):
     UNKNOWN = "unknown"
     MOVE_RIGHT = "move_right"
@@ -31,6 +37,11 @@ class PlcConnectionState(str, Enum):
     CONNECTED = "CONNECTED"
     DEGRADED = "DEGRADED"
     ERROR = "ERROR"
+
+
+class OperatorAccessState(str, Enum):
+    LOCKED = "LOCKED"
+    UNLOCKED = "UNLOCKED"
 
 
 @dataclass(frozen=True)
