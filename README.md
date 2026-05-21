@@ -14,11 +14,10 @@ Implemented:
 - Dashboard layout with ceiling birdview and front camera as primary views.
 - Ceiling birdview displayed as a vertical tile with CCW 90-degree frame rotation.
 - Collapsible sidebar with connected actions and `EMPTY` feature slots.
-- Test screen with scrollable test list and compact result rows.
 - Runtime camera capture for all configured cameras, with disconnected cameras shown as NG.
 - Hailo installation checks and sample image smoke test using `data/samples/test-car.png`.
 - Hailo callback normalization into JSONL detection events.
-- Live AI Detection overlays on camera frames.
+- Live AI inference overlays on camera frames.
 - Live Hailo multistream detection using one GStreamer pipeline:
 
   ```text
@@ -27,11 +26,13 @@ Implemented:
 
 - Bounding-box correction for the difference between source frame resolution and YOLO 640x640 letterboxed inference input.
 - Actual received frame resolution display in each camera tile.
+- Purpose-specific Hailo buttons for vehicle-only detection, LPR image checks, and person-presence detection.
+- Person-presence detection uses the TAPPAS person detector only; Re-ID embedding and gallery matching are intentionally not used.
+- Fatal Hailo/GStreamer log detection that stops stuck `gst-launch` processes instead of leaving the UI in a loading state.
 - Fake PLC adapter and state-machine core used by tests.
 
 Known gaps:
 
-- Long-running Hailo multistream watchdog is still basic. If the `gst-launch` process exits, the UI worker currently retries only twice.
 - Stage-specific AI decisions are not complete: vehicle alignment, plate recognition, person/obstacle safety fusion, and in-vehicle occupancy still need production logic.
 - Calibration editing and validation UI is not implemented yet.
 - Real PLC protocol adapter is not implemented yet.
@@ -87,7 +88,7 @@ Important values:
 - `PLC_ENDPOINT`: PLC or simulator endpoint.
 - `UI_CAMERA_RESOLUTION`: preview/display capture resolution, for example `1920x1080` or `1280x720`.
 
-Camera rotation is part of the equipment configuration. Set `CAMERA_N_ROTATION_DEGREES` to one of `0`, `90`, `180`, or `270`; `90` means CCW 90 degrees and `270` means CW 90 degrees. The default site profile uses `CAMERA_1_ROTATION_DEGREES=90` for the ceiling birdview camera and `0` for the other cameras. The operator UI rotation buttons update the runtime value, and AI Detection uses the same rotated stream that the operator sees.
+Camera rotation is part of the equipment configuration. Set `CAMERA_N_ROTATION_DEGREES` to one of `0`, `90`, `180`, or `270`; `90` means CCW 90 degrees and `270` means CW 90 degrees. The default site profile uses `CAMERA_1_ROTATION_DEGREES=90` for the ceiling birdview camera and `0` for the other cameras. The operator UI rotation buttons update the runtime value, and AI inference uses the same rotated stream that the operator sees.
 
 The UI displays the actual received frame size in each camera tile, so you can verify whether the configured resolution is being applied.
 
@@ -106,48 +107,37 @@ Dashboard behavior:
 - The ceiling birdview tile is vertical and the frame is displayed CCW 90 degrees.
 - The sidebar opens from the `메뉴` button.
 - `전체 카메라` switches to the four-camera inspection layout.
-- `테스트` opens the in-UI diagnostic screen.
-- `AI Detection` starts live Hailo multistream detection for currently streaming cameras.
+- `이전 AI Detection` starts the previous working multistream launch path for regression isolation.
+- `차량 전용 검출` runs the Hailo LPR example vehicle detector (`yolov5m_vehicles`) on the front camera.
+- `번호판 이미지 LPR` runs the Hailo LPR example models against sanitized images in `tmp/car_number-test`.
+- `사람 존재 감지` runs the TAPPAS person detector on currently streaming cameras.
 - `차량 진입 시뮬레이션` is UI-only and keeps PLC OK blocked.
 - `EMPTY` buttons are safe no-op feature slots.
 
-Disconnected cameras remain visible as NG tiles and are not used as AI Detection targets. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
+Disconnected cameras remain visible as NG tiles and are not used as inference targets. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
 
-## AI Detection
+## Purpose AI Checks
 
-In the operator UI sidebar, press `AI Detection`.
+Purpose-specific AI buttons use fixed TAPPAS example model sets and always keep PLC OK blocked:
 
-Behavior:
+- `차량 전용 검출`: `apps/h8/gstreamer/general/license_plate_recognition/resources/yolov5m_vehicles.hef`.
+- `번호판 이미지 LPR`: `yolov5m_vehicles.hef`, `tiny_yolov4_license_plates.hef`, and `lprnet.hef`.
+- `사람 존재 감지`: `apps/h8/gstreamer/general/multi_person_multi_camera_tracking/resources/yolov5s_personface_reid.hef` with `yolov5_personface_letterbox`; it does not run Re-ID embedding, gallery matching, or same-person tracking.
 
-- Uses only cameras that are currently streaming normally.
-- Runs a single Hailo multistream GStreamer process for those cameras.
-- Writes normalized detection events to `artifacts/runtime/detections/multistream.jsonl`.
-- Generates temporary per-camera callback wrappers under `artifacts/runtime/detections/`.
-- Draws fresh detection boxes and labels on the corresponding camera tile.
-- Keeps boxes visible only while events are fresh. The current overlay TTL is 1 second.
+Logs are written under `artifacts/runtime/purpose-ai/`. These buttons are implementation and integration checks only; they do not authorize PLC OK.
 
-Hardware check performed on the target showed both active cameras producing events in the same multistream run:
+For regression debugging, `이전 AI Detection` bypasses purpose-specific controls and launches the previous multistream path that uses `HAILO_HEF_PATH`, shared `artifacts/runtime/detections/multistream.jsonl`, and the current UI camera rotation map.
+
+The inference runner watches GStreamer logs for fatal Hailo conditions such as `HAILO_OUT_OF_PHYSICAL_DEVICES`, `Failed to create vdevice`, `CHECK_SUCCESS failed`, and `Caught SIGSEGV`. If one appears, the UI shows an inference error, terminates the process group, and keeps final OK blocked.
+
+Recent hardware checks on the target verified:
 
 ```text
-COUNTS {'front': 1158, 'ceiling': 2366}
+vehicle_detection: 2 events, no errors
+person_presence: 138 events, no errors
 ```
 
-If detections disappear after some time, check whether the GStreamer process exited. The current worker retries only twice; a stronger watchdog/restart policy is listed in `PLAN.md`.
-
-## Operator Test Screen
-
-Open the sidebar with `메뉴`, then press `테스트`.
-
-Available tests include:
-
-- Settings validation.
-- Hailo installation check.
-- Hailo sample image inference.
-- Per-camera frame receive checks.
-- PLC simulator interface check.
-- Full hardware smoke sequence.
-
-The test list is scrollable. Failure details are written to the right console while the left result rows stay compact, preventing layout shifts. Diagnostic results are not safety approval and default to `safe_to_operate=False`.
+If detections disappear after some time, check the relevant log under `artifacts/runtime/purpose-ai/` or `artifacts/runtime/detections/` and confirm the model matches the configured postprocess library and network name.
 
 ## Hailo Sample Image Smoke
 
@@ -201,7 +191,7 @@ For UI-centered changes, also verify the main button flows directly in the runni
 1. Confirm the first screen is the operator dashboard.
 2. Click `메뉴` and confirm the sidebar opens.
 3. Click `전체 카메라` and confirm the four-camera view appears.
-4. Click `테스트` and confirm the diagnostic screen appears.
+4. Click `사람 존재 감지` and confirm the status strip shows the purpose AI task.
 5. Click `차량 진입 시뮬레이션` and confirm it is visibly test-only.
 6. Click an `EMPTY` button and confirm it only shows a not-connected message.
 7. Confirm simulation and `EMPTY` actions do not show final OK.

@@ -47,6 +47,17 @@ def test_live_detection_pipeline_uses_rtsp_hailo_and_callback(tmp_path: Path):
     assert "fakesink sync=false" in pipeline
 
 
+def test_live_detection_pipeline_uses_selected_hef_override(tmp_path: Path):
+    settings = _settings(tmp_path)
+    selected_hef = tmp_path / "selected.hef"
+    selected_hef.write_text("hef", encoding="utf-8")
+
+    pipeline = build_live_detection_pipeline(settings, settings.camera_2, hef_path=selected_hef)
+
+    assert f"hailonet hef-path={selected_hef}" in pipeline
+    assert f"hailonet hef-path={settings.hailo_hef_path}" not in pipeline
+
+
 def test_live_detection_pipeline_default_threshold_is_low_for_operator_overlay(tmp_path: Path):
     settings = _settings(tmp_path)
 
@@ -92,6 +103,7 @@ def test_live_detection_process_sets_camera_event_sink_and_tappas_env(tmp_path: 
     process = live_detection_process(settings, settings.camera_1, event_dir=tmp_path / "events")
 
     assert process.event_path == tmp_path / "events" / "ceiling.jsonl"
+    assert process.hef_path == settings.hailo_hef_path
     assert process.env["TOWERSIGHTAI_HAILO_CAMERA_ID"] == "ceiling"
     assert process.env["TOWERSIGHTAI_HAILO_EVENT_PATH"] == str(process.event_path)
     assert process.env["VIRTUAL_ENV"] == str(tmp_path / "hailo_tappas_venv")
@@ -126,6 +138,26 @@ def test_live_multistream_detection_pipeline_routes_each_camera_to_callback(tmp_
     assert f"hailonet hef-path={settings.hailo_hef_path} batch-size=1 nms-score-threshold=0.42" in pipeline
 
 
+def test_live_multistream_detection_pipeline_uses_selected_hef_override(tmp_path: Path):
+    settings = _settings(tmp_path)
+    selected_hef = tmp_path / "selected.hef"
+    selected_hef.write_text("hef", encoding="utf-8")
+    callbacks = {
+        "ceiling": tmp_path / "callback_ceiling.py",
+        "front": tmp_path / "callback_front.py",
+    }
+
+    pipeline = build_live_multistream_detection_pipeline(
+        settings,
+        (settings.camera_1, settings.camera_2),
+        callback_modules=callbacks,
+        hef_path=selected_hef,
+    )
+
+    assert f"hailonet hef-path={selected_hef}" in pipeline
+    assert f"hailonet hef-path={settings.hailo_hef_path}" not in pipeline
+
+
 def test_live_multistream_detection_process_writes_camera_specific_callbacks(tmp_path: Path, monkeypatch):
     settings = _settings(tmp_path)
     tappas_bin = tmp_path / "hailo_tappas_venv" / "bin"
@@ -137,6 +169,7 @@ def test_live_multistream_detection_process_writes_camera_specific_callbacks(tmp
         settings,
         (settings.camera_1, settings.camera_2),
         event_dir=tmp_path / "events",
+        hef_path=tmp_path / "selected.hef",
     )
 
     assert process.event_path == tmp_path / "events" / "multistream.jsonl"
@@ -150,6 +183,8 @@ def test_live_multistream_detection_process_writes_camera_specific_callbacks(tmp
     assert f"hailopython module={ceiling_callback}" in " ".join(process.command)
     assert f"hailopython module={front_callback}" in " ".join(process.command)
     assert process.log_path == tmp_path / "events" / "multistream.gst.log"
+    assert process.hef_path == tmp_path / "selected.hef"
+    assert f"hailonet hef-path={tmp_path / 'selected.hef'}" in " ".join(process.command)
 
 
 def test_live_detection_runner_redirects_gstreamer_output_to_log_file(tmp_path: Path, monkeypatch):
@@ -168,9 +203,10 @@ def test_live_detection_runner_redirects_gstreamer_output_to_log_file(tmp_path: 
     monkeypatch.setattr("towersightai.inference.live_detection.shutil.which", lambda _command: "/usr/bin/gst-launch-1.0")
     monkeypatch.setattr("towersightai.inference.live_detection.subprocess.Popen", fake_popen)
     process = LiveDetectionProcess(
-        command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
+        command=("gst-launch-1.0", "-q", "rtspsrc", "location=rtsp://user:secret@192.0.2.10/stream1", "!", "fakesink"),
         event_path=tmp_path / "events.jsonl",
         env={},
+        hef_path=tmp_path / "selected.hef",
         log_path=tmp_path / "gst.log",
     )
     runner = LiveDetectionRunner(process, on_events=lambda _events: None, on_error=lambda _message: None)
@@ -179,6 +215,10 @@ def test_live_detection_runner_redirects_gstreamer_output_to_log_file(tmp_path: 
 
     assert popen_kwargs["stdout"] == subprocess.DEVNULL
     assert popen_kwargs["stderr"].name == str(tmp_path / "gst.log")
+    log_text = (tmp_path / "gst.log").read_text(encoding="utf-8")
+    assert f"active-hef-path={tmp_path / 'selected.hef'}" in log_text
+    assert "rtsp://***:***@192.0.2.10/stream1" in log_text
+    assert "secret" not in log_text
 
 
 def test_parse_detection_json_and_tail_reads_only_new_events(tmp_path: Path):

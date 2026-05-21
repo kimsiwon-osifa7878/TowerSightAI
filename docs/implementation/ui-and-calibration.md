@@ -22,7 +22,7 @@ Default layout:
 - Ceiling birdview is shown as a vertical tile and the frame is displayed CCW 90 degrees.
 - The birdview tile must not draw default lane/stop guide lines unless calibration mode or a specific overlay mode is active.
 - The front view stays wide and is used for vehicle entry context.
-- Safety status, state, PLC status, camera health, AI Detection state, and clock remain visible.
+- Safety status, state, PLC status, camera health, AI inference state, and clock remain visible.
 - Camera loss, stale frames, Hailo errors, and PLC unknown state must be visible as NG or blocked states.
 
 The all-camera layout remains available from the sidebar for inspection of ceiling, front, rear-side, and opposite-side cameras.
@@ -35,9 +35,21 @@ Current connected entries:
 
 - `운영 대시보드`
 - `전체 카메라`
-- `테스트`
-- `AI Detection`
+- `이전 AI Detection`
+- `차량 전용 검출`
+- `번호판 이미지 LPR`
+- `사람 존재 감지`
 - `차량 진입 시뮬레이션`
+
+`이전 AI Detection` is a regression-isolation control. It should bypass runtime model selection and launch the previous multistream detection path that uses `HAILO_HEF_PATH`, the shared detection event directory, and the same camera rotation map as the visible UI.
+
+Purpose-specific AI controls should use fixed, known-compatible TAPPAS example model sets:
+
+- `차량 전용 검출`: front camera only, Hailo LPR example `yolov5m_vehicles`.
+- `번호판 이미지 LPR`: image-set test using `tmp/car_number-test` and the Hailo LPR example vehicle, plate, and OCR models.
+- `사람 존재 감지`: currently streaming cameras using the TAPPAS person detector path. It must infer only whether a person exists; do not run Re-ID embedding, gallery matching, or same-person tracking.
+
+These controls are for integration diagnosis and staged feature development. They must show running/error/log status in the operator status strip and keep final OK blocked.
 
 Unimplemented feature slots must be labeled `EMPTY`. Pressing an `EMPTY` button should only show a message such as “not connected yet” and must not alter safety state, PLC state, calibration state, or final OK.
 
@@ -121,6 +133,7 @@ Coordinates should be normalized unless a module has a documented reason to use 
 - Tests for dashboard startup, sidebar open/close, and all-camera switching.
 - Tests that `EMPTY` buttons are safe no-ops.
 - Tests that vehicle-entry simulation remains test-only and blocks final OK.
+- Tests that purpose-specific AI buttons create the expected fixed-model pipeline and do not use arbitrary HEF selection.
 - Tests for camera tile layout, birdview rotation policy, and stale/NG display.
 - Tests for Korean operator instruction selection.
 - Tests that password values are redacted.

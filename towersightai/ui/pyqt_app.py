@@ -1,33 +1,37 @@
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from towersightai.camera.pipeline import build_preview_pipeline, normalize_rotation_degrees
 from towersightai.config.settings import CameraRole, Settings
-from towersightai.diagnostics import DiagnosticResult, DiagnosticStatus, DiagnosticsService
 from towersightai.inference.events import DetectionEvent
 from towersightai.inference.live_detection import LiveDetectionRunner, latest_events, live_multistream_detection_process
+from towersightai.inference.purpose_tasks import (
+    PURPOSE_LPR_IMAGE,
+    PURPOSE_PERSON_PRESENCE,
+    PURPOSE_TASK_SPECS,
+    PURPOSE_VEHICLE_DETECTION,
+    PurposeInferenceRunner,
+    build_purpose_process,
+)
 from towersightai.ui.model import GlobalSafetyStatus, OperatorDisplayModel
 
-TEST_LIST_PANEL_WIDTH = 320
 OPERATOR_PANEL_WIDTH = 400
 OPERATOR_SIDEBAR_WIDTH = 300
-TEST_STATUS_HEIGHT = 34
-TEST_SUMMARY_MAX_HEIGHT = 112
 DETECTION_TTL_SECONDS = 1.0
+FIRST_INFERENCE_TIMEOUT_SECONDS = 30.0
 SIDEBAR_ACTION_LABELS = (
     "운영 대시보드",
     "전체 카메라",
     "카메라 설정",
-    "테스트",
-    "AI Detection",
+    "이전 AI Detection",
+    "차량 전용 검출",
+    "번호판 이미지 LPR",
+    "사람 존재 감지",
     "차량 진입 시뮬레이션",
-    "EMPTY",
-    "EMPTY",
-    "EMPTY",
-    "EMPTY",
-    "EMPTY",
     "EMPTY",
     "EMPTY",
 )
@@ -43,10 +47,8 @@ try:
         QLabel,
         QMainWindow,
         QPushButton,
-        QScrollArea,
         QSizePolicy,
         QStackedWidget,
-        QTextEdit,
         QVBoxLayout,
         QWidget,
     )
@@ -237,26 +239,11 @@ class CameraCaptureWorker(QObject):
         return capture, using_gstreamer
 
 
-class DiagnosticWorker(QObject):
-    started = pyqtSignal(str)
-    finished = pyqtSignal(object)
-
-    def __init__(self, service: DiagnosticsService, test_id: str, timeout_seconds: int = 10) -> None:
-        super().__init__()
-        self.service = service
-        self.test_id = test_id
-        self.timeout_seconds = timeout_seconds
-
-    def run(self) -> None:
-        self.started.emit(self.test_id)
-        result = self.service.run(self.test_id, timeout_seconds=self.timeout_seconds)
-        self.service.write_result(result)
-        self.finished.emit(result)
-
-
 class LiveDetectionWorker(QObject):
     detections_ready = pyqtSignal(str, object)
     status_changed = pyqtSignal(str, str)
+    detection_started = pyqtSignal(str, str)
+    first_inference_ready = pyqtSignal(float)
     finished = pyqtSignal(str)
 
     def __init__(
@@ -264,12 +251,16 @@ class LiveDetectionWorker(QObject):
         settings: Settings,
         camera_ids: tuple[str, ...],
         camera_rotations: dict[str, int] | None = None,
+        hef_path: Path | None = None,
+        legacy_mode: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
         self.camera_ids = camera_ids
         self.camera_rotations = dict(camera_rotations or {})
+        self.hef_path = hef_path
+        self.legacy_mode = legacy_mode
         self.cameras = tuple(camera for camera in settings.cameras if camera.id in set(camera_ids))
         self._runner: LiveDetectionRunner | None = None
         self._stop_requested = False
@@ -279,20 +270,46 @@ class LiveDetectionWorker(QObject):
         if self._runner is not None:
             self._runner.stop()
 
+    def _build_process(self):
+        if self.legacy_mode:
+            return live_multistream_detection_process(
+                self.settings,
+                self.cameras,
+                camera_rotations=self.camera_rotations,
+            )
+        return live_multistream_detection_process(
+            self.settings,
+            self.cameras,
+            camera_rotations=self.camera_rotations,
+            hef_path=self.hef_path,
+        )
+
     def run(self) -> None:
         attempt = 0
         while not self._stop_requested:
             if self._stop_requested:
                 break
-            process = live_multistream_detection_process(
-                self.settings,
-                self.cameras,
-                camera_rotations=self.camera_rotations,
-            )
+            process = self._build_process()
+            active_hef = Path(process.hef_path)
+            if not self.legacy_mode and f"hef-path={active_hef}" not in " ".join(process.command):
+                for camera_id in self.camera_ids:
+                    self.status_changed.emit(camera_id, f"AI 추론 실패: 선택 모델이 파이프라인에 반영되지 않았습니다. 선택={active_hef.name}")
+                break
+            started_at = time.monotonic()
+            first_event_sent = False
+            if not self.legacy_mode:
+                self.detection_started.emit(str(active_hef), str(process.log_path or ""))
             for camera_id in self.camera_ids:
-                self.status_changed.emit(camera_id, "AI Detection 실행 중" if attempt == 0 else "AI Detection 재시도 중")
+                if self.legacy_mode:
+                    self.status_changed.emit(camera_id, "이전 AI Detection 실행 중" if attempt == 0 else "이전 AI Detection 재시도 중")
+                else:
+                    self.status_changed.emit(camera_id, "AI Detection 실행 중" if attempt == 0 else "AI Detection 재시도 중")
 
             def on_events(events: tuple[DetectionEvent, ...]) -> None:
+                nonlocal first_event_sent
+                if events and not first_event_sent:
+                    first_event_sent = True
+                    self.first_inference_ready.emit(time.monotonic() - started_at)
                 grouped: dict[str, list[DetectionEvent]] = {}
                 for event in events:
                     grouped.setdefault(event.camera_id, []).append(event)
@@ -311,10 +328,88 @@ class LiveDetectionWorker(QObject):
                 break
             attempt += 1
             for camera_id in self.camera_ids:
-                self.status_changed.emit(camera_id, "AI Detection 재시작 대기")
+                self.status_changed.emit(camera_id, "이전 AI Detection 재시작 대기" if self.legacy_mode else "AI Detection 재시작 대기")
             QThread.msleep(min(5000, 500 * attempt))
         for camera_id in self.camera_ids:
             self.finished.emit(camera_id)
+
+
+class PurposeInferenceWorker(QObject):
+    detections_ready = pyqtSignal(str, object)
+    status_changed = pyqtSignal(str, str)
+    task_started = pyqtSignal(str, str, str)
+    first_inference_ready = pyqtSignal(float)
+    finished = pyqtSignal(str)
+
+    def __init__(
+        self,
+        task_id: str,
+        settings: Settings,
+        camera_ids: tuple[str, ...],
+        camera_rotations: dict[str, int] | None = None,
+        image_dir: Path = Path("tmp/car_number-test"),
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.task_id = task_id
+        self.settings = settings
+        self.camera_ids = camera_ids
+        self.camera_rotations = dict(camera_rotations or {})
+        self.image_dir = image_dir
+        self.cameras = tuple(camera for camera in settings.cameras if camera.id in set(camera_ids))
+        self._runner: PurposeInferenceRunner | None = None
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        self._stop_requested = True
+        if self._runner is not None:
+            self._runner.stop()
+
+    def _build_process(self):
+        return build_purpose_process(
+            self.task_id,
+            self.settings,
+            cameras=self.cameras,
+            camera_rotations=self.camera_rotations,
+            image_dir=self.image_dir,
+        )
+
+    def run(self) -> None:
+        try:
+            process = self._build_process()
+        except (OSError, ValueError) as exc:
+            self.status_changed.emit(self.task_id, str(exc))
+            self.finished.emit(self.task_id)
+            return
+
+        started_at = time.monotonic()
+        first_event_sent = False
+        failed = False
+        self.task_started.emit(process.task_id, process.label, str(process.log_path))
+        for camera_id in process.camera_ids:
+            self.status_changed.emit(camera_id, f"{process.label} 실행 중")
+
+        def on_events(events: tuple[DetectionEvent, ...]) -> None:
+            nonlocal first_event_sent
+            if events and not first_event_sent:
+                first_event_sent = True
+                self.first_inference_ready.emit(time.monotonic() - started_at)
+            grouped: dict[str, list[DetectionEvent]] = {}
+            for event in events:
+                grouped.setdefault(event.camera_id, []).append(event)
+            for camera_id, camera_events in grouped.items():
+                self.detections_ready.emit(camera_id, latest_events(camera_events))
+
+        def on_error(message: str) -> None:
+            nonlocal failed
+            failed = True
+            self.status_changed.emit(process.task_id, message)
+
+        self._runner = PurposeInferenceRunner(process, on_events=on_events, on_error=on_error)
+        self._runner.run()
+        if not failed and not first_event_sent and process.task_id in {PURPOSE_LPR_IMAGE, PURPOSE_PERSON_PRESENCE} and not self._stop_requested:
+            self.first_inference_ready.emit(time.monotonic() - started_at)
+        self.finished.emit(process.task_id)
 
 
 class OperatorWindow(QMainWindow):
@@ -322,20 +417,30 @@ class OperatorWindow(QMainWindow):
         super().__init__(parent)
         self.model = model
         self.settings = settings
-        self.diagnostics = DiagnosticsService(settings) if settings is not None else None
         self.camera_widgets: dict[CameraRole, CameraSurface] = {}
         self._runtime_camera_status: dict[str, str] = {}
         self._threads: list[QThread] = []
         self._workers: list[CameraCaptureWorker] = []
-        self._diagnostic_threads: list[QThread] = []
-        self._diagnostic_workers: list[DiagnosticWorker] = []
         self._detection_threads: list[QThread] = []
         self._detection_workers: list[LiveDetectionWorker] = []
-        self._test_buttons: dict[str, QPushButton] = {}
-        self._test_rows: dict[str, QLabel] = {}
+        self._purpose_threads: list[QThread] = []
+        self._purpose_workers: list[PurposeInferenceWorker] = []
         self._detection_enabled = False
         self._detection_camera_ids: tuple[str, ...] = ()
         self._detection_event_counts: dict[str, int] = {}
+        self._detection_load_started_at: float | None = None
+        self._detection_first_inference_seconds: float | None = None
+        self._detection_model_label = ""
+        self._detection_log_path: Path | None = None
+        self._detection_unconfirmed_reported = False
+        self._detection_failed = False
+        self._detection_legacy_mode = False
+        self._purpose_task_enabled = False
+        self._purpose_task_id = ""
+        self._purpose_task_label = ""
+        self._purpose_task_log_path: Path | None = None
+        self._purpose_task_started_at: float | None = None
+        self._purpose_task_first_inference_seconds: float | None = None
         self._operator_unlocked = True
         self._vehicle_entry_simulation = False
         self._camera_layout_mode = "dashboard"
@@ -343,7 +448,9 @@ class OperatorWindow(QMainWindow):
             camera.id: camera.rotation_degrees
             for camera in settings.cameras
         } if settings is not None else {}
+        self._selected_hailo_model_path: Path | None = None
         self.sidebar_buttons: dict[str, QPushButton] = {}
+        self.purpose_task_buttons: dict[str, QPushButton] = {}
         self.camera_rotation_buttons: dict[str, QPushButton] = {}
         self.clock_label = QLabel()
         self.setWindowTitle("TowerSightAI Operator Console")
@@ -379,14 +486,15 @@ class OperatorWindow(QMainWindow):
             worker.stop()
         for thread in self._threads:
             thread.quit()
-            thread.wait(1500)
-        for thread in self._diagnostic_threads:
-            thread.quit()
-            thread.wait(1500)
+            thread.wait(5000)
         self._stop_ai_detection()
+        self._stop_purpose_inference()
         for thread in self._detection_threads:
             thread.quit()
-            thread.wait(1500)
+            thread.wait(5000)
+        for thread in self._purpose_threads:
+            thread.quit()
+            thread.wait(5000)
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
@@ -442,17 +550,72 @@ class OperatorWindow(QMainWindow):
             return
         self._detection_event_counts[camera_id] = self._detection_event_counts.get(camera_id, 0) + len(detections)
         if self._detection_enabled:
-            self.ai_detection_label.setText(_ai_detection_label(self._detection_camera_ids, self._detection_event_counts))
+            if self._detection_legacy_mode:
+                self.ai_detection_label.setText(_legacy_ai_detection_label(self._detection_camera_ids, self._detection_event_counts))
+            else:
+                self.ai_detection_label.setText(
+                    _ai_detection_label(
+                        self._detection_camera_ids,
+                        self._detection_event_counts,
+                        first_inference_seconds=self._detection_first_inference_seconds,
+                    )
+                )
+        elif self._purpose_task_enabled:
+            self.ai_detection_label.setText(
+                _purpose_detection_label(
+                    self._purpose_task_label,
+                    self._detection_camera_ids,
+                    self._detection_event_counts,
+                    first_inference_seconds=self._purpose_task_first_inference_seconds,
+                )
+            )
         widget.set_detections(detections)
 
     def _set_detection_status(self, camera_id: str, message: str) -> None:
         if "실행 중" in message or "재시도 중" in message or "재시작 대기" in message:
-            self.ai_detection_label.setText(_ai_detection_label(self._detection_camera_ids, self._detection_event_counts))
+            if self._detection_legacy_mode:
+                self.ai_detection_label.setText(_legacy_ai_detection_label(self._detection_camera_ids, self._detection_event_counts))
+            else:
+                self.ai_detection_label.setText(
+                    _ai_detection_label(
+                        self._detection_camera_ids,
+                        self._detection_event_counts,
+                        first_inference_seconds=self._detection_first_inference_seconds,
+                    )
+                )
             return
-        self.ai_detection_label.setText(f"AI Detection 오류: {camera_id}")
+        self.ai_detection_label.setText(f"{'이전 AI Detection' if self._detection_legacy_mode else 'AI Detection'} 오류: {camera_id}")
+        self._detection_failed = True
+        if hasattr(self, "model_status_label"):
+            self.model_status_label.setText(f"추론 실패: {self._detection_model_label or '모델 미확인'}")
         self.warning_label.setText(f"Hailo detection 문제: {message[:120]}")
 
+    def _set_detection_started(self, hef_path: str, log_path: str) -> None:
+        self._detection_load_started_at = time.monotonic()
+        self._detection_first_inference_seconds = None
+        self._detection_unconfirmed_reported = False
+        self._detection_failed = False
+        self._detection_model_label = Path(hef_path).name
+        self._detection_log_path = Path(log_path) if log_path else None
+        self.ai_detection_label.setText(_ai_detection_label(self._detection_camera_ids, self._detection_event_counts, loading_seconds=0.0))
+        self.model_status_label.setText(f"실행 모델: {self._detection_model_label}")
+        self.warning_label.setText(f"AI 모델 로드 중: {self._detection_model_label}")
+
+    def _set_first_inference_ready(self, elapsed_seconds: float) -> None:
+        self._detection_first_inference_seconds = elapsed_seconds
+        self.ai_detection_label.setText(
+            _ai_detection_label(
+                self._detection_camera_ids,
+                self._detection_event_counts,
+                first_inference_seconds=elapsed_seconds,
+            )
+        )
+        self.model_status_label.setText(f"실행 모델: {self._detection_model_label}")
+        self.warning_label.setText(f"AI 추론 시작 완료: {self._detection_model_label} ({elapsed_seconds:.1f}s)")
+
     def _refresh_runtime_health_labels(self) -> None:
+        if self._detection_failed:
+            return
         blocked_tiles = tuple(
             tile
             for tile in self.model.camera_tiles
@@ -461,10 +624,14 @@ class OperatorWindow(QMainWindow):
         blocked_count = len(blocked_tiles)
         if blocked_count:
             self.camera_summary_label.setText(f"카메라 {blocked_count}/4 차단")
+            if self._detection_enabled:
+                return
             self.warning_label.setText("카메라 입력 차단: " + ", ".join(tile.title for tile in blocked_tiles))
             return
 
         self.camera_summary_label.setText("카메라 4/4 정상")
+        if self._detection_enabled:
+            return
         if self.model.plc_state.value != "CONNECTED":
             self.warning_label.setText("PLC 상태 미확인: 최종 OK 차단")
         else:
@@ -474,10 +641,8 @@ class OperatorWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.operator_view = self._build_operator_view()
         self.settings_view = self._build_settings_view()
-        self.test_view = self._build_test_view()
         self.stack.addWidget(self.operator_view)
         self.stack.addWidget(self.settings_view)
-        self.stack.addWidget(self.test_view)
         self.setCentralWidget(self.stack)
         self._show_operator_dashboard()
 
@@ -558,8 +723,9 @@ class OperatorWindow(QMainWindow):
         self.state_label = QLabel()
         self.plc_label = QLabel()
         self.camera_summary_label = QLabel()
-        self.ai_detection_label = QLabel("AI Detection OFF")
-        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.ai_detection_label, self.clock_label):
+        self.model_status_label = QLabel("모델 선택: 없음")
+        self.ai_detection_label = QLabel("AI 추론 OFF")
+        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.clock_label):
             label.setObjectName("telemetryLabel")
             label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             status_layout.addWidget(label)
@@ -579,13 +745,22 @@ class OperatorWindow(QMainWindow):
                 button.clicked.connect(self._show_all_cameras)
             elif label == "카메라 설정":
                 button.clicked.connect(self._show_camera_settings)
-            elif label == "테스트":
-                self.to_tests_button = button
-                button.clicked.connect(self._show_tests)
-            elif label == "AI Detection":
-                self.ai_detection_button = button
+            elif label == "이전 AI Detection":
+                self.legacy_ai_detection_button = button
                 button.setCheckable(True)
-                button.clicked.connect(self._toggle_ai_detection)
+                button.clicked.connect(self._toggle_legacy_ai_detection)
+            elif label == "차량 전용 검출":
+                button.setCheckable(True)
+                self.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION] = button
+                button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_VEHICLE_DETECTION))
+            elif label == "번호판 이미지 LPR":
+                button.setCheckable(True)
+                self.purpose_task_buttons[PURPOSE_LPR_IMAGE] = button
+                button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_LPR_IMAGE))
+            elif label == "사람 존재 감지":
+                button.setCheckable(True)
+                self.purpose_task_buttons[PURPOSE_PERSON_PRESENCE] = button
+                button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_PERSON_PRESENCE))
             elif label == "차량 진입 시뮬레이션":
                 button.clicked.connect(self._simulate_vehicle_entry)
             else:
@@ -632,7 +807,7 @@ class OperatorWindow(QMainWindow):
         self.rotation_summary_label.setObjectName("instructionLabel")
         self.rotation_summary_label.setWordWrap(True)
         detail_layout.addWidget(self.rotation_summary_label)
-        rotation_note = QLabel("회전값은 카메라 preview 파이프라인과 AI Detection 파이프라인에 동일하게 적용됩니다.")
+        rotation_note = QLabel("회전값은 카메라 preview 파이프라인과 AI 추론 파이프라인에 동일하게 적용됩니다.")
         rotation_note.setObjectName("warningLabel")
         rotation_note.setWordWrap(True)
         detail_layout.addWidget(rotation_note)
@@ -641,86 +816,31 @@ class OperatorWindow(QMainWindow):
         self._refresh_rotation_controls()
         return root
 
-    def _build_test_view(self) -> QWidget:
-        root = QWidget()
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(12, 12, 12, 12)
-        outer.setSpacing(10)
-
-        list_panel = QWidget()
-        list_panel.setObjectName("sidePanel")
-        list_panel.setFixedWidth(TEST_LIST_PANEL_WIDTH)
-        list_panel.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        list_layout = QVBoxLayout(list_panel)
-        list_layout.setContentsMargins(14, 14, 14, 14)
-        list_layout.setSpacing(8)
-        outer.addWidget(list_panel)
-
-        title = QLabel("운영자 테스트")
-        title.setObjectName("testTitleLabel")
-        list_layout.addWidget(title)
-
-        scroll = QScrollArea()
-        scroll.setObjectName("testListScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(0, 0, 0, 0)
-        scroll_layout.setSpacing(8)
-
-        if self.diagnostics is not None:
-            for test in self.diagnostics.available_tests():
-                button = QPushButton(test.label)
-                button.setToolTip(test.description)
-                button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                button.clicked.connect(lambda _checked=False, test_id=test.test_id: self._start_diagnostic(test_id))
-                status = QLabel("IDLE")
-                status.setObjectName("telemetryLabel")
-                status.setFixedHeight(TEST_STATUS_HEIGHT)
-                status.setWordWrap(False)
-                status.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-                status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                scroll_layout.addWidget(button)
-                scroll_layout.addWidget(status)
-                self._test_buttons[test.test_id] = button
-                self._test_rows[test.test_id] = status
-        else:
-            disabled = QLabel("설정이 없어 테스트를 실행할 수 없습니다.")
-            disabled.setObjectName("warningLabel")
-            scroll_layout.addWidget(disabled)
-
-        scroll_layout.addStretch(1)
-        scroll.setWidget(scroll_content)
-        list_layout.addWidget(scroll, 1)
-        back = QPushButton("운영자 화면")
-        back.clicked.connect(self._show_operator)
-        list_layout.addWidget(back)
-
-        log_panel = QWidget()
-        log_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        log_layout = QVBoxLayout(log_panel)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        self.test_summary_label = QLabel("테스트 대기 중")
-        self.test_summary_label.setObjectName("instructionLabel")
-        self.test_summary_label.setWordWrap(True)
-        self.test_summary_label.setMaximumHeight(TEST_SUMMARY_MAX_HEIGHT)
-        self.test_summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        log_layout.addWidget(self.test_summary_label)
-        self.test_log = QTextEdit()
-        self.test_log.setReadOnly(True)
-        self.test_log.setObjectName("testLog")
-        self.test_log.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.test_log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        log_layout.addWidget(self.test_log, 1)
-        outer.addWidget(log_panel, 1)
-        return root
-
     def _tick(self) -> None:
         text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.clock_label.setText(text)
+        if (
+            self._detection_enabled
+            and not self._detection_legacy_mode
+            and self._detection_load_started_at is not None
+            and self._detection_first_inference_seconds is None
+        ):
+            elapsed = time.monotonic() - self._detection_load_started_at
+            self.ai_detection_label.setText(
+                _ai_detection_label(self._detection_camera_ids, self._detection_event_counts, loading_seconds=elapsed)
+            )
+            if elapsed >= FIRST_INFERENCE_TIMEOUT_SECONDS and not self._detection_unconfirmed_reported:
+                self._detection_unconfirmed_reported = True
+                self._detection_failed = True
+                self.model_status_label.setText(f"추론 미확인: {self._detection_model_label}")
+                self.warning_label.setText(
+                    f"AI 추론 실패: {self._detection_model_label} 첫 detection 이벤트가 {FIRST_INFERENCE_TIMEOUT_SECONDS:.0f}s 내 확인되지 않았습니다."
+                )
+        if self._purpose_task_enabled and self._purpose_task_started_at is not None and self._purpose_task_first_inference_seconds is None:
+            elapsed = time.monotonic() - self._purpose_task_started_at
+            self.ai_detection_label.setText(
+                _purpose_detection_label(self._purpose_task_label, self._detection_camera_ids, self._detection_event_counts, loading_seconds=elapsed)
+            )
 
     def _show_operator(self) -> None:
         if not self._operator_unlocked:
@@ -738,11 +858,6 @@ class OperatorWindow(QMainWindow):
         self._set_camera_layout("all")
         self.stack.setCurrentWidget(self.operator_view)
 
-    def _show_tests(self) -> None:
-        if not self._operator_unlocked:
-            return
-        self.stack.setCurrentWidget(self.test_view)
-
     def _show_camera_settings(self) -> None:
         if not self._operator_unlocked:
             return
@@ -751,8 +866,6 @@ class OperatorWindow(QMainWindow):
 
     def _unlock_operator(self) -> None:
         self._operator_unlocked = True
-        if hasattr(self, "to_tests_button"):
-            self.to_tests_button.setEnabled(True)
         self._show_operator_dashboard()
 
     def _toggle_sidebar(self) -> None:
@@ -778,9 +891,12 @@ class OperatorWindow(QMainWindow):
         self._restart_camera_capture()
         if self._detection_enabled:
             self._stop_ai_detection()
-            self.ai_detection_label.setText("AI Detection OFF: 회전 변경")
+            self.ai_detection_label.setText("AI 추론 OFF: 회전 변경")
+        if self._purpose_task_enabled:
+            self._stop_purpose_inference()
+            self.ai_detection_label.setText("목적 추론 OFF: 회전 변경")
         self.warning_label.setText(
-            f"{camera_id} 회전 {_rotation_label(next_rotation)} 적용. AI Detection은 다음 시작부터 같은 회전 스트림을 사용합니다."
+            f"{camera_id} 회전 {_rotation_label(next_rotation)} 적용. AI 추론은 다음 시작부터 같은 회전 스트림을 사용합니다."
         )
 
     def _refresh_rotation_controls(self) -> None:
@@ -802,7 +918,7 @@ class OperatorWindow(QMainWindow):
             worker.stop()
         for thread in tuple(self._threads):
             thread.quit()
-            thread.wait(1500)
+            thread.wait(5000)
         self._threads.clear()
         self._workers.clear()
         self._start_camera_capture()
@@ -845,41 +961,69 @@ class OperatorWindow(QMainWindow):
         if self._detection_enabled:
             self._stop_ai_detection()
             return
-        self._start_ai_detection()
+        self._start_ai_detection(legacy_mode=False)
 
-    def _start_ai_detection(self) -> None:
-        if self.settings is None:
-            self.ai_detection_button.setChecked(False)
-            self.warning_label.setText("설정이 없어 AI Detection을 시작할 수 없습니다.")
+    def _toggle_legacy_ai_detection(self, checked: bool = False) -> None:
+        del checked
+        if self._detection_enabled:
+            self._stop_ai_detection()
             return
+        self._start_ai_detection(legacy_mode=True)
+
+    def _start_ai_detection(self, *, legacy_mode: bool = False) -> None:
+        if self.settings is None:
+            self._set_detection_buttons_checked(False)
+            self.warning_label.setText("설정이 없어 AI 추론을 시작할 수 없습니다.")
+            return
+        if self._purpose_task_enabled:
+            self._stop_purpose_inference()
         if self._detection_workers:
-            self.ai_detection_button.setChecked(False)
-            self.warning_label.setText("AI Detection 종료 처리 중입니다. 잠시 후 다시 시도해 주세요.")
+            self._set_detection_buttons_checked(False)
+            self.warning_label.setText("AI 추론 종료 처리 중입니다. 잠시 후 다시 시도해 주세요.")
             return
         streaming_camera_ids = _streaming_camera_ids(self.settings, self._runtime_camera_status)
         if not streaming_camera_ids:
-            self.ai_detection_button.setChecked(False)
-            self.ai_detection_button.setText("AI Detection")
-            self.ai_detection_label.setText("AI Detection OFF")
-            self.warning_label.setText("정상 스트리밍 중인 카메라가 없어 AI Detection을 시작하지 않습니다.")
+            self._set_detection_buttons_checked(False)
+            self._set_detection_button_texts()
+            self.ai_detection_label.setText("AI 추론 OFF")
+            self.warning_label.setText("정상 스트리밍 중인 카메라가 없어 AI 추론을 시작하지 않습니다.")
             return
         self._detection_enabled = True
+        self._detection_legacy_mode = legacy_mode
         self._detection_camera_ids = streaming_camera_ids
         self._detection_event_counts = {camera_id: 0 for camera_id in streaming_camera_ids}
-        self.ai_detection_button.setChecked(True)
-        self.ai_detection_button.setText("AI Detection ON")
-        self.ai_detection_label.setText(_ai_detection_label(streaming_camera_ids, self._detection_event_counts))
-        self.warning_label.setText("AI Detection 멀티스트림 실행 중: " + ", ".join(streaming_camera_ids))
+        self._detection_load_started_at = time.monotonic()
+        self._detection_first_inference_seconds = None
+        self._detection_unconfirmed_reported = False
+        self._detection_failed = False
+        selected_hef = Path(self.settings.hailo_hef_path) if legacy_mode else Path(self._selected_hailo_model_path or self.settings.hailo_hef_path)
+        self._detection_model_label = selected_hef.name
+        self._detection_log_path = None
+        if legacy_mode:
+            self.model_status_label.setText(f"이전 방식: {self._detection_model_label}")
+            self.ai_detection_label.setText(_legacy_ai_detection_label(streaming_camera_ids, self._detection_event_counts))
+            self.warning_label.setText("이전 방식 AI Detection 실행 중: " + ", ".join(streaming_camera_ids))
+        else:
+            self.model_status_label.setText(f"모델 로드 중: {self._detection_model_label}")
+            self.ai_detection_label.setText(_ai_detection_label(streaming_camera_ids, self._detection_event_counts, loading_seconds=0.0))
+            self.warning_label.setText(f"AI 모델 로드 중: {self._detection_model_label}")
+        self._set_detection_buttons_checked(True, legacy_mode=legacy_mode)
+        self._set_detection_button_texts(legacy_mode=legacy_mode)
         thread = QThread(self)
         worker = LiveDetectionWorker(
             self.settings,
             streaming_camera_ids,
             camera_rotations={camera_id: self._camera_rotations.get(camera_id, 0) for camera_id in streaming_camera_ids},
+            hef_path=None if legacy_mode else self._selected_hailo_model_path,
+            legacy_mode=legacy_mode,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.detections_ready.connect(self._set_camera_detections)
         worker.status_changed.connect(self._set_detection_status)
+        if not legacy_mode:
+            worker.detection_started.connect(self._set_detection_started)
+            worker.first_inference_ready.connect(self._set_first_inference_ready)
         worker.finished.connect(thread.quit)
         thread.finished.connect(lambda worker=worker, thread=thread: self._cleanup_detection_worker(thread, worker))
         self._detection_threads.append(thread)
@@ -888,17 +1032,186 @@ class OperatorWindow(QMainWindow):
 
     def _stop_ai_detection(self) -> None:
         self._detection_enabled = False
+        self._detection_legacy_mode = False
         self._detection_camera_ids = ()
         self._detection_event_counts = {}
-        if hasattr(self, "ai_detection_button"):
-            self.ai_detection_button.setChecked(False)
-            self.ai_detection_button.setText("AI Detection")
+        self._detection_load_started_at = None
+        self._detection_first_inference_seconds = None
+        self._detection_model_label = ""
+        self._detection_log_path = None
+        self._detection_unconfirmed_reported = False
+        self._detection_failed = False
+        self._set_detection_buttons_checked(False)
+        self._set_detection_button_texts()
         if hasattr(self, "ai_detection_label"):
-            self.ai_detection_label.setText("AI Detection OFF")
+            self.ai_detection_label.setText("AI 추론 OFF")
+        if hasattr(self, "model_status_label"):
+            selected_text = self._selected_hailo_model_path.name if self._selected_hailo_model_path is not None else "없음"
+            self.model_status_label.setText(f"모델 선택: {selected_text}")
         for worker in tuple(self._detection_workers):
             worker.stop()
         for widget in self.camera_widgets.values():
             widget.clear_detections()
+
+    def _toggle_purpose_inference(self, task_id: str) -> None:
+        if self._purpose_task_enabled and self._purpose_task_id == task_id:
+            self._stop_purpose_inference()
+            return
+        self._start_purpose_inference(task_id)
+
+    def _start_purpose_inference(self, task_id: str) -> None:
+        if self.settings is None:
+            self._set_purpose_buttons_checked(False)
+            self.warning_label.setText("설정이 없어 목적별 AI 추론을 시작할 수 없습니다.")
+            return
+        if self._purpose_workers:
+            self._set_purpose_buttons_checked(False)
+            self.warning_label.setText("목적별 AI 추론 종료 처리 중입니다. 잠시 후 다시 시도해 주세요.")
+            return
+        if self._detection_enabled:
+            self._stop_ai_detection()
+        spec = PURPOSE_TASK_SPECS[task_id]
+        camera_ids = self._purpose_camera_ids(task_id)
+        if task_id != PURPOSE_LPR_IMAGE and not camera_ids:
+            self._set_purpose_buttons_checked(False)
+            self.warning_label.setText(f"{spec.label}: 정상 스트리밍 중인 대상 카메라가 없습니다.")
+            return
+        self._purpose_task_enabled = True
+        self._purpose_task_id = task_id
+        self._purpose_task_label = spec.label
+        self._purpose_task_log_path = None
+        self._purpose_task_started_at = time.monotonic()
+        self._purpose_task_first_inference_seconds = None
+        self._detection_enabled = False
+        self._detection_failed = False
+        self._detection_camera_ids = camera_ids
+        self._detection_event_counts = {camera_id: 0 for camera_id in camera_ids}
+        self.model_status_label.setText(f"목적 모델 로드 중: {spec.label}")
+        self.ai_detection_label.setText(_purpose_detection_label(spec.label, camera_ids, self._detection_event_counts, loading_seconds=0.0))
+        self.warning_label.setText(f"{spec.label} 실행 준비 중: 최종 OK는 차단됩니다.")
+        self._set_detection_buttons_checked(False)
+        self._set_detection_button_texts()
+        self._set_purpose_buttons_checked(True, task_id=task_id)
+        self._set_purpose_button_texts()
+
+        thread = QThread(self)
+        worker = PurposeInferenceWorker(
+            task_id,
+            self.settings,
+            camera_ids,
+            camera_rotations={camera_id: self._camera_rotations.get(camera_id, 0) for camera_id in camera_ids},
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.detections_ready.connect(self._set_camera_detections)
+        worker.status_changed.connect(self._set_purpose_status)
+        worker.task_started.connect(self._set_purpose_started)
+        worker.first_inference_ready.connect(self._set_purpose_first_inference_ready)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(lambda worker=worker, thread=thread: self._cleanup_purpose_worker(thread, worker))
+        self._purpose_threads.append(thread)
+        self._purpose_workers.append(worker)
+        thread.start()
+
+    def _purpose_camera_ids(self, task_id: str) -> tuple[str, ...]:
+        if self.settings is None:
+            return ()
+        if task_id == PURPOSE_LPR_IMAGE:
+            return ()
+        streaming = _streaming_camera_ids(self.settings, self._runtime_camera_status)
+        if task_id == PURPOSE_VEHICLE_DETECTION:
+            for camera in self.settings.cameras:
+                if camera.role is CameraRole.front and camera.id in streaming:
+                    return (camera.id,)
+            return ()
+        if task_id == PURPOSE_PERSON_PRESENCE:
+            return streaming
+        return ()
+
+    def _set_purpose_started(self, task_id: str, label: str, log_path: str) -> None:
+        self._purpose_task_id = task_id
+        self._purpose_task_label = label
+        self._purpose_task_log_path = Path(log_path) if log_path else None
+        self._purpose_task_started_at = time.monotonic()
+        self._purpose_task_first_inference_seconds = None
+        self.ai_detection_label.setText(_purpose_detection_label(label, self._detection_camera_ids, self._detection_event_counts, loading_seconds=0.0))
+        self.model_status_label.setText(f"목적 모델 실행: {label}")
+        self.warning_label.setText(f"{label} 추론 시작 중. 로그: {self._purpose_task_log_path}")
+
+    def _set_purpose_first_inference_ready(self, elapsed_seconds: float) -> None:
+        self._purpose_task_first_inference_seconds = elapsed_seconds
+        self.ai_detection_label.setText(
+            _purpose_detection_label(
+                self._purpose_task_label,
+                self._detection_camera_ids,
+                self._detection_event_counts,
+                first_inference_seconds=elapsed_seconds,
+            )
+        )
+        self.model_status_label.setText(f"목적 모델 실행: {self._purpose_task_label}")
+        self.warning_label.setText(f"{self._purpose_task_label} 추론 확인: {elapsed_seconds:.1f}s. 최종 OK는 차단됩니다.")
+
+    def _set_purpose_status(self, target_id: str, message: str) -> None:
+        if "실행 중" in message:
+            self.ai_detection_label.setText(
+                _purpose_detection_label(
+                    self._purpose_task_label,
+                    self._detection_camera_ids,
+                    self._detection_event_counts,
+                    first_inference_seconds=self._purpose_task_first_inference_seconds,
+                )
+            )
+            return
+        self._detection_failed = True
+        self.ai_detection_label.setText(f"{self._purpose_task_label or '목적 추론'} 오류")
+        self.model_status_label.setText(f"목적 추론 실패: {self._purpose_task_label or target_id}")
+        self.warning_label.setText(f"{self._purpose_task_label or target_id} 문제: {message[:120]}")
+
+    def _stop_purpose_inference(self) -> None:
+        self._purpose_task_enabled = False
+        self._purpose_task_id = ""
+        self._purpose_task_label = ""
+        self._purpose_task_log_path = None
+        self._purpose_task_started_at = None
+        self._purpose_task_first_inference_seconds = None
+        self._set_purpose_buttons_checked(False)
+        self._set_purpose_button_texts()
+        for worker in tuple(self._purpose_workers):
+            worker.stop()
+        for widget in self.camera_widgets.values():
+            widget.clear_detections()
+
+    def _cleanup_purpose_worker(self, thread: QThread, worker: PurposeInferenceWorker) -> None:
+        if thread in self._purpose_threads:
+            self._purpose_threads.remove(thread)
+        if worker in self._purpose_workers:
+            self._purpose_workers.remove(worker)
+        if self._purpose_task_enabled and not self._purpose_workers:
+            failed = self._detection_failed
+            label = self._purpose_task_label
+            self._purpose_task_enabled = False
+            self._purpose_task_id = ""
+            self._purpose_task_label = ""
+            self._purpose_task_log_path = None
+            self._purpose_task_started_at = None
+            self._purpose_task_first_inference_seconds = None
+            self._set_purpose_buttons_checked(False)
+            self._set_purpose_button_texts()
+            if failed:
+                self.ai_detection_label.setText(f"{label} 오류")
+            else:
+                self.ai_detection_label.setText(f"{label} 완료")
+                self.model_status_label.setText(f"목적 추론 완료: {label}")
+                self.warning_label.setText(f"{label} 실행이 종료되었습니다. 결과는 로그를 확인하세요. 최종 OK는 차단됩니다.")
+
+    def _set_purpose_buttons_checked(self, checked: bool, *, task_id: str = "") -> None:
+        for current_task_id, button in self.purpose_task_buttons.items():
+            button.setChecked(checked and current_task_id == task_id)
+
+    def _set_purpose_button_texts(self) -> None:
+        for task_id, button in self.purpose_task_buttons.items():
+            label = PURPOSE_TASK_SPECS[task_id].label
+            button.setText(f"{label} ON" if self._purpose_task_enabled and self._purpose_task_id == task_id else label)
 
     def _cleanup_detection_worker(self, thread: QThread, worker: LiveDetectionWorker) -> None:
         if thread in self._detection_threads:
@@ -906,72 +1219,39 @@ class OperatorWindow(QMainWindow):
         if worker in self._detection_workers:
             self._detection_workers.remove(worker)
         if self._detection_enabled and not self._detection_workers:
+            failed = self._detection_failed
+            legacy_mode = self._detection_legacy_mode
             self._detection_enabled = False
+            self._detection_legacy_mode = False
             self._detection_camera_ids = ()
             self._detection_event_counts = {}
-            if hasattr(self, "ai_detection_button"):
-                self.ai_detection_button.setChecked(False)
-                self.ai_detection_button.setText("AI Detection")
+            self._detection_load_started_at = None
+            self._detection_first_inference_seconds = None
+            self._detection_model_label = ""
+            self._detection_log_path = None
+            self._detection_unconfirmed_reported = False
+            self._set_detection_buttons_checked(False)
+            self._set_detection_button_texts()
+            if failed and hasattr(self, "ai_detection_label"):
+                self.ai_detection_label.setText("이전 AI Detection 오류" if legacy_mode else "AI 추론 오류")
+            if hasattr(self, "model_status_label"):
+                if failed:
+                    failed_model = Path(self.settings.hailo_hef_path).name if legacy_mode and self.settings is not None else "모델 미확인"
+                    if worker.hef_path is not None:
+                        failed_model = worker.hef_path.name
+                    self.model_status_label.setText(f"추론 실패: {failed_model}")
+                else:
+                    selected_text = self._selected_hailo_model_path.name if self._selected_hailo_model_path is not None else "없음"
+                    self.model_status_label.setText(f"모델 선택: {selected_text}")
 
-    def _start_diagnostic(self, test_id: str) -> None:
-        if self.diagnostics is None:
-            return
-        button = self._test_buttons.get(test_id)
-        if button:
-            button.setEnabled(False)
-        row = self._test_rows.get(test_id)
-        if row:
-            row.setText("RUNNING")
-            row.setToolTip("테스트 실행 중")
-        self.test_summary_label.setText("테스트 실행 중: " + test_id)
-        self.test_log.append(f"[RUNNING] {test_id}")
+    def _set_detection_buttons_checked(self, checked: bool, *, legacy_mode: bool = False) -> None:
+        if hasattr(self, "legacy_ai_detection_button"):
+            self.legacy_ai_detection_button.setChecked(checked and legacy_mode)
 
-        thread = QThread(self)
-        worker = DiagnosticWorker(self.diagnostics, test_id, timeout_seconds=30 if test_id in {"hailo_image_smoke", "full_hardware_smoke"} else 10)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._finish_diagnostic)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(lambda: self._cleanup_diagnostic_worker(thread, worker))
-        self._diagnostic_threads.append(thread)
-        self._diagnostic_workers.append(worker)
-        thread.start()
-
-    def _finish_diagnostic(self, result: DiagnosticResult) -> None:
-        status_text = result.status.value
-        row = self._test_rows.get(result.test_id)
-        if row:
-            row.setText(_diagnostic_row_text(result))
-            row.setToolTip(f"{status_text}: {result.summary}")
-        button = self._test_buttons.get(result.test_id)
-        if button:
-            button.setEnabled(True)
-        self.test_summary_label.setText(f"{result.label}: {result.summary}")
-        self.test_log.append(f"[{status_text}] {result.label} ({result.duration_ms} ms)")
-        self.test_log.append(result.summary)
-        if result.detail:
-            lines = result.detail.splitlines()
-            tail = "\n".join(lines[-100:])
-            self.test_log.append(tail)
-        if result.status is not DiagnosticStatus.PASS:
-            self.warning_label.setText(f"테스트 실패: {result.label}")
-
-    def _cleanup_diagnostic_worker(self, thread: QThread, worker: DiagnosticWorker) -> None:
-        if thread in self._diagnostic_threads:
-            self._diagnostic_threads.remove(thread)
-        if worker in self._diagnostic_workers:
-            self._diagnostic_workers.remove(worker)
-
-
-def _diagnostic_row_text(result: DiagnosticResult) -> str:
-    if result.status is DiagnosticStatus.PASS:
-        return f"PASS ({result.duration_ms} ms)"
-    if result.status is DiagnosticStatus.FAIL:
-        return f"FAIL ({result.duration_ms} ms)"
-    if result.status is DiagnosticStatus.SKIP:
-        return "SKIP"
-    return result.status.value
-
+    def _set_detection_button_texts(self, *, legacy_mode: bool = False) -> None:
+        if hasattr(self, "legacy_ai_detection_button"):
+            text = "이전 AI Detection ON" if self._detection_enabled and legacy_mode else "이전 AI Detection"
+            self.legacy_ai_detection_button.setText(text)
 
 def _fresh_detections(detections: tuple[DetectionEvent, ...]) -> tuple[DetectionEvent, ...]:
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=DETECTION_TTL_SECONDS)
@@ -1076,13 +1356,57 @@ def _detection_label(event: DetectionEvent) -> str:
     return f"{event.label} {event.confidence:.2f}"
 
 
-def _ai_detection_label(camera_ids: tuple[str, ...], event_counts: dict[str, int] | None = None) -> str:
+def _ai_detection_label(
+    camera_ids: tuple[str, ...],
+    event_counts: dict[str, int] | None = None,
+    *,
+    loading_seconds: float | None = None,
+    first_inference_seconds: float | None = None,
+) -> str:
     if not camera_ids:
-        return "AI Detection OFF"
+        return "AI 추론 OFF"
     if event_counts is None:
-        return "AI Detection ON: " + ", ".join(camera_ids)
+        label = "AI 추론 ON: " + ", ".join(camera_ids)
+    else:
+        parts = [f"{camera_id}({event_counts.get(camera_id, 0)})" for camera_id in camera_ids]
+        label = "AI 추론 ON: " + ", ".join(parts)
+    if first_inference_seconds is not None:
+        return f"{label} / first inference {first_inference_seconds:.1f}s"
+    if loading_seconds is not None:
+        return f"{label} / loading {loading_seconds:.1f}s"
+    return label
+
+
+def _legacy_ai_detection_label(camera_ids: tuple[str, ...], event_counts: dict[str, int] | None = None) -> str:
+    if not camera_ids:
+        return "이전 AI Detection OFF"
+    if event_counts is None:
+        return "이전 AI Detection ON: " + ", ".join(camera_ids)
     parts = [f"{camera_id}({event_counts.get(camera_id, 0)})" for camera_id in camera_ids]
-    return "AI Detection ON: " + ", ".join(parts)
+    return "이전 AI Detection ON: " + ", ".join(parts)
+
+
+def _purpose_detection_label(
+    label: str,
+    camera_ids: tuple[str, ...],
+    event_counts: dict[str, int] | None = None,
+    *,
+    loading_seconds: float | None = None,
+    first_inference_seconds: float | None = None,
+) -> str:
+    prefix = label or "목적 추론"
+    if not camera_ids:
+        text = f"{prefix} ON"
+    elif event_counts is None:
+        text = f"{prefix} ON: " + ", ".join(camera_ids)
+    else:
+        parts = [f"{camera_id}({event_counts.get(camera_id, 0)})" for camera_id in camera_ids]
+        text = f"{prefix} ON: " + ", ".join(parts)
+    if first_inference_seconds is not None:
+        return f"{text} / first inference {first_inference_seconds:.1f}s"
+    if loading_seconds is not None:
+        return f"{text} / loading {loading_seconds:.1f}s"
+    return text
 
 
 def launch_operator_ui(model: OperatorDisplayModel, settings: Settings | None = None) -> int:

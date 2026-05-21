@@ -1,13 +1,14 @@
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QRect, QSize
+from PyQt6.QtCore import QRect, QSize, QThread
 from PyQt6.QtWidgets import QApplication
 
 from towersightai.config.settings import Settings
-from towersightai.diagnostics import DiagnosticResult, DiagnosticStatus
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.state_machine.core import ParkingState
 from towersightai.ui.model import build_operator_display
@@ -16,12 +17,14 @@ from towersightai.ui.pyqt_app import (
     SIDEBAR_ACTION_LABELS,
     LiveDetectionWorker,
     OperatorWindow,
+    PurposeInferenceWorker,
     _bbox_to_rect,
     _ai_detection_label,
     _detection_label,
-    _diagnostic_row_text,
     _fresh_detections,
+    _legacy_ai_detection_label,
     _network_bbox_to_source_bbox,
+    _purpose_detection_label,
     _rotate_cv_frame,
     _rotation_label,
     _streaming_camera_ids,
@@ -48,31 +51,6 @@ def _qt_app() -> QApplication:
     global _APP
     _APP = QApplication.instance() or QApplication([])
     return _APP
-
-
-def test_diagnostic_row_text_stays_compact_for_failures():
-    result = DiagnosticResult(
-        test_id="camera_3",
-        label="카메라 3 프레임 수신",
-        status=DiagnosticStatus.FAIL,
-        summary="timed out waiting for a frame from an unavailable camera",
-        duration_ms=10027,
-    )
-
-    assert _diagnostic_row_text(result) == "FAIL (10027 ms)"
-    assert result.summary not in _diagnostic_row_text(result)
-
-
-def test_diagnostic_row_text_stays_compact_for_passes():
-    result = DiagnosticResult(
-        test_id="camera_1",
-        label="카메라 1 프레임 수신",
-        status=DiagnosticStatus.PASS,
-        summary="프레임 수신 성공",
-        duration_ms=42,
-    )
-
-    assert _diagnostic_row_text(result) == "PASS (42 ms)"
 
 
 def test_detection_bbox_maps_to_image_rect():
@@ -162,7 +140,22 @@ def test_cv_fallback_frame_rotation_matches_ui_setting():
 
 
 def test_ai_detection_label_shows_all_target_cameras_and_counts():
-    assert _ai_detection_label(("ceiling", "front"), {"ceiling": 0, "front": 7}) == "AI Detection ON: ceiling(0), front(7)"
+    assert _ai_detection_label(("ceiling", "front"), {"ceiling": 0, "front": 7}) == "AI 추론 ON: ceiling(0), front(7)"
+    assert "loading 1.2s" in _ai_detection_label(("ceiling",), {"ceiling": 0}, loading_seconds=1.2)
+    assert "first inference 3.4s" in _ai_detection_label(("ceiling",), {"ceiling": 2}, first_inference_seconds=3.4)
+
+
+def test_legacy_ai_detection_label_shows_counts_without_model_load_state():
+    assert _legacy_ai_detection_label(()) == "이전 AI Detection OFF"
+    assert _legacy_ai_detection_label(("ceiling", "front"), {"ceiling": 3, "front": 9}) == (
+        "이전 AI Detection ON: ceiling(3), front(9)"
+    )
+
+
+def test_purpose_detection_label_shows_task_counts_and_load_time():
+    assert _purpose_detection_label("차량 전용 검출", ("front",), {"front": 2}) == "차량 전용 검출 ON: front(2)"
+    assert "loading 1.5s" in _purpose_detection_label("번호판 이미지 LPR", (), loading_seconds=1.5)
+    assert "first inference 2.4s" in _purpose_detection_label("사람 존재 감지", ("front",), first_inference_seconds=2.4)
 
 
 def test_operator_side_panel_width_is_fixed_for_long_detection_status():
@@ -177,12 +170,20 @@ def test_operator_ui_starts_on_dashboard_with_sidebar_closed():
 
     assert app is not None
     assert window.stack.currentWidget() is window.operator_view
-    assert window.stack.count() == 3
+    assert window.stack.count() == 2
     assert window._camera_layout_mode == "dashboard"
     assert window.operator_sidebar.isHidden() is True
     assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
     assert "운전자 화면" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert sum(1 for button in window.sidebar_buttons.values() if button.text() == "EMPTY") == 7
+    assert "이전 AI Detection" in {button.text() for button in window.sidebar_buttons.values()}
+    assert "차량 전용 검출" in {button.text() for button in window.sidebar_buttons.values()}
+    assert "번호판 이미지 LPR" in {button.text() for button in window.sidebar_buttons.values()}
+    assert "사람 존재 감지" in {button.text() for button in window.sidebar_buttons.values()}
+    assert "AI모델 선택" not in {button.text() for button in window.sidebar_buttons.values()}
+    assert "테스트" not in {button.text() for button in window.sidebar_buttons.values()}
+    assert "AI Detection" not in {button.text() for button in window.sidebar_buttons.values()}
+    assert "Multi-Camera Re-ID" not in {button.text() for button in window.sidebar_buttons.values()}
+    assert sum(1 for button in window.sidebar_buttons.values() if button.text() == "EMPTY") == 2
 
     window.sidebar_toggle_button.click()
     assert window.operator_sidebar.isHidden() is False
@@ -204,7 +205,7 @@ def test_camera_settings_rotation_button_updates_runtime_rotation_state():
 
     assert window._camera_rotations["ceiling"] == 90
     assert "천장 버드뷰: CCW 90도 회전" in window.camera_rotation_buttons["ceiling"].text()
-    assert "AI Detection은 다음 시작부터 같은 회전 스트림" in window.warning_label.text()
+    assert "AI 추론은 다음 시작부터 같은 회전 스트림" in window.warning_label.text()
     window.close()
 
 
@@ -230,12 +231,179 @@ def test_operator_window_initializes_camera_rotation_from_settings(monkeypatch):
     window.close()
 
 
+def test_ai_detection_timeout_marks_selected_model_unconfirmed(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    window._detection_enabled = True
+    window._detection_camera_ids = ("ceiling",)
+    window._detection_event_counts = {"ceiling": 0}
+    window._detection_model_label = "selected.hef"
+    window._detection_load_started_at = 0.0
+    window._detection_first_inference_seconds = None
+    monkeypatch.setattr("towersightai.ui.pyqt_app.time.monotonic", lambda: 31.0)
+
+    window._tick()
+
+    assert "추론 미확인: selected.hef" == window.model_status_label.text()
+    assert "AI 추론 실패" in window.warning_label.text()
+    window.close()
+
+
 def test_live_detection_worker_keeps_ui_rotation_map_for_pipeline_start():
     settings = _settings()
 
-    worker = LiveDetectionWorker(settings, ("ceiling", "front"), camera_rotations={"ceiling": 90, "front": 0})
+    worker = LiveDetectionWorker(settings, ("ceiling", "front"), camera_rotations={"ceiling": 90, "front": 0}, hef_path=Path("/tmp/selected.hef"))
 
     assert worker.camera_rotations == {"ceiling": 90, "front": 0}
+    assert worker.hef_path == Path("/tmp/selected.hef")
+
+
+def test_live_detection_worker_legacy_mode_keeps_previous_pipeline_inputs():
+    settings = _settings()
+
+    worker = LiveDetectionWorker(
+        settings,
+        ("ceiling", "front"),
+        camera_rotations={"ceiling": 90, "front": 0},
+        hef_path=Path("/tmp/selected.hef"),
+        legacy_mode=True,
+    )
+
+    assert worker.legacy_mode is True
+    assert worker.camera_rotations == {"ceiling": 90, "front": 0}
+
+
+def test_live_detection_worker_normal_mode_reuses_previous_event_path_with_selected_hef(monkeypatch):
+    settings = _settings()
+    calls = []
+
+    def fake_live_process(settings_arg, cameras_arg, **kwargs):
+        calls.append((settings_arg, cameras_arg, kwargs))
+        return SimpleNamespace(command=("gst-launch-1.0", f"hailonet hef-path={kwargs.get('hef_path') or settings_arg.hailo_hef_path}"), hef_path=kwargs.get("hef_path") or settings_arg.hailo_hef_path)
+
+    monkeypatch.setattr("towersightai.ui.pyqt_app.live_multistream_detection_process", fake_live_process)
+    worker = LiveDetectionWorker(
+        settings,
+        ("ceiling", "front"),
+        camera_rotations={"ceiling": 90, "front": 0},
+        hef_path=Path("/tmp/selected.hef"),
+    )
+
+    process = worker._build_process()
+
+    assert process.hef_path == Path("/tmp/selected.hef")
+    assert calls[0][2] == {"camera_rotations": {"ceiling": 90, "front": 0}, "hef_path": Path("/tmp/selected.hef")}
+    assert "event_dir" not in calls[0][2]
+
+
+def test_live_detection_worker_legacy_mode_uses_previous_process_without_hef_override(monkeypatch):
+    settings = _settings()
+    calls = []
+
+    def fake_live_process(settings_arg, cameras_arg, **kwargs):
+        calls.append((settings_arg, cameras_arg, kwargs))
+        return SimpleNamespace(command=("gst-launch-1.0", f"hailonet hef-path={settings_arg.hailo_hef_path}"), hef_path=settings_arg.hailo_hef_path)
+
+    monkeypatch.setattr("towersightai.ui.pyqt_app.live_multistream_detection_process", fake_live_process)
+    worker = LiveDetectionWorker(
+        settings,
+        ("ceiling", "front"),
+        camera_rotations={"ceiling": 90, "front": 0},
+        hef_path=Path("/tmp/selected.hef"),
+        legacy_mode=True,
+    )
+
+    process = worker._build_process()
+
+    assert process.hef_path == settings.hailo_hef_path
+    assert calls[0][2] == {"camera_rotations": {"ceiling": 90, "front": 0}}
+    assert "hef_path" not in calls[0][2]
+    assert "event_dir" not in calls[0][2]
+
+
+def test_legacy_ai_detection_button_starts_previous_detection_path(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    window._runtime_camera_status = {"ceiling": "정상 수신", "front": "정상 수신"}
+
+    window.sidebar_buttons["이전 AI Detection"].click()
+
+    assert window._detection_legacy_mode is True
+    assert window.legacy_ai_detection_button.isChecked() is True
+    assert window.legacy_ai_detection_button.text() == "이전 AI Detection ON"
+    assert not hasattr(window, "ai_detection_button")
+    assert len(window._detection_workers) == 1
+    assert window._detection_workers[0].legacy_mode is True
+    assert window._detection_workers[0].hef_path is None
+    assert window.ai_detection_label.text() == "이전 AI Detection ON: ceiling(0), front(0)"
+    window.close()
+
+
+def test_vehicle_purpose_button_starts_front_only_task(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    window._runtime_camera_status = {"front": "정상 수신", "ceiling": "정상 수신"}
+
+    window.sidebar_buttons["차량 전용 검출"].click()
+
+    assert window._purpose_task_enabled is True
+    assert window._purpose_task_id == "vehicle_detection"
+    assert window.purpose_task_buttons["vehicle_detection"].isChecked() is True
+    assert len(window._purpose_workers) == 1
+    assert isinstance(window._purpose_workers[0], PurposeInferenceWorker)
+    assert window._purpose_workers[0].camera_ids == ("front",)
+    assert window.ai_detection_label.text() == "차량 전용 검출 ON: front(0) / loading 0.0s"
+    window.close()
+
+
+def test_lpr_purpose_button_starts_image_task_without_camera(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+
+    window.sidebar_buttons["번호판 이미지 LPR"].click()
+
+    assert window._purpose_task_enabled is True
+    assert window._purpose_task_id == "lpr_image"
+    assert window.purpose_task_buttons["lpr_image"].isChecked() is True
+    assert len(window._purpose_workers) == 1
+    assert window._purpose_workers[0].camera_ids == ()
+    assert window.ai_detection_label.text() == "번호판 이미지 LPR ON / loading 0.0s"
+    window.close()
+
+
+def test_person_presence_purpose_button_uses_streaming_cameras(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    window._runtime_camera_status = {"ceiling": "정상 수신", "front": "정상 수신", "rear_side": "NG: 프레임 지연"}
+
+    window.sidebar_buttons["사람 존재 감지"].click()
+
+    assert window._purpose_task_enabled is True
+    assert window._purpose_task_id == "person_presence"
+    assert window.purpose_task_buttons["person_presence"].isChecked() is True
+    assert len(window._purpose_workers) == 1
+    assert window._purpose_workers[0].camera_ids == ("ceiling", "front")
+    assert window.ai_detection_label.text() == "사람 존재 감지 ON: ceiling(0), front(0) / loading 0.0s"
+    window.close()
 
 
 def test_vehicle_entry_simulation_is_ui_only_and_keeps_final_ok_blocked():

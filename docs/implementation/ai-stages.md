@@ -111,6 +111,8 @@ Purpose:
 Implementation notes:
 
 - A single credible person detection is enough to block OK.
+- The current UI-connected implementation is `사람 존재 감지`, a detector-only Hailo purpose task over currently streaming cameras.
+- Do not use Multi-Camera Re-ID for safety gating. The system needs person existence, not identity continuity.
 - Use configured ROIs to ignore irrelevant outside areas when appropriate.
 - Continue sending or holding `human_present` while a person remains possible.
 

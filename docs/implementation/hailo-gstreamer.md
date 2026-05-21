@@ -81,9 +81,20 @@ The state machine must not parse raw Hailo objects directly.
 ## Model Policy
 
 - Initial object detection may use YOLO HEF paths from TAPPAS references.
+- Purpose-specific operator controls use fixed known model sets instead of arbitrary runtime HEF selection:
+  - `차량 전용 검출`: LPR example `yolov5m_vehicles`.
+  - `번호판 이미지 LPR`: LPR example vehicle, plate, and OCR models.
+  - `사람 존재 감지`: TAPPAS multi-person tracking detector stage only, using `yolov5s_personface_reid.hef` and `yolov5_personface_letterbox`.
+- Person-presence detection must not run Re-ID embedding, `hailogallery`, or same-person tracking; it only emits normalized `person`/`human` detections so safety logic can conservatively block OK.
 - Plate OCR and in-vehicle occupancy may require separate models or CPU-side modules. Keep those behind interfaces until the model is selected.
 - Model thresholds must be configurable and tested.
 - Low confidence must become NG or retry, never OK.
+
+## Runtime Failure Handling
+
+Hailo/TAPPAS failures can leave `gst-launch` alive after fatal errors such as `HAILO_OUT_OF_PHYSICAL_DEVICES`, `Failed to create vdevice`, `CHECK_SUCCESS failed`, or `Caught SIGSEGV`. Inference runners must watch the log tail, report the failure to the UI, terminate the process group, and escalate to SIGKILL if SIGTERM does not stop the process. A stuck or failed pipeline is NG/wait, never OK.
+
+Each inference launch should overwrite its own GStreamer log instead of appending indefinitely. This prevents stale fatal messages from a previous run being interpreted as the current run state.
 
 ## Pipeline Testing
 

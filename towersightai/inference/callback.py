@@ -48,6 +48,7 @@ def run_with_config(
     camera_id: str,
     event_path: str | None = None,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    allowed_labels: tuple[str, ...] | None = None,
 ):
     detections = _extract_detections(video_frame)
     if not detections:
@@ -59,6 +60,9 @@ def run_with_config(
         timestamp=datetime.now(timezone.utc),
         min_confidence=min_confidence,
     )
+    if allowed_labels is not None:
+        normalized_labels = {label.lower() for label in allowed_labels}
+        events = tuple(event for event in events if event.label.lower() in normalized_labels)
     _write_events(events, event_path=event_path)
     _print_summary(events)
     return _flow_ok()

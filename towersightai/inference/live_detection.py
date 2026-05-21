@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import signal
@@ -18,6 +19,16 @@ from towersightai.inference.image_smoke import HAILO_CALLBACK_MODULE, NETWORK_FO
 
 
 DEFAULT_DETECTION_DIR = Path("artifacts/runtime/detections")
+FATAL_GSTREAMER_PATTERNS = (
+    "HAILO_OUT_OF_PHYSICAL_DEVICES",
+    "Failed to create vdevice",
+    "Caught SIGSEGV",
+    "CHECK_SUCCESS failed",
+    "CHECK_EXPECTED failed",
+    "파이프라인이 재생을 원하지 않음",
+    "파이프라인이 PREROLL하기를 원하지 않음",
+    "Internal data stream error",
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +36,7 @@ class LiveDetectionProcess:
     command: tuple[str, ...]
     event_path: Path
     env: dict[str, str]
+    hef_path: Path
     log_path: Path | None = None
 
 
@@ -35,9 +47,11 @@ def build_live_detection_pipeline(
     latency_ms: int = 100,
     min_confidence: float = 0.1,
     rotation_degrees: int | None = None,
+    hef_path: Path | None = None,
 ) -> str:
     rotation = camera.rotation_degrees if rotation_degrees is None else rotation_degrees
     orientation = display_orientation_element(rotation)
+    effective_hef_path = Path(hef_path or settings.hailo_hef_path)
     return " ".join(
         (
             f"rtspsrc location={camera.rtsp_url} latency={latency_ms} protocols=tcp drop-on-latency=true",
@@ -50,7 +64,7 @@ def build_live_detection_pipeline(
             "! videoconvert n-threads=3",
             f"! video/x-raw,format={NETWORK_FORMAT},width={NETWORK_WIDTH},height={NETWORK_HEIGHT},pixel-aspect-ratio=1/1",
             "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream",
-            f"! hailonet hef-path={settings.hailo_hef_path} batch-size=1 nms-score-threshold={min_confidence} "
+            f"! hailonet hef-path={effective_hef_path} batch-size=1 nms-score-threshold={min_confidence} "
             "nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32",
             "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream",
             f"! hailofilter function-name={settings.hailo_network_name} so-path={settings.hailo_postprocess_so} qos=false",
@@ -70,7 +84,9 @@ def build_live_multistream_detection_pipeline(
     latency_ms: int = 100,
     min_confidence: float = 0.1,
     camera_rotations: dict[str, int] | None = None,
+    hef_path: Path | None = None,
 ) -> str:
+    effective_hef_path = Path(hef_path or settings.hailo_hef_path)
     streamrouter_inputs = " ".join(
         f'src_{index}::input-streams="<sink_{index}>"'
         for index, _camera in enumerate(cameras)
@@ -89,7 +105,7 @@ def build_live_multistream_detection_pipeline(
         (
             "hailoroundrobin mode=0 name=fun",
             "! queue name=hailo_pre_infer_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={settings.hailo_hef_path} batch-size=1 nms-score-threshold={min_confidence} "
+            f"! hailonet hef-path={effective_hef_path} batch-size=1 nms-score-threshold={min_confidence} "
             "nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32",
             "! queue name=hailo_postprocess_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
             f"! hailofilter function-name={settings.hailo_network_name} so-path={settings.hailo_postprocess_so} qos=false",
@@ -140,15 +156,18 @@ def live_detection_process(
     latency_ms: int = 100,
     min_confidence: float = 0.1,
     rotation_degrees: int | None = None,
+    hef_path: Path | None = None,
     gst_launch: str = "gst-launch-1.0",
 ) -> LiveDetectionProcess:
     event_path = event_dir / f"{camera.id}.jsonl"
+    effective_hef_path = Path(hef_path or settings.hailo_hef_path)
     pipeline = build_live_detection_pipeline(
         settings,
         camera,
         latency_ms=latency_ms,
         min_confidence=min_confidence,
         rotation_degrees=rotation_degrees,
+        hef_path=effective_hef_path,
     )
     env = _gst_runtime_env(settings)
     env.update(
@@ -162,6 +181,7 @@ def live_detection_process(
         command=(gst_launch, "-q", *shlex.split(pipeline)),
         event_path=event_path,
         env=env,
+        hef_path=effective_hef_path,
         log_path=event_dir / f"{camera.id}.gst.log",
     )
 
@@ -174,12 +194,14 @@ def live_multistream_detection_process(
     latency_ms: int = 100,
     min_confidence: float = 0.1,
     camera_rotations: dict[str, int] | None = None,
+    hef_path: Path | None = None,
     gst_launch: str = "gst-launch-1.0",
 ) -> LiveDetectionProcess:
     if not cameras:
         raise ValueError("At least one camera is required for live multistream detection.")
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "multistream.jsonl"
+    effective_hef_path = Path(hef_path or settings.hailo_hef_path)
     callback_modules = {
         camera.id: _write_multistream_callback_module(
             event_dir=event_dir,
@@ -196,6 +218,7 @@ def live_multistream_detection_process(
         latency_ms=latency_ms,
         min_confidence=min_confidence,
         camera_rotations=camera_rotations,
+        hef_path=effective_hef_path,
     )
     env = _gst_runtime_env(settings)
     env.update(
@@ -208,6 +231,7 @@ def live_multistream_detection_process(
         command=(gst_launch, "-q", *shlex.split(pipeline)),
         event_path=event_path,
         env=env,
+        hef_path=effective_hef_path,
         log_path=event_dir / "multistream.gst.log",
     )
 
@@ -316,8 +340,11 @@ class LiveDetectionRunner:
         if self.process.log_path is not None:
             self.process.log_path.parent.mkdir(parents=True, exist_ok=True)
         tail = DetectionFileTail(self.process.event_path)
-        stderr_target = self.process.log_path.open("a", encoding="utf-8") if self.process.log_path is not None else subprocess.DEVNULL
+        stderr_target = self.process.log_path.open("w", encoding="utf-8") if self.process.log_path is not None else subprocess.DEVNULL
         try:
+            if hasattr(stderr_target, "write"):
+                stderr_target.write(_launch_log_text(self.process))
+                stderr_target.flush()
             self._process = subprocess.Popen(
                 self.process.command,
                 stdout=subprocess.DEVNULL,
@@ -331,6 +358,11 @@ class LiveDetectionRunner:
                 events = tail.read_new_events()
                 if events:
                     self.on_events(events)
+                fatal_message = _fatal_log_message(self.process.log_path)
+                if fatal_message:
+                    self.on_error(fatal_message)
+                    self._terminate_process(force=True)
+                    break
                 if self._process.poll() is not None:
                     break
                 time.sleep(self.poll_seconds)
@@ -346,7 +378,7 @@ class LiveDetectionRunner:
                 stderr_target.close()
         return True
 
-    def _terminate_process(self) -> None:
+    def _terminate_process(self, *, force: bool = False) -> None:
         process = self._process
         if process is None or process.poll() is not None:
             return
@@ -354,6 +386,15 @@ class LiveDetectionRunner:
             os_killpg(process.pid, signal.SIGTERM)
         except OSError:
             process.terminate()
+        if not force:
+            return
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os_killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                process.kill()
 
 
 def os_killpg(pid: int, sig: signal.Signals) -> None:
@@ -366,11 +407,42 @@ def latest_events(events: Iterable[DetectionEvent], *, limit: int = 20) -> tuple
     return tuple(sorted(events, key=lambda event: event.confidence, reverse=True)[:limit])
 
 
+def _launch_log_text(process: LiveDetectionProcess) -> str:
+    return "\n".join(
+        (
+            "",
+            "TowerSightAI AI Detection launch",
+            f"active-hef-path={process.hef_path}",
+            f"event-path={process.event_path}",
+            f"command-redacted={_redacted_command_text(process.command)}",
+            "",
+        )
+    )
+
+
+def _redacted_command_text(command: tuple[str, ...]) -> str:
+    return _redact_rtsp_credentials(" ".join(shlex.quote(part) for part in command))
+
+
+def _redact_rtsp_credentials(text: str) -> str:
+    return re.sub(r"(rtsp://)([^:/@\s]+):([^@\s]+)@", r"\1***:***@", text)
+
+
 def _process_error_message(returncode: int | None, log_path: Path | None) -> str:
     log_tail = _read_log_tail(log_path)
     if log_tail:
         return log_tail
     return f"gst-launch exited with {returncode}"
+
+
+def _fatal_log_message(log_path: Path | None) -> str:
+    log_tail = _read_log_tail(log_path)
+    if not log_tail:
+        return ""
+    for pattern in FATAL_GSTREAMER_PATTERNS:
+        if pattern in log_tail:
+            return log_tail
+    return ""
 
 
 def _read_log_tail(log_path: Path | None, *, max_chars: int = 4000) -> str:

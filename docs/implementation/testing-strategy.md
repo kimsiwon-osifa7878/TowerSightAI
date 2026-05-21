@@ -1,6 +1,6 @@
 # Testing Strategy Guide
 
-Every implementation stage needs tests. Safety logic must be testable without live cameras, Hailo-8, or PLC hardware. From the current prototype forward, the operator UI test screen is also a field-verification hub.
+Every implementation stage needs tests. Safety logic must be testable without live cameras, Hailo-8, or PLC hardware. The current operator UI is the primary field-verification surface for dashboard, camera, and purpose-AI flows.
 
 ## Test Layers
 
@@ -18,6 +18,8 @@ Run on any developer machine:
 - Calibration geometry persistence and validation.
 - UI state-to-message mapping.
 - Operator dashboard, sidebar, EMPTY action, and simulation behavior.
+- Purpose-specific Hailo pipeline builders for vehicle detection, LPR image tests, and person-presence detection.
+- Fatal Hailo/GStreamer log handling so stuck `gst-launch` processes do not leave the UI loading indefinitely.
 
 ## UI-Only Tests
 
@@ -44,9 +46,9 @@ Run without real hardware by using fakes:
 
 Fake-data tests may update the UI, but they must not imply real safety approval.
 
-## In-UI Diagnostic Tests
+## Diagnostic Tests
 
-Run from the operator test screen:
+Run through CLI or explicit hardware verification tooling:
 
 - Settings validation.
 - Hailo installation check.
@@ -76,7 +78,10 @@ Manual or semi-automated checklist:
 - Confirm ceiling birdview uses the vertical tile and CCW 90-degree display policy.
 - Confirm `메뉴` opens the sidebar.
 - Click `전체 카메라` and confirm the four-camera inspection layout is visible.
-- Click `테스트` and confirm the diagnostic list and log panel are visible.
+- For Hailo regression isolation, click `이전 AI Detection` and compare whether detection events resume through the previous `HAILO_HEF_PATH` launch path.
+- Click `차량 전용 검출` and confirm the status strip shows the purpose task, the front camera is the only target, and `artifacts/runtime/purpose-ai/vehicle_detection/vehicle.gst.log` contains `yolov5m_vehicles.hef`.
+- Click `번호판 이미지 LPR` and confirm `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` contains `yolov5m_vehicles.hef`, `tiny_yolov4_license_plates.hef`, `lprnet.hef`, and OCR postprocess output or errors.
+- Click `사람 존재 감지` and confirm `artifacts/runtime/purpose-ai/person_presence/person_presence.gst.log` contains `yolov5s_personface_reid.hef` and `yolov5_personface_letterbox`, but does not contain `repvgg_a0_person_reid_2048.hef` or `hailogallery`.
 - Click `차량 진입 시뮬레이션` and confirm only test overlay/instruction text changes.
 - Click at least one `EMPTY` button and confirm it is a safe no-op.
 - Confirm simulation and EMPTY actions do not show final OK and do not send PLC events.
@@ -84,7 +89,7 @@ Manual or semi-automated checklist:
 
 This UI verification is an implementation check, not a product safety approval. If the local environment cannot run the GUI, record the blocker in the final report.
 
-Future automation can extend `tools/verify_operator_ui_screenshot.sh` to use `xdotool` for clicking `메뉴`, `전체 카메라`, `테스트`, `차량 진입 시뮬레이션`, and `EMPTY`, saving a screenshot after each step.
+Future automation can extend `tools/verify_operator_ui_screenshot.sh` to use `xdotool` for clicking `메뉴`, `전체 카메라`, `사람 존재 감지`, `차량 진입 시뮬레이션`, and `EMPTY`, saving a screenshot after each step.
 
 ## Hardware Smoke Tests
 
