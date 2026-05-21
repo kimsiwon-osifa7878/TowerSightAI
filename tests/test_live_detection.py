@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from towersightai.config.settings import Settings
 from towersightai.inference.live_detection import (
     DetectionFileTail,
+    LiveDetectionProcess,
+    LiveDetectionRunner,
     build_live_detection_pipeline,
     build_live_multistream_detection_pipeline,
     live_detection_process,
@@ -146,6 +149,36 @@ def test_live_multistream_detection_process_writes_camera_specific_callbacks(tmp
     assert f"event_path='{process.event_path}'" in ceiling_callback.read_text(encoding="utf-8")
     assert f"hailopython module={ceiling_callback}" in " ".join(process.command)
     assert f"hailopython module={front_callback}" in " ".join(process.command)
+    assert process.log_path == tmp_path / "events" / "multistream.gst.log"
+
+
+def test_live_detection_runner_redirects_gstreamer_output_to_log_file(tmp_path: Path, monkeypatch):
+    popen_kwargs = {}
+
+    class CompletedProcess:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(*args, **kwargs):
+        popen_kwargs.update(kwargs)
+        return CompletedProcess()
+
+    monkeypatch.setattr("towersightai.inference.live_detection.shutil.which", lambda _command: "/usr/bin/gst-launch-1.0")
+    monkeypatch.setattr("towersightai.inference.live_detection.subprocess.Popen", fake_popen)
+    process = LiveDetectionProcess(
+        command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
+        event_path=tmp_path / "events.jsonl",
+        env={},
+        log_path=tmp_path / "gst.log",
+    )
+    runner = LiveDetectionRunner(process, on_events=lambda _events: None, on_error=lambda _message: None)
+
+    assert runner.run() is True
+
+    assert popen_kwargs["stdout"] == subprocess.DEVNULL
+    assert popen_kwargs["stderr"].name == str(tmp_path / "gst.log")
 
 
 def test_parse_detection_json_and_tail_reads_only_new_events(tmp_path: Path):

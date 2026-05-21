@@ -280,7 +280,8 @@ class LiveDetectionWorker(QObject):
             self._runner.stop()
 
     def run(self) -> None:
-        for attempt in range(2):
+        attempt = 0
+        while not self._stop_requested:
             if self._stop_requested:
                 break
             process = live_multistream_detection_process(
@@ -303,10 +304,15 @@ class LiveDetectionWorker(QObject):
                     self.status_changed.emit(camera_id, message)
 
             self._runner = LiveDetectionRunner(process, on_events=on_events, on_error=on_error)
-            self._runner.run()
+            started = self._runner.run()
             if self._stop_requested:
                 break
-            QThread.msleep(500)
+            if not started:
+                break
+            attempt += 1
+            for camera_id in self.camera_ids:
+                self.status_changed.emit(camera_id, "AI Detection 재시작 대기")
+            QThread.msleep(min(5000, 500 * attempt))
         for camera_id in self.camera_ids:
             self.finished.emit(camera_id)
 
@@ -440,7 +446,7 @@ class OperatorWindow(QMainWindow):
         widget.set_detections(detections)
 
     def _set_detection_status(self, camera_id: str, message: str) -> None:
-        if "실행 중" in message or "재시도 중" in message:
+        if "실행 중" in message or "재시도 중" in message or "재시작 대기" in message:
             self.ai_detection_label.setText(_ai_detection_label(self._detection_camera_ids, self._detection_event_counts))
             return
         self.ai_detection_label.setText(f"AI Detection 오류: {camera_id}")
@@ -899,6 +905,13 @@ class OperatorWindow(QMainWindow):
             self._detection_threads.remove(thread)
         if worker in self._detection_workers:
             self._detection_workers.remove(worker)
+        if self._detection_enabled and not self._detection_workers:
+            self._detection_enabled = False
+            self._detection_camera_ids = ()
+            self._detection_event_counts = {}
+            if hasattr(self, "ai_detection_button"):
+                self.ai_detection_button.setChecked(False)
+                self.ai_detection_button.setText("AI Detection")
 
     def _start_diagnostic(self, test_id: str) -> None:
         if self.diagnostics is None:

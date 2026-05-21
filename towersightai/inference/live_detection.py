@@ -25,6 +25,7 @@ class LiveDetectionProcess:
     command: tuple[str, ...]
     event_path: Path
     env: dict[str, str]
+    log_path: Path | None = None
 
 
 def build_live_detection_pipeline(
@@ -161,6 +162,7 @@ def live_detection_process(
         command=(gst_launch, "-q", *shlex.split(pipeline)),
         event_path=event_path,
         env=env,
+        log_path=event_dir / f"{camera.id}.gst.log",
     )
 
 
@@ -206,6 +208,7 @@ def live_multistream_detection_process(
         command=(gst_launch, "-q", *shlex.split(pipeline)),
         event_path=event_path,
         env=env,
+        log_path=event_dir / "multistream.gst.log",
     )
 
 
@@ -302,39 +305,46 @@ class LiveDetectionRunner:
         self._running = False
         self._terminate_process()
 
-    def run(self) -> None:
+    def run(self) -> bool:
         if shutil.which(self.process.command[0]) is None:
             self.on_error(f"{self.process.command[0]} not found")
-            return
+            return False
 
         self.process.event_path.parent.mkdir(parents=True, exist_ok=True)
         if self.process.event_path.exists():
             self.process.event_path.unlink()
+        if self.process.log_path is not None:
+            self.process.log_path.parent.mkdir(parents=True, exist_ok=True)
         tail = DetectionFileTail(self.process.event_path)
-        self._process = subprocess.Popen(
-            self.process.command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=self.process.env,
-            start_new_session=True,
-        )
+        stderr_target = self.process.log_path.open("a", encoding="utf-8") if self.process.log_path is not None else subprocess.DEVNULL
+        try:
+            self._process = subprocess.Popen(
+                self.process.command,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_target,
+                text=True,
+                env=self.process.env,
+                start_new_session=True,
+            )
 
-        while self._running:
+            while self._running:
+                events = tail.read_new_events()
+                if events:
+                    self.on_events(events)
+                if self._process.poll() is not None:
+                    break
+                time.sleep(self.poll_seconds)
+
             events = tail.read_new_events()
             if events:
                 self.on_events(events)
-            if self._process.poll() is not None:
-                break
-            time.sleep(self.poll_seconds)
-
-        events = tail.read_new_events()
-        if events:
-            self.on_events(events)
-        if self._running and self._process.poll() not in (None, 0):
-            _stdout, stderr = self._process.communicate(timeout=1)
-            self.on_error((stderr or f"gst-launch exited with {self._process.returncode}").strip())
-        self._terminate_process()
+            if self._running and self._process.poll() not in (None, 0):
+                self.on_error(_process_error_message(self._process.returncode, self.process.log_path))
+        finally:
+            self._terminate_process()
+            if hasattr(stderr_target, "close"):
+                stderr_target.close()
+        return True
 
     def _terminate_process(self) -> None:
         process = self._process
@@ -354,3 +364,23 @@ def os_killpg(pid: int, sig: signal.Signals) -> None:
 
 def latest_events(events: Iterable[DetectionEvent], *, limit: int = 20) -> tuple[DetectionEvent, ...]:
     return tuple(sorted(events, key=lambda event: event.confidence, reverse=True)[:limit])
+
+
+def _process_error_message(returncode: int | None, log_path: Path | None) -> str:
+    log_tail = _read_log_tail(log_path)
+    if log_tail:
+        return log_tail
+    return f"gst-launch exited with {returncode}"
+
+
+def _read_log_tail(log_path: Path | None, *, max_chars: int = 4000) -> str:
+    if log_path is None or not log_path.exists():
+        return ""
+    try:
+        with log_path.open("rb") as fp:
+            fp.seek(0, 2)
+            size = fp.tell()
+            fp.seek(max(0, size - max_chars))
+            return fp.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
