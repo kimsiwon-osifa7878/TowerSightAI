@@ -19,6 +19,13 @@ class CameraConfig:
     rtsp_url: str
     username: str | None = None
     password: str | None = None
+    rotation_degrees: int = 0
+
+    def __post_init__(self) -> None:
+        rotation = int(self.rotation_degrees) % 360
+        if rotation not in {0, 90, 180, 270}:
+            raise ValueError("Camera rotation must be one of 0, 90, 180, or 270 degrees.")
+        object.__setattr__(self, "rotation_degrees", rotation)
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,7 @@ class Settings:
             rtsp_url=camera["rtsp_url"],
             username=camera.get("username"),
             password=camera.get("password"),
+            rotation_degrees=int(camera.get("rotation_degrees", 0)),
         )
 
     def _as_resolution(self, resolution: CameraResolution | tuple[int, int] | str) -> CameraResolution:

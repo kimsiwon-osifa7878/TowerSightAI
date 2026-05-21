@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
+from towersightai.camera.pipeline import display_orientation_element
 from towersightai.config.settings import CameraConfig, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.inference.image_smoke import HAILO_CALLBACK_MODULE, NETWORK_FORMAT, NETWORK_HEIGHT, NETWORK_WIDTH, _gst_runtime_env
@@ -32,7 +33,10 @@ def build_live_detection_pipeline(
     *,
     latency_ms: int = 100,
     min_confidence: float = 0.1,
+    rotation_degrees: int | None = None,
 ) -> str:
+    rotation = camera.rotation_degrees if rotation_degrees is None else rotation_degrees
+    orientation = display_orientation_element(rotation)
     return " ".join(
         (
             f"rtspsrc location={camera.rtsp_url} latency={latency_ms} protocols=tcp drop-on-latency=true",
@@ -40,6 +44,7 @@ def build_live_detection_pipeline(
             "! h264parse",
             "! decodebin",
             "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream",
+            f"! {orientation}" if orientation else "",
             "! videoscale add-borders=true n-threads=2",
             "! videoconvert n-threads=3",
             f"! video/x-raw,format={NETWORK_FORMAT},width={NETWORK_WIDTH},height={NETWORK_HEIGHT},pixel-aspect-ratio=1/1",
@@ -63,6 +68,7 @@ def build_live_multistream_detection_pipeline(
     callback_modules: dict[str, Path],
     latency_ms: int = 100,
     min_confidence: float = 0.1,
+    camera_rotations: dict[str, int] | None = None,
 ) -> str:
     streamrouter_inputs = " ".join(
         f'src_{index}::input-streams="<sink_{index}>"'
@@ -74,6 +80,7 @@ def build_live_multistream_detection_pipeline(
             index=index,
             callback_module=callback_modules[camera.id],
             latency_ms=latency_ms,
+            rotation_degrees=(camera_rotations or {}).get(camera.id, camera.rotation_degrees),
         )
         for index, camera in enumerate(cameras)
     )
@@ -98,7 +105,9 @@ def _multistream_source_branch(
     index: int,
     callback_module: Path,
     latency_ms: int,
+    rotation_degrees: int,
 ) -> str:
+    orientation = display_orientation_element(rotation_degrees)
     return " ".join(
         (
             f"rtspsrc location={camera.rtsp_url} name=source_{index} message-forward=true "
@@ -107,6 +116,7 @@ def _multistream_source_branch(
             "! h264parse",
             "! decodebin",
             f"! queue name=hailo_preprocess_q_{index} leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
+            f"! {orientation}" if orientation else "",
             "! videoscale add-borders=true n-threads=2",
             "! videoconvert n-threads=3",
             f"! video/x-raw,format={NETWORK_FORMAT},width={NETWORK_WIDTH},height={NETWORK_HEIGHT},pixel-aspect-ratio=1/1",
@@ -128,6 +138,7 @@ def live_detection_process(
     event_dir: Path = DEFAULT_DETECTION_DIR,
     latency_ms: int = 100,
     min_confidence: float = 0.1,
+    rotation_degrees: int | None = None,
     gst_launch: str = "gst-launch-1.0",
 ) -> LiveDetectionProcess:
     event_path = event_dir / f"{camera.id}.jsonl"
@@ -136,6 +147,7 @@ def live_detection_process(
         camera,
         latency_ms=latency_ms,
         min_confidence=min_confidence,
+        rotation_degrees=rotation_degrees,
     )
     env = _gst_runtime_env(settings)
     env.update(
@@ -159,6 +171,7 @@ def live_multistream_detection_process(
     event_dir: Path = DEFAULT_DETECTION_DIR,
     latency_ms: int = 100,
     min_confidence: float = 0.1,
+    camera_rotations: dict[str, int] | None = None,
     gst_launch: str = "gst-launch-1.0",
 ) -> LiveDetectionProcess:
     if not cameras:
@@ -180,6 +193,7 @@ def live_multistream_detection_process(
         callback_modules=callback_modules,
         latency_ms=latency_ms,
         min_confidence=min_confidence,
+        camera_rotations=camera_rotations,
     )
     env = _gst_runtime_env(settings)
     env.update(

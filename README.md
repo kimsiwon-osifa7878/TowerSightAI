@@ -82,10 +82,12 @@ Important values:
 - `HAILO_HEF_PATH`: YOLO HEF file path.
 - `HAILO_POSTPROCESS_SO`: Hailo postprocess `.so`.
 - `HAILO_NETWORK_NAME`: defaults to `yolov5`.
-- `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, RTSP URL, optional username/password.
+- `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, RTSP URL, optional username/password, and `CAMERA_N_ROTATION_DEGREES`.
 - `CALIBRATION_PATH`: calibration JSON path.
 - `PLC_ENDPOINT`: PLC or simulator endpoint.
 - `UI_CAMERA_RESOLUTION`: preview/display capture resolution, for example `1920x1080` or `1280x720`.
+
+Camera rotation is part of the equipment configuration. Set `CAMERA_N_ROTATION_DEGREES` to one of `0`, `90`, `180`, or `270`; `90` means CCW 90 degrees and `270` means CW 90 degrees. The default site profile uses `CAMERA_1_ROTATION_DEGREES=90` for the ceiling birdview camera and `0` for the other cameras. The operator UI rotation buttons update the runtime value, and AI Detection uses the same rotated stream that the operator sees.
 
 The UI displays the actual received frame size in each camera tile, so you can verify whether the configured resolution is being applied.
 
@@ -193,6 +195,18 @@ WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-veri
 ```
 
 This launches the operator UI, captures the desktop, prints PNG metadata, and exits the app. Generated screenshots under `tmp/` are local verification artifacts and should not be committed.
+
+For UI-centered changes, also verify the main button flows directly in the running UI:
+
+1. Confirm the first screen is the operator dashboard.
+2. Click `메뉴` and confirm the sidebar opens.
+3. Click `전체 카메라` and confirm the four-camera view appears.
+4. Click `테스트` and confirm the diagnostic screen appears.
+5. Click `차량 진입 시뮬레이션` and confirm it is visibly test-only.
+6. Click an `EMPTY` button and confirm it only shows a not-connected message.
+7. Confirm simulation and `EMPTY` actions do not show final OK.
+
+If a GUI session is unavailable, record that the screenshot/button verification was not run and why. UI screenshot verification is not safety approval and never authorizes PLC OK.
 
 ## Tests
 

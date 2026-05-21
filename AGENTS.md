@@ -59,6 +59,32 @@ Follow `docs/implementation/implementation-roadmap.md` as the source of truth fo
 - Hardware tests must be clearly marked and skippable.
 - Every state transition that can affect PLC OK/NG must have tests for success, failure, and uncertainty.
 
+## UI-Centered Verification
+
+For changes that affect the operator UI layout, buttons, status text, camera surfaces, overlays, sidebar behavior, diagnostics screen, or UI-first test flows, verification must include a real UI run when a GUI-capable Ubuntu desktop environment is available.
+
+Required post-implementation checks:
+
+1. Run `pytest -q`.
+2. Launch the operator UI in windowed mode.
+3. Capture the default operator dashboard screenshot.
+4. Click `메뉴` and capture the sidebar-open screenshot.
+5. Verify key UI flows by clicking:
+   - `전체 카메라`
+   - `테스트`
+   - `차량 진입 시뮬레이션`
+   - at least one `EMPTY` button
+6. Confirm the UI still keeps final OK blocked for simulation and EMPTY actions.
+7. Store screenshots under `tmp/operator-ui-verification/` and do not commit them.
+
+Use the existing screenshot helper as the baseline command:
+
+```bash
+WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-verification
+```
+
+If the current environment cannot run a GUI, state that clearly in the final report and include the reason, such as missing display session, missing `xdotool`, missing `gnome-screenshot`, or unavailable PyQt/OpenCV runtime. UI screenshot verification is implementation verification only; it is not product safety approval and must never imply PLC OK.
+
 ## External References
 
 - Hailo-8 M.2: https://hailo.ai/products/ai-accelerators/hailo-8-m2-ai-acceleration-module/

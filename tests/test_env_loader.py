@@ -12,6 +12,7 @@ CAMERA_4_ROLE=opposite_side
 CAMERA_4_RTSP_URL=rtsp://user:secret@192.0.2.4/stream1
 CAMERA_4_USERNAME=user
 CAMERA_4_PASSWORD=secret
+CAMERA_4_ROTATION_DEGREES=0
 """
     path.write_text(
         f"""
@@ -27,12 +28,15 @@ CAMERA_1_ROLE=ceiling
 CAMERA_1_RTSP_URL=rtsp://user:secret@192.0.2.1/stream1
 CAMERA_1_USERNAME=user
 CAMERA_1_PASSWORD=secret
+CAMERA_1_ROTATION_DEGREES=90
 CAMERA_2_ID=front
 CAMERA_2_ROLE=front
 CAMERA_2_RTSP_URL=rtsp://user:secret@192.0.2.2/stream1
+CAMERA_2_ROTATION_DEGREES=0
 CAMERA_3_ID=rear_side
 CAMERA_3_ROLE=rear_side
 CAMERA_3_RTSP_URL=rtsp://user:secret@192.0.2.3/stream1
+CAMERA_3_ROTATION_DEGREES=0
 {camera_4}
 CALIBRATION_PATH=data/calibration/site.json
 PLC_ENDPOINT=tcp://127.0.0.1:502
@@ -59,6 +63,7 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
     assert settings.ui_camera_resolution.width == 1024
     assert settings.ui_camera_resolution.height == 576
     assert [camera.id for camera in settings.cameras] == ["ceiling", "front", "rear_side", "opposite_side"]
+    assert [camera.rotation_degrees for camera in settings.cameras] == [90, 0, 0, 0]
 
 
 def test_load_settings_from_env_expands_home_and_config_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -106,4 +111,15 @@ def test_invalid_ui_camera_resolution_raises(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="WIDTHxHEIGHT"):
+        load_settings_from_env(env_path)
+
+
+def test_invalid_camera_rotation_raises(tmp_path: Path):
+    env_path = _write_env(tmp_path / ".env")
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace("CAMERA_1_ROTATION_DEGREES=90", "CAMERA_1_ROTATION_DEGREES=45"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Camera rotation"):
         load_settings_from_env(env_path)

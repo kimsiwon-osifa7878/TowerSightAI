@@ -34,3 +34,18 @@ def test_production_requires_calibration_file(tmp_path: Path):
             calibration_path=tmp_path / "missing.json",
             plc_endpoint="tcp://127.0.0.1:502",
         )
+
+
+def test_camera_rotation_must_be_right_angle(tmp_path: Path):
+    with pytest.raises(ValueError, match="Camera rotation"):
+        Settings(
+            tappas_workspace=tmp_path,
+            hailo_hef_path=tmp_path / "m.hef",
+            hailo_postprocess_so=tmp_path / "pp.so",
+            camera_1={"id": "front", "role": "front", "rtsp_url": "rtsp://a", "rotation_degrees": 45},
+            camera_2={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://b"},
+            camera_3={"id": "rear_side", "role": "rear_side", "rtsp_url": "rtsp://c"},
+            camera_4={"id": "opposite_side", "role": "opposite_side", "rtsp_url": "rtsp://d"},
+            calibration_path=tmp_path / "calibration.json",
+            plc_endpoint="tcp://127.0.0.1:502",
+        )

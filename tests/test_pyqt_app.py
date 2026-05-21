@@ -14,6 +14,7 @@ from towersightai.ui.model import build_operator_display
 from towersightai.ui.pyqt_app import (
     OPERATOR_PANEL_WIDTH,
     SIDEBAR_ACTION_LABELS,
+    LiveDetectionWorker,
     OperatorWindow,
     _bbox_to_rect,
     _ai_detection_label,
@@ -21,6 +22,8 @@ from towersightai.ui.pyqt_app import (
     _diagnostic_row_text,
     _fresh_detections,
     _network_bbox_to_source_bbox,
+    _rotate_cv_frame,
+    _rotation_label,
     _streaming_camera_ids,
 )
 
@@ -102,6 +105,21 @@ def test_detection_bbox_removes_square_yolo_letterbox_for_wide_source():
     assert _network_bbox_to_source_bbox(0.25, 0.359375, 0.5, 0.28125, QSize(1280, 720)) == (0.25, 0.25, 0.5, 0.5)
 
 
+def test_detection_bbox_removes_square_yolo_letterbox_for_rotated_ceiling_source():
+    event = DetectionEvent(
+        camera_id="ceiling",
+        label="car",
+        confidence=0.84,
+        bbox=BoundingBox(0.359375, 0.25, 0.28125, 0.5),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    rect = _bbox_to_rect(event, QRect(10, 20, 720, 1280), source_size=QSize(720, 1280))
+
+    assert rect == QRect(190, 340, 360, 640)
+    assert _network_bbox_to_source_bbox(0.359375, 0.25, 0.28125, 0.5, QSize(720, 1280)) == (0.25, 0.25, 0.5, 0.5)
+
+
 def test_fresh_detections_drops_stale_events():
     fresh = DetectionEvent(
         camera_id="front",
@@ -132,6 +150,17 @@ def test_streaming_camera_ids_include_only_live_camera_statuses():
     assert _streaming_camera_ids(_settings(), statuses) == ("ceiling", "front")
 
 
+def test_cv_fallback_frame_rotation_matches_ui_setting():
+    import cv2  # type: ignore[import-not-found]
+    import numpy as np
+
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    rotated = _rotate_cv_frame(cv2, frame, 90)
+
+    assert rotated.shape == (1920, 1080, 3)
+
+
 def test_ai_detection_label_shows_all_target_cameras_and_counts():
     assert _ai_detection_label(("ceiling", "front"), {"ceiling": 0, "front": 7}) == "AI Detection ON: ceiling(0), front(7)"
 
@@ -148,7 +177,7 @@ def test_operator_ui_starts_on_dashboard_with_sidebar_closed():
 
     assert app is not None
     assert window.stack.currentWidget() is window.operator_view
-    assert window.stack.count() == 2
+    assert window.stack.count() == 3
     assert window._camera_layout_mode == "dashboard"
     assert window.operator_sidebar.isHidden() is True
     assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
@@ -158,6 +187,55 @@ def test_operator_ui_starts_on_dashboard_with_sidebar_closed():
     window.sidebar_toggle_button.click()
     assert window.operator_sidebar.isHidden() is False
     window.close()
+
+
+def test_camera_settings_rotation_button_updates_runtime_rotation_state():
+    _qt_app()
+    settings = _settings()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    window = OperatorWindow(model)
+
+    window.sidebar_buttons["카메라 설정"].click()
+    assert window.stack.currentWidget() is window.settings_view
+    assert window._camera_rotations.get("ceiling", 0) == 0
+    assert _rotation_label(0) == "0도"
+
+    window.camera_rotation_buttons["ceiling"].click()
+
+    assert window._camera_rotations["ceiling"] == 90
+    assert "천장 버드뷰: CCW 90도 회전" in window.camera_rotation_buttons["ceiling"].text()
+    assert "AI Detection은 다음 시작부터 같은 회전 스트림" in window.warning_label.text()
+    window.close()
+
+
+def test_operator_window_initializes_camera_rotation_from_settings(monkeypatch):
+    _qt_app()
+    settings = Settings(
+        tappas_workspace="/tmp/tappas",
+        hailo_hef_path="/tmp/model.hef",
+        hailo_postprocess_so="/tmp/post.so",
+        camera_1={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://a", "rotation_degrees": 90},
+        camera_2={"id": "front", "role": "front", "rtsp_url": "rtsp://b", "rotation_degrees": 0},
+        camera_3={"id": "rear_side", "role": "rear_side", "rtsp_url": "rtsp://c", "rotation_degrees": 0},
+        camera_4={"id": "opposite_side", "role": "opposite_side", "rtsp_url": "rtsp://d", "rotation_degrees": 0},
+        calibration_path="/tmp/calibration.json",
+        plc_endpoint="tcp://127.0.0.1:502",
+    )
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    window = OperatorWindow(model, settings=settings)
+
+    assert window._camera_rotations == {"ceiling": 90, "front": 0, "rear_side": 0, "opposite_side": 0}
+    assert "천장 버드뷰: CCW 90도 회전" in window.camera_rotation_buttons["ceiling"].text()
+    window.close()
+
+
+def test_live_detection_worker_keeps_ui_rotation_map_for_pipeline_start():
+    settings = _settings()
+
+    worker = LiveDetectionWorker(settings, ("ceiling", "front"), camera_rotations={"ceiling": 90, "front": 0})
+
+    assert worker.camera_rotations == {"ceiling": 90, "front": 0}
 
 
 def test_vehicle_entry_simulation_is_ui_only_and_keeps_final_ok_blocked():

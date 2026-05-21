@@ -29,6 +29,7 @@ CAMERA_1_ROLE=ceiling
 CAMERA_1_RTSP_URL=rtsp://user:password@192.168.0.10:554/stream1
 CAMERA_1_USERNAME=user
 CAMERA_1_PASSWORD=password
+CAMERA_1_ROTATION_DEGREES=90
 
 CAMERA_2_ID=front
 CAMERA_2_ROLE=front
@@ -66,7 +67,7 @@ rtph264depay ! h264parse ! decodebin !
 videoconvert ! video/x-raw,format=RGB
 ```
 
-For preview-only and driver-display paths, scale decoded frames to `UI_CAMERA_RESOLUTION`; the default is `1280x720`. Apply width/height caps separately from RGB conversion to keep GStreamer negotiation compatible with RTSP decoders. Health-check paths should stay minimal and only verify that a fresh frame can be decoded. `appsink sync=false drop=true max-buffers=<small>` is acceptable for preview-only paths. For Hailo inference paths, normalize to the model input size and format required by the HEF.
+For preview-only and operator-display paths, apply `CAMERA_N_ROTATION_DEGREES` before scaling, then scale decoded frames to `UI_CAMERA_RESOLUTION`; the default is `1280x720`. `90` means CCW 90 degrees and `270` means CW 90 degrees. The baseline equipment profile sets the ceiling birdview camera to `90` and the remaining cameras to `0`. The Hailo live detection path must use the same rotation setting before model resizing so the AI input stream matches the operator-visible stream. Apply width/height caps separately from RGB conversion to keep GStreamer negotiation compatible with RTSP decoders. Health-check paths should stay minimal and only verify that a fresh frame can be decoded. `appsink sync=false drop=true max-buffers=<small>` is acceptable for preview-only paths. For Hailo inference paths, normalize to the model input size and format required by the HEF after the configured rotation.
 
 Tapo-C310 cameras are specified at 15 fps, so a healthy `stream1` preview may report about 15 fps even when the GStreamer pipeline is working correctly. Optimize preview paths for low latency and stable freshness rather than assuming a 30 fps source. Use `drop-on-latency=true`, small/leaky preview queues, and `appsink sync=false drop=true max-buffers=1` for preview-only frame capture. TCP remains the default transport for reliability; UDP may be tested on a stable LAN when lower latency matters more than packet-loss recovery.
 

@@ -137,6 +137,7 @@ def _camera_dict(values: Mapping[str, str], index: int) -> dict[str, str | None]
         "rtsp_url": values[f"CAMERA_{index}_RTSP_URL"],
         "username": values.get(f"CAMERA_{index}_USERNAME") or None,
         "password": values.get(f"CAMERA_{index}_PASSWORD") or None,
+        "rotation_degrees": values.get(f"CAMERA_{index}_ROTATION_DEGREES", "0"),
     }
 
 

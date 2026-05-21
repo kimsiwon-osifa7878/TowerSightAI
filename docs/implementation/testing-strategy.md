@@ -59,6 +59,33 @@ Run from the operator test screen:
 
 Diagnostic results must default to `safe_to_operate=False`. A passing diagnostic means the test passed, not that PLC OK is authorized.
 
+## UI Manual Verification
+
+For operator UI changes, implementation verification should include a real UI run, button clicks, and screenshots when a GUI-capable Ubuntu desktop environment is available.
+
+Baseline command:
+
+```bash
+WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-verification
+```
+
+Manual or semi-automated checklist:
+
+- Confirm the app starts on the operator dashboard.
+- Confirm ceiling birdview and front camera are visible on the first screen.
+- Confirm ceiling birdview uses the vertical tile and CCW 90-degree display policy.
+- Confirm `메뉴` opens the sidebar.
+- Click `전체 카메라` and confirm the four-camera inspection layout is visible.
+- Click `테스트` and confirm the diagnostic list and log panel are visible.
+- Click `차량 진입 시뮬레이션` and confirm only test overlay/instruction text changes.
+- Click at least one `EMPTY` button and confirm it is a safe no-op.
+- Confirm simulation and EMPTY actions do not show final OK and do not send PLC events.
+- Save screenshots under `tmp/operator-ui-verification/` and keep them out of commits.
+
+This UI verification is an implementation check, not a product safety approval. If the local environment cannot run the GUI, record the blocker in the final report.
+
+Future automation can extend `tools/verify_operator_ui_screenshot.sh` to use `xdotool` for clicking `메뉴`, `전체 카메라`, `테스트`, `차량 진입 시뮬레이션`, and `EMPTY`, saving a screenshot after each step.
+
 ## Hardware Smoke Tests
 
 Run only on the Ubuntu target with explicit opt-in:

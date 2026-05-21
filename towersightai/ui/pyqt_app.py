@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta, timezone
 
-from towersightai.camera.pipeline import build_preview_pipeline
+from towersightai.camera.pipeline import build_preview_pipeline, normalize_rotation_degrees
 from towersightai.config.settings import CameraRole, Settings
 from towersightai.diagnostics import DiagnosticResult, DiagnosticStatus, DiagnosticsService
 from towersightai.inference.events import DetectionEvent
@@ -19,6 +19,7 @@ DETECTION_TTL_SECONDS = 1.0
 SIDEBAR_ACTION_LABELS = (
     "운영 대시보드",
     "전체 카메라",
+    "카메라 설정",
     "테스트",
     "AI Detection",
     "차량 진입 시뮬레이션",
@@ -33,7 +34,7 @@ SIDEBAR_ACTION_LABELS = (
 
 try:
     from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QTransform
+    from PyQt6.QtGui import QColor, QImage, QPainter, QPen
     from PyQt6.QtWidgets import (
         QApplication,
         QFrame,
@@ -100,8 +101,6 @@ class CameraSurface(QFrame):
         center_x = content.left() + width // 2
         center_y = content.top() + height // 2
         display_frame = self._frame
-        if display_frame is not None and not display_frame.isNull() and "버드뷰" in self.title:
-            display_frame = display_frame.transformed(QTransform().rotate(90))
         if display_frame is not None and not display_frame.isNull():
             scaled_size = display_frame.size()
             scaled_size.scale(content.size(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -168,10 +167,11 @@ class CameraCaptureWorker(QObject):
     status_changed = pyqtSignal(str, str)
     finished = pyqtSignal()
 
-    def __init__(self, settings: Settings, camera_id: str, parent: QObject | None = None) -> None:
+    def __init__(self, settings: Settings, camera_id: str, rotation_degrees: int = 0, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
         self.camera = next(camera for camera in settings.cameras if camera.id == camera_id)
+        self.rotation_degrees = rotation_degrees
         self._running = True
 
     def stop(self) -> None:
@@ -209,6 +209,8 @@ class CameraCaptureWorker(QObject):
                     self.status_changed.emit(self.camera.id, "NG: 프레임 형식 오류")
                     QThread.msleep(100)
                     continue
+                if not using_gstreamer:
+                    frame = _rotate_cv_frame(cv2, frame, self.rotation_degrees)
                 if frame.shape[2] == 4:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
                 elif not using_gstreamer:
@@ -222,7 +224,11 @@ class CameraCaptureWorker(QObject):
         self.finished.emit()
 
     def _open_capture(self, cv2):  # noqa: ANN001 - cv2 module is imported lazily in the worker thread.
-        pipeline = build_preview_pipeline(self.camera, resolution=self.settings.ui_camera_resolution)
+        pipeline = build_preview_pipeline(
+            self.camera,
+            resolution=self.settings.ui_camera_resolution,
+            rotation_degrees=self.rotation_degrees,
+        )
         capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         using_gstreamer = capture.isOpened()
         if not using_gstreamer:
@@ -253,10 +259,17 @@ class LiveDetectionWorker(QObject):
     status_changed = pyqtSignal(str, str)
     finished = pyqtSignal(str)
 
-    def __init__(self, settings: Settings, camera_ids: tuple[str, ...], parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        camera_ids: tuple[str, ...],
+        camera_rotations: dict[str, int] | None = None,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self.settings = settings
         self.camera_ids = camera_ids
+        self.camera_rotations = dict(camera_rotations or {})
         self.cameras = tuple(camera for camera in settings.cameras if camera.id in set(camera_ids))
         self._runner: LiveDetectionRunner | None = None
         self._stop_requested = False
@@ -270,7 +283,11 @@ class LiveDetectionWorker(QObject):
         for attempt in range(2):
             if self._stop_requested:
                 break
-            process = live_multistream_detection_process(self.settings, self.cameras)
+            process = live_multistream_detection_process(
+                self.settings,
+                self.cameras,
+                camera_rotations=self.camera_rotations,
+            )
             for camera_id in self.camera_ids:
                 self.status_changed.emit(camera_id, "AI Detection 실행 중" if attempt == 0 else "AI Detection 재시도 중")
 
@@ -316,7 +333,12 @@ class OperatorWindow(QMainWindow):
         self._operator_unlocked = True
         self._vehicle_entry_simulation = False
         self._camera_layout_mode = "dashboard"
+        self._camera_rotations: dict[str, int] = {
+            camera.id: camera.rotation_degrees
+            for camera in settings.cameras
+        } if settings is not None else {}
         self.sidebar_buttons: dict[str, QPushButton] = {}
+        self.camera_rotation_buttons: dict[str, QPushButton] = {}
         self.clock_label = QLabel()
         self.setWindowTitle("TowerSightAI Operator Console")
         self.setStyleSheet(_stylesheet())
@@ -374,7 +396,7 @@ class OperatorWindow(QMainWindow):
             return
         for camera in self.settings.cameras:
             thread = QThread(self)
-            worker = CameraCaptureWorker(self.settings, camera.id)
+            worker = CameraCaptureWorker(self.settings, camera.id, self._camera_rotations.get(camera.id, 0))
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             worker.frame_ready.connect(self._set_camera_frame)
@@ -445,8 +467,10 @@ class OperatorWindow(QMainWindow):
     def _build(self) -> None:
         self.stack = QStackedWidget()
         self.operator_view = self._build_operator_view()
+        self.settings_view = self._build_settings_view()
         self.test_view = self._build_test_view()
         self.stack.addWidget(self.operator_view)
+        self.stack.addWidget(self.settings_view)
         self.stack.addWidget(self.test_view)
         self.setCentralWidget(self.stack)
         self._show_operator_dashboard()
@@ -547,6 +571,8 @@ class OperatorWindow(QMainWindow):
                 button.clicked.connect(self._show_operator_dashboard)
             elif label == "전체 카메라":
                 button.clicked.connect(self._show_all_cameras)
+            elif label == "카메라 설정":
+                button.clicked.connect(self._show_camera_settings)
             elif label == "테스트":
                 self.to_tests_button = button
                 button.clicked.connect(self._show_tests)
@@ -562,6 +588,52 @@ class OperatorWindow(QMainWindow):
             key = f"EMPTY_{empty_count}" if label == "EMPTY" else label
             self.sidebar_buttons[key] = button
             layout.addWidget(button)
+
+    def _build_settings_view(self) -> QWidget:
+        root = QWidget()
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        panel = QWidget()
+        panel.setObjectName("sidePanel")
+        panel.setFixedWidth(380)
+        panel.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 14, 14, 14)
+        panel_layout.setSpacing(8)
+        title = QLabel("카메라 설정")
+        title.setObjectName("testTitleLabel")
+        panel_layout.addWidget(title)
+
+        for tile in self.model.camera_tiles:
+            button = QPushButton()
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda _checked=False, camera_id=tile.camera_id: self._rotate_camera(camera_id))
+            self.camera_rotation_buttons[tile.camera_id] = button
+            panel_layout.addWidget(button)
+
+        panel_layout.addStretch(1)
+        back = QPushButton("운영자 화면")
+        back.clicked.connect(self._show_operator)
+        panel_layout.addWidget(back)
+        outer.addWidget(panel)
+
+        detail = QWidget()
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        self.rotation_summary_label = QLabel()
+        self.rotation_summary_label.setObjectName("instructionLabel")
+        self.rotation_summary_label.setWordWrap(True)
+        detail_layout.addWidget(self.rotation_summary_label)
+        rotation_note = QLabel("회전값은 카메라 preview 파이프라인과 AI Detection 파이프라인에 동일하게 적용됩니다.")
+        rotation_note.setObjectName("warningLabel")
+        rotation_note.setWordWrap(True)
+        detail_layout.addWidget(rotation_note)
+        detail_layout.addStretch(1)
+        outer.addWidget(detail, 1)
+        self._refresh_rotation_controls()
+        return root
 
     def _build_test_view(self) -> QWidget:
         root = QWidget()
@@ -665,6 +737,12 @@ class OperatorWindow(QMainWindow):
             return
         self.stack.setCurrentWidget(self.test_view)
 
+    def _show_camera_settings(self) -> None:
+        if not self._operator_unlocked:
+            return
+        self._refresh_rotation_controls()
+        self.stack.setCurrentWidget(self.settings_view)
+
     def _unlock_operator(self) -> None:
         self._operator_unlocked = True
         if hasattr(self, "to_tests_button"):
@@ -686,6 +764,42 @@ class OperatorWindow(QMainWindow):
         self._show_operator_dashboard()
         self.instruction_label.setText("진입 차량 감지: 버드뷰와 정면 영상을 확인 중입니다.")
         self.warning_label.setText("차량 진입 시뮬레이션: UI 확인 전용이며 PLC OK는 차단됩니다.")
+
+    def _rotate_camera(self, camera_id: str) -> None:
+        next_rotation = _next_rotation(self._camera_rotations.get(camera_id, 0))
+        self._camera_rotations[camera_id] = next_rotation
+        self._refresh_rotation_controls()
+        self._restart_camera_capture()
+        if self._detection_enabled:
+            self._stop_ai_detection()
+            self.ai_detection_label.setText("AI Detection OFF: 회전 변경")
+        self.warning_label.setText(
+            f"{camera_id} 회전 {_rotation_label(next_rotation)} 적용. AI Detection은 다음 시작부터 같은 회전 스트림을 사용합니다."
+        )
+
+    def _refresh_rotation_controls(self) -> None:
+        summaries: list[str] = []
+        for tile in self.model.camera_tiles:
+            rotation = self._camera_rotations.get(tile.camera_id, 0)
+            text = f"{tile.title}: {_rotation_label(rotation)}"
+            summaries.append(text)
+            button = self.camera_rotation_buttons.get(tile.camera_id)
+            if button is not None:
+                button.setText(f"{text} 회전")
+        if hasattr(self, "rotation_summary_label"):
+            self.rotation_summary_label.setText(" / ".join(summaries))
+
+    def _restart_camera_capture(self) -> None:
+        if self.settings is None:
+            return
+        for worker in tuple(self._workers):
+            worker.stop()
+        for thread in tuple(self._threads):
+            thread.quit()
+            thread.wait(1500)
+        self._threads.clear()
+        self._workers.clear()
+        self._start_camera_capture()
 
     def _set_camera_layout(self, mode: str) -> None:
         self._camera_layout_mode = mode
@@ -751,7 +865,11 @@ class OperatorWindow(QMainWindow):
         self.ai_detection_label.setText(_ai_detection_label(streaming_camera_ids, self._detection_event_counts))
         self.warning_label.setText("AI Detection 멀티스트림 실행 중: " + ", ".join(streaming_camera_ids))
         thread = QThread(self)
-        worker = LiveDetectionWorker(self.settings, streaming_camera_ids)
+        worker = LiveDetectionWorker(
+            self.settings,
+            streaming_camera_ids,
+            camera_rotations={camera_id: self._camera_rotations.get(camera_id, 0) for camera_id in streaming_camera_ids},
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.detections_ready.connect(self._set_camera_detections)
@@ -853,6 +971,30 @@ def _streaming_camera_ids(settings: Settings, runtime_status: dict[str, str]) ->
         for camera in settings.cameras
         if runtime_status.get(camera.id) == "정상 수신"
     )
+
+
+def _next_rotation(rotation_degrees: int) -> int:
+    return {0: 90, 90: 180, 180: 270, 270: 0}[rotation_degrees % 360]
+
+
+def _rotation_label(rotation_degrees: int) -> str:
+    return {
+        0: "0도",
+        90: "CCW 90도",
+        180: "180도",
+        270: "CW 90도",
+    }[rotation_degrees % 360]
+
+
+def _rotate_cv_frame(cv2, frame, rotation_degrees: int):  # noqa: ANN001, ANN201 - cv2/numpy are optional runtime deps.
+    rotation = normalize_rotation_degrees(rotation_degrees)
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return frame
 
 
 def _bbox_to_rect(event: DetectionEvent, image_rect: QRect, *, source_size: QSize | None = None) -> QRect | None:
