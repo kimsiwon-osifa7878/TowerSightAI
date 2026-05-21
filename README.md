@@ -2,7 +2,7 @@
 
 TowerSightAI is a safety-first AI monitoring system for a parking machine. It combines four RTSP camera streams, Hailo-8 object detection, conservative state handling, PLC adapter boundaries, and a PyQt6 operator console.
 
-The current repository is still an implementation prototype, not a production safety release. The core rule is unchanged: unknown, stale, missing, low-confidence, or unhealthy inputs must block final OK and keep the system in NG/wait.
+The current repository is still an implementation prototype, not a production safety release. The core rule is unchanged: unknown, stale, missing, low-confidence, simulated, or unhealthy inputs must block final OK and keep the system in NG/wait.
 
 ## Current Status
 
@@ -10,10 +10,12 @@ Implemented:
 
 - Typed `.env` loading and validation for four camera roles: `ceiling`, `front`, `rear_side`, `opposite_side`.
 - RTSP preview pipeline generation with redacted source handling.
-- PyQt6 operator console with driver view, operator view, and hardware test view.
-- Runtime camera capture for all configured cameras, with disconnected cameras shown as NG.
-- Operator unlock shortcut: `Ctrl+Shift+O`.
+- PyQt6 operator console that starts on an operator dashboard.
+- Dashboard layout with ceiling birdview and front camera as primary views.
+- Ceiling birdview displayed as a vertical tile with CCW 90-degree frame rotation.
+- Collapsible sidebar with connected actions and `EMPTY` feature slots.
 - Test screen with scrollable test list and compact result rows.
+- Runtime camera capture for all configured cameras, with disconnected cameras shown as NG.
 - Hailo installation checks and sample image smoke test using `data/samples/test-car.png`.
 - Hailo callback normalization into JSONL detection events.
 - Live AI Detection overlays on camera frames.
@@ -25,7 +27,6 @@ Implemented:
 
 - Bounding-box correction for the difference between source frame resolution and YOLO 640x640 letterboxed inference input.
 - Actual received frame resolution display in each camera tile.
-- Fixed-width operator side panel so long AI Detection status text does not resize the UI.
 - Fake PLC adapter and state-machine core used by tests.
 
 Known gaps:
@@ -36,12 +37,24 @@ Known gaps:
 - Real PLC protocol adapter is not implemented yet.
 - Final OK remains blocked until the missing safety prerequisites are implemented and verified.
 
+## Development Direction
+
+Near-term work is UI-first:
+
+1. Add the operator UI button, status row, panel, or test slot.
+2. Connect it to `EMPTY`, fake, or simulation behavior that cannot change final OK.
+3. Add UI and fake-data tests.
+4. Connect real camera, Hailo, calibration, AI-stage, or PLC logic.
+
+`EMPTY` buttons are placeholders for future functionality. Pressing them must not change safety state or send PLC events.
+
 ## Safety Rules
 
-- Never send PLC OK on camera loss, missing frames, unknown PLC state, invalid calibration, Hailo failure, low confidence, or possible human/obstacle presence.
+- Never send PLC OK on camera loss, missing frames, unknown PLC state, invalid calibration, Hailo failure, low confidence, simulated input, or possible human/obstacle presence.
 - Keep deployment-specific values in `.env`; do not commit real RTSP credentials, PLC secrets, or local Hailo install paths.
 - `.env.example` must contain placeholders only.
 - Hardware tests must be opt-in or clearly manual.
+- UI tests and simulations are implementation checks only and do not imply safe operation.
 
 ## Install
 
@@ -83,25 +96,24 @@ source .venv/bin/activate
 towersightai-operator-ui --env .env --windowed
 ```
 
-The default entry screen is the driver-facing view. To enter operator mode:
+The default entry screen is the operator dashboard.
 
-```text
-Ctrl+Shift+O
-```
+Dashboard behavior:
 
-Operator view contains:
-
-- 2x2 camera grid: ceiling, front, rear side, opposite side.
-- Right-side fixed-width status/control panel.
-- Driver screen button.
-- Test screen button.
-- AI Detection toggle.
+- Ceiling birdview and front camera are shown first.
+- The ceiling birdview tile is vertical and the frame is displayed CCW 90 degrees.
+- The sidebar opens from the `메뉴` button.
+- `전체 카메라` switches to the four-camera inspection layout.
+- `테스트` opens the in-UI diagnostic screen.
+- `AI Detection` starts live Hailo multistream detection for currently streaming cameras.
+- `차량 진입 시뮬레이션` is UI-only and keeps PLC OK blocked.
+- `EMPTY` buttons are safe no-op feature slots.
 
 Disconnected cameras remain visible as NG tiles and are not used as AI Detection targets. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
 
 ## AI Detection
 
-In operator mode, press `AI Detection`.
+In the operator UI sidebar, press `AI Detection`.
 
 Behavior:
 
@@ -122,7 +134,7 @@ If detections disappear after some time, check whether the GStreamer process exi
 
 ## Operator Test Screen
 
-Enter operator mode with `Ctrl+Shift+O`, then press `테스트`.
+Open the sidebar with `메뉴`, then press `테스트`.
 
 Available tests include:
 
@@ -133,7 +145,7 @@ Available tests include:
 - PLC simulator interface check.
 - Full hardware smoke sequence.
 
-The test list is scrollable. Failure details are written to the right console while the left result rows stay compact, preventing layout shifts.
+The test list is scrollable. Failure details are written to the right console while the left result rows stay compact, preventing layout shifts. Diagnostic results are not safety approval and default to `safe_to_operate=False`.
 
 ## Hailo Sample Image Smoke
 
@@ -191,10 +203,10 @@ pytest -q
 Current local result:
 
 ```text
-49 passed
+51 passed
 ```
 
-Unit tests do not require live RTSP cameras, Hailo-8, or PLC hardware.
+Unit and UI tests do not require live RTSP cameras, Hailo-8, or PLC hardware.
 
 ## Project Layout
 
@@ -203,7 +215,7 @@ TowerSightAI/
 ├── data/samples/                  # sanitized sample images
 ├── docs/                          # design and implementation guides
 ├── refers/                        # Hailo/GStreamer reference code; do not edit unless requested
-├── tests/                         # hardware-free unit tests
+├── tests/                         # hardware-free unit and UI tests
 ├── tools/                         # local verification scripts
 └── towersightai/
     ├── camera/                    # RTSP/GStreamer preview helpers
@@ -218,5 +230,4 @@ TowerSightAI/
 
 - Read `AGENTS.md` and the implementation docs before changing safety behavior.
 - Keep `refers/` unchanged unless specifically asked.
-- Add tests with behavioral changes.
-- Treat all local camera/Hailo outputs under `artifacts/` and `tmp/` as disposable runtime artifacts.
+- Add UI-visible controls and tests before connecting new production behavior.

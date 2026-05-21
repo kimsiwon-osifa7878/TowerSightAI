@@ -1,51 +1,70 @@
 # UI and Calibration Guide
 
-The UI is a driver-facing safety display for a 55-inch or larger monitor. It must be readable from inside or near the vehicle and must change with the AI state.
+The UI is an operator-centered HMI for validating camera, AI, calibration, and PLC readiness from one console. It must still behave as a safety display: unknown, stale, missing, simulated, or low-confidence inputs never look safe and never authorize PLC OK.
 
-## Display Modes
+## UI-First Development Rule
 
-## Before Entry
+New features should be added in this order:
 
-State: `IDLE`, `VEHICLE_DETECTED`, `PLATE_RECOGNITION`
+1. Add the operator UI button, status row, panel, or test slot.
+2. Connect it to `EMPTY`, fake, or simulation behavior that cannot change final OK.
+3. Add UI and fake-data tests.
+4. Connect real camera, Hailo, calibration, AI-stage, or PLC logic.
+5. Keep the UI result auditable through the test screen or diagnostics log.
 
-- Show front camera view prominently.
-- Show waiting, vehicle detection, and plate recognition status.
-- Do not show OK styling before safety checks are complete.
+## Operator Dashboard
 
-## During Entry and Alignment
+The app starts on the operator dashboard. There is no separate driver screen in the current UI direction.
 
-State: `VEHICLE_ENTERING`, `ALIGNMENT_GUIDE`
+Default layout:
 
-- Show front view and ceiling bird's-eye view together.
-- Overlay lane centerline, side bounds, stop zone, and vehicle position.
-- Show one clear instruction at a time:
-  - "차량을 오른쪽으로 조금 이동해 주세요."
-  - "차량을 왼쪽으로 조금 이동해 주세요."
-  - "조금 더 앞으로 진입해 주세요."
-  - "차량을 조금 후진해 주세요."
-  - "정상 위치에 주차되었습니다."
+- Ceiling birdview and front camera are the primary first-screen views.
+- Ceiling birdview is shown as a vertical tile and the frame is displayed CCW 90 degrees.
+- The birdview tile must not draw default lane/stop guide lines unless calibration mode or a specific overlay mode is active.
+- The front view stays wide and is used for vehicle entry context.
+- Safety status, state, PLC status, camera health, AI Detection state, and clock remain visible.
+- Camera loss, stale frames, Hailo errors, and PLC unknown state must be visible as NG or blocked states.
 
-## After Parking
+The all-camera layout remains available from the sidebar for inspection of ceiling, front, rear-side, and opposite-side cameras.
 
-State: `PARKED`, `SAFETY_CHECK`, `HUMAN_DETECTED`, `READY_FOR_OPERATION`
+## Sidebar and Feature Slots
 
-- Show safety check screen.
-- Show parking-machine person status.
-- Show in-vehicle occupancy status.
-- Show final OK/NG/waiting state.
-- Show next driver instructions, such as engine off and side mirrors folded.
+The sidebar is a collapsible operator control surface.
 
-## Error and Stop States
+Current connected entries:
 
-State: `AI_STOP` or error/NG substates
+- `운영 대시보드`
+- `전체 카메라`
+- `테스트`
+- `AI Detection`
+- `차량 진입 시뮬레이션`
 
-- Show that AI monitoring is stopped or blocked.
-- Show camera, calibration, Hailo, or PLC fault reason when available.
-- Never present a blocked state as safe.
+Unimplemented feature slots must be labeled `EMPTY`. Pressing an `EMPTY` button should only show a message such as “not connected yet” and must not alter safety state, PLC state, calibration state, or final OK.
+
+## UI Test and Simulation Behavior
+
+UI test and simulation actions are for implementation verification only.
+
+- Vehicle-entry simulation may draw test overlays and update instruction text.
+- Fake camera, fake detection, fake PLC, and fake AI-stage actions must be visually marked or described as test-only.
+- Test actions must not send real PLC events.
+- Test actions must not make `can_show_final_ok` true.
+- Diagnostic results default to `safe_to_operate=False`.
+
+## State-Oriented Display Behavior
+
+The UI should expose the design-document states but does not need a separate screen for each state.
+
+- Before entry: show front and birdview context with waiting/detection status.
+- During entry and alignment: show front and ceiling birdview together with one clear instruction.
+- After parking: show safety checks, person/obstacle status, in-vehicle occupancy status, and final OK/NG/WAIT.
+- Error and stop states: show the blocking subsystem and reason.
+
+Never present a blocked state as safe.
 
 ## Settings UI
 
-On-site settings must support:
+On-site settings should eventually support:
 
 - Camera status and redacted RTSP source display.
 - Camera role assignment.
@@ -59,17 +78,20 @@ Settings must not reveal camera passwords.
 
 ## Calibration UI
 
-Calibration is required for accurate alignment and safety zones. Provide per-camera calibration workflows:
+Calibration is required for accurate alignment and safety zones. It should be reached from the sidebar after the UI shell is stable.
+
+Provide per-camera calibration workflows:
 
 - Select camera.
-- Draw or adjust lane centerline.
+- Draw or adjust lane centerline only in calibration mode.
 - Draw side boundaries.
 - Draw stop zone.
 - Draw danger/safety ROIs.
 - Draw vehicle cabin/window ROIs for front and side cameras.
 - Save calibration with timestamp, site ID, camera ID, and version.
+- Review and activate calibration explicitly.
 
-Calibration changes must be reviewable before activation. Invalid or missing calibration blocks final OK.
+Invalid, missing, unreviewed, or stale calibration blocks final OK.
 
 ## Calibration Data Shape
 
@@ -96,8 +118,11 @@ Coordinates should be normalized unless a module has a documented reason to use 
 
 ## UI Testing
 
-- Render tests for each state.
-- Tests for Korean driver instruction selection.
+- Tests for dashboard startup, sidebar open/close, and all-camera switching.
+- Tests that `EMPTY` buttons are safe no-ops.
+- Tests that vehicle-entry simulation remains test-only and blocks final OK.
+- Tests for camera tile layout, birdview rotation policy, and stale/NG display.
+- Tests for Korean operator instruction selection.
 - Tests that password values are redacted.
 - Tests for calibration save/load validation.
 - Tests that error/NG states cannot display final OK styling.

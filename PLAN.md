@@ -1,117 +1,108 @@
-# TowerSightAI Implementation Plan
+# TowerSightAI UI-First Implementation Plan
 
-This file captures the next implementation work from the current prototype state.
+This file captures the next implementation work from the current prototype state. The near-term development mode is UI-first: add the operator UI control, status, and test slot first; connect it to fake or empty behavior safely; then wire in real camera, Hailo, AI-stage, and PLC logic.
+
+The safety rule is unchanged. UI tests, simulations, and EMPTY buttons never authorize PLC OK.
 
 ## Immediate Priority
 
-1. Harden live AI Detection runtime.
+1. Stabilize the operator UI shell.
 
    Current state:
-   - AI Detection now uses a single Hailo multistream GStreamer process.
+   - The app starts on the operator dashboard.
+   - The dashboard prioritizes the ceiling birdview and front camera.
+   - Ceiling birdview is displayed as a vertical tile and rotated CCW 90 degrees.
+   - A collapsible sidebar owns navigation and feature slots.
+   - Unimplemented feature slots are labeled `EMPTY`.
+
+   Next work:
+   - Keep the dashboard layout stable across fullscreen and windowed modes.
+   - Add UI-only checks for sidebar open/close, dashboard/all-camera switching, and EMPTY actions.
+   - Ensure every empty or simulation action leaves final OK blocked.
+   - Keep camera tiles from resizing when long status text appears.
+
+2. Build the in-UI test hub.
+
+   Current state:
+   - The test screen can run settings, Hailo installation, sample image, per-camera frame, PLC simulator, and full hardware smoke diagnostics.
+   - Diagnostic results are recorded with `safe_to_operate=False`.
+
+   Next work:
+   - Add UI-only tests for layout, sidebar controls, and simulation buttons.
+   - Add fake-data tests for camera health, detection events, and PLC events.
+   - Add a live multistream diagnostic that runs for a short duration and reports silent streams.
+   - Store sanitized summaries in `artifacts/diagnostics/`.
+
+3. Improve camera and AI visualization.
+
+   Current state:
+   - Live AI Detection uses a single Hailo multistream GStreamer process.
    - Active streams are selected from cameras whose runtime status is `정상 수신`.
-   - Hardware verification confirmed simultaneous `front` and `ceiling` events.
-   - If `gst-launch` exits, the UI worker retries only twice.
+   - Detection boxes are drawn as fresh overlays and expire after a short TTL.
 
    Next work:
-   - Replace the fixed two-attempt retry loop with a supervised watchdog.
-   - Show per-camera inference health separately from preview health.
-   - Preserve and display the last GStreamer stderr tail in the test/diagnostic UI.
-   - Mark AI Detection as degraded or stopped if events become stale.
-   - Keep final OK blocked on stale inference events.
-
-2. Add live multistream diagnostics.
-
-   Next work:
-   - Add a diagnostic test that starts live multistream detection for connected cameras for a short duration.
-   - Assert that every selected camera emits at least one event, or report which stream is silent.
-   - Store a sanitized summary in `artifacts/diagnostics/`.
-   - Keep the test manual/hardware-only and never allow it to imply PLC OK.
-
-3. Improve overlay lifecycle.
-
-   Current state:
-   - Overlay TTL is `1.0` second.
-   - Boxes disappear quickly if event delivery pauses.
-
-   Next work:
+   - Show preview health and inference health separately per camera.
    - Track last detection timestamp per camera.
-   - Display `AI stale` or `AI no events` when a stream is alive but inference events stop.
-   - Consider a configurable TTL via `.env`, but keep conservative NG behavior for stale data.
+   - Display `AI stale` or `AI no events` when events stop.
+   - Preserve and display the last GStreamer stderr tail in the UI test/diagnostic log.
+   - Replace the fixed two-attempt retry loop with a supervised watchdog.
 
-## AI Stage Work
+## UI-First Feature Buildout
 
-4. Vehicle entry and alignment.
-
-   Next work:
-   - Define calibration data loader for lane centerline, side bounds, and stop zone.
-   - Convert ceiling/front detections into vehicle position estimates.
-   - Add alignment decision outputs: left/right/forward/back/parked/unknown.
-   - Add unit tests for success, failure, and uncertainty.
-
-5. Person and obstacle safety.
+4. Calibration workflow.
 
    Next work:
-   - Define label policy for person, vehicle, obstacle, and ignored classes.
-   - Fuse detections across all healthy cameras.
-   - Treat missing side cameras as NG or degraded according to the final safety policy.
-   - Add tests that prove possible person/obstacle presence blocks OK.
+   - Add a sidebar entry for calibration when the UI shape is ready.
+   - Support camera selection, normalized geometry editing, save/revert, and validation.
+   - Start with UI-only/fake persistence tests before connecting production calibration.
+   - Block final OK when calibration is missing, invalid, or unreviewed.
 
-6. Plate and in-vehicle occupancy.
-
-   Next work:
-   - Add interfaces before choosing final OCR/occupancy implementation.
-   - Keep plate fallback policy explicit.
-   - Add tests for recognized, unrecognized, low-confidence, and unavailable states.
-
-## UI And Calibration
-
-7. Calibration UI.
+5. Stage simulation and fake event playback.
 
    Next work:
-   - Add operator calibration mode.
-   - Support draggable lane, stop-zone, and ROI geometry.
-   - Save normalized coordinates with timestamp, site ID, camera ID, and version.
-   - Validate calibration before activation.
-   - Block final OK when calibration is missing or invalid.
+   - Add UI controls that inject fake vehicle, alignment, person, obstacle, and occupancy states.
+   - Clearly mark all fake states as test-only.
+   - Use these fake states to verify operator instructions and NG/WAIT/READY styling.
+   - Keep PLC OK blocked unless the real safety gate later approves all prerequisites.
 
-8. Operator UX hardening.
+6. AI stage logic behind UI-observable outputs.
 
    Next work:
-   - Add explicit AI Detection health rows per stream.
-   - Add a log/details drawer for recent Hailo and camera errors.
-   - Keep right panel fixed width.
-   - Keep all long text wrapped without resizing camera tiles.
+   - Add vehicle entry and alignment decisions.
+   - Add person/obstacle fusion across healthy cameras.
+   - Add plate and in-vehicle occupancy interfaces before final model selection.
+   - Expose every stage as a UI-visible result: `PASS`, `WAIT`, `RETRY`, `NG`, or `ERROR`.
 
 ## PLC And Safety Gate
 
-9. PLC adapter.
+7. Conservative final OK.
+
+   Next work:
+   - Centralize final OK prerequisites in one safety gate.
+   - Require healthy cameras, healthy inference, valid calibration, known PLC state, and completed stage decisions.
+   - Add tests for every success, failure, and uncertainty path.
+
+8. Real PLC adapter.
 
    Next work:
    - Confirm real PLC protocol and event schema.
    - Implement a real adapter behind the existing mockable boundary.
-   - Add integration tests with a simulator or fake server.
+   - Add simulator or fake-server integration tests.
    - Assert event ordering for NG, human detected, human clear, parked, and final OK.
 
-10. Conservative final OK.
+## Field Hardening
+
+9. Ubuntu target deployment.
+
+   Next work:
+   - Add service/runbook notes for HailoRT, TAPPAS venv, GStreamer plugins, desktop session, and network setup.
+   - Define log locations and rotation.
+   - Add a site acceptance checklist that starts from the operator UI test hub.
+
+10. Observability.
 
     Next work:
-    - Centralize final OK prerequisites in one safety gate.
-    - Require healthy cameras, healthy inference, valid calibration, known PLC state, and completed stage decisions.
-    - Add tests for every success, failure, and uncertainty path.
-
-## Deployment And Field Hardening
-
-11. Ubuntu target deployment.
-
-    Next work:
-    - Add service/runbook notes for HailoRT, TAPPAS venv, GStreamer plugins, desktop session, and network setup.
-    - Define log locations and rotation.
-    - Add a site acceptance checklist.
-
-12. Observability.
-
-    Next work:
-    - Add structured logs for camera status, Hailo process lifecycle, detection counts, state transitions, and PLC events.
+    - Add structured logs for camera status, Hailo process lifecycle, detection counts, UI test actions, state transitions, and PLC events.
     - Redact all credentials in logs.
     - Keep safety-relevant decisions auditable.
 

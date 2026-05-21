@@ -7,7 +7,7 @@ This guide defines the stable implementation shape for TowerSightAI. The source 
 - Primary target: Ubuntu edge computer in the parking-machine site.
 - Cameras: four Tapo-C310 RTSP streams over LAN or WiFi.
 - Accelerator: Hailo-8 M.2, using HailoRT/TAPPAS GStreamer elements.
-- Display: 55-inch or larger driver-facing monitor.
+- Display: 55-inch or larger operator HMI display that can also present safety guidance when needed.
 - External control: PLC integration through a replaceable adapter.
 
 ## Core Modules

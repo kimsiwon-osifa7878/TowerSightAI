@@ -1,6 +1,6 @@
 # Testing Strategy Guide
 
-Every implementation stage needs tests. Safety logic must be testable without live cameras, Hailo-8, or PLC hardware.
+Every implementation stage needs tests. Safety logic must be testable without live cameras, Hailo-8, or PLC hardware. From the current prototype forward, the operator UI test screen is also a field-verification hub.
 
 ## Test Layers
 
@@ -17,8 +17,21 @@ Run on any developer machine:
 - AI decision logic.
 - Calibration geometry persistence and validation.
 - UI state-to-message mapping.
+- Operator dashboard, sidebar, EMPTY action, and simulation behavior.
 
-## Integration Tests
+## UI-Only Tests
+
+Run without real hardware:
+
+- App starts on the operator dashboard.
+- Sidebar opens and closes.
+- Dashboard and all-camera layouts switch correctly.
+- Ceiling birdview uses the vertical dashboard tile and CCW 90-degree display policy.
+- EMPTY buttons do not change safety state.
+- Vehicle-entry simulation is visually testable but keeps final OK blocked.
+- Long status text does not resize camera tiles unexpectedly.
+
+## Fake-Data Integration Tests
 
 Run without real hardware by using fakes:
 
@@ -27,6 +40,24 @@ Run without real hardware by using fakes:
 - Fake PLC adapter records events.
 - State machine drives UI state from simulated detections.
 - Calibration fixtures drive alignment decisions.
+- Fake AI-stage outputs drive UI PASS/WAIT/RETRY/NG/ERROR states.
+
+Fake-data tests may update the UI, but they must not imply real safety approval.
+
+## In-UI Diagnostic Tests
+
+Run from the operator test screen:
+
+- Settings validation.
+- Hailo installation check.
+- Hailo sample image inference.
+- Per-camera frame receive checks.
+- PLC simulator interface check.
+- UI-only control checks.
+- Fake event playback checks.
+- Full hardware smoke sequence when explicitly selected.
+
+Diagnostic results must default to `safe_to_operate=False`. A passing diagnostic means the test passed, not that PLC OK is authorized.
 
 ## Hardware Smoke Tests
 
@@ -35,7 +66,7 @@ Run only on the Ubuntu target with explicit opt-in:
 - Validate GStreamer can open each Tapo-C310 RTSP stream.
 - Validate Hailo device and plugins are available.
 - Run single-stream detection from `front` camera.
-- Run four-stream Hailo pipeline with redacted logs.
+- Run multi-stream Hailo detection for connected cameras.
 - Verify UI fullscreen rendering on the target display.
 - Verify PLC test endpoint or simulator communication.
 
@@ -51,6 +82,7 @@ Each stage that affects PLC OK must test:
 - Invalid calibration when relevant.
 - PLC failure when relevant.
 - Recovery after temporary failure.
+- Simulated/fake input path remains blocked from final OK.
 
 ## State Machine Tests
 
@@ -72,7 +104,7 @@ Illegal transitions must be rejected or converted to NG/error according to polic
 
 Pipeline builder tests should assert:
 
-- Four configured RTSP sources are included.
+- Configured RTSP sources are included.
 - Credentials are not logged in clear text.
 - `TAPPAS_WORKSPACE`, HEF path, and postprocess path are configurable.
 - Hailo elements are present in the expected order.
@@ -83,11 +115,14 @@ Pipeline builder tests should assert:
 
 UI tests should assert:
 
-- Correct camera layout for each state.
-- Driver guidance messages match alignment result.
-- Safety screen displays human and in-vehicle status.
+- Correct operator dashboard startup.
+- Correct camera layout for dashboard and all-camera modes.
+- Sidebar and EMPTY actions are safe.
+- Operator guidance messages match alignment result.
+- Safety screen displays human, obstacle, and in-vehicle status.
 - Settings pages redact secrets.
 - Calibration cannot save structurally invalid geometry.
+- Error/NG states cannot display final OK styling.
 
 ## Test Data
 
@@ -100,4 +135,4 @@ Keep fixtures sanitized:
 
 ## CI Policy
 
-Default CI should run unit and non-hardware integration tests. Hardware smoke tests should require an environment flag such as `RUN_HARDWARE_TESTS=1`.
+Default CI should run unit, UI-only, and non-hardware integration tests. Hardware smoke tests should require an environment flag such as `RUN_HARDWARE_TESTS=1`.

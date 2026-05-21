@@ -12,13 +12,28 @@ from towersightai.ui.model import GlobalSafetyStatus, OperatorDisplayModel
 
 TEST_LIST_PANEL_WIDTH = 320
 OPERATOR_PANEL_WIDTH = 400
+OPERATOR_SIDEBAR_WIDTH = 300
 TEST_STATUS_HEIGHT = 34
 TEST_SUMMARY_MAX_HEIGHT = 112
 DETECTION_TTL_SECONDS = 1.0
+SIDEBAR_ACTION_LABELS = (
+    "운영 대시보드",
+    "전체 카메라",
+    "테스트",
+    "AI Detection",
+    "차량 진입 시뮬레이션",
+    "EMPTY",
+    "EMPTY",
+    "EMPTY",
+    "EMPTY",
+    "EMPTY",
+    "EMPTY",
+    "EMPTY",
+)
 
 try:
     from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QColor, QImage, QPainter, QPen
+    from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QTransform
     from PyQt6.QtWidgets import (
         QApplication,
         QFrame,
@@ -46,6 +61,7 @@ class CameraSurface(QFrame):
         self._frame: QImage | None = None
         self._detections: tuple[DetectionEvent, ...] = ()
         self._frame_size_text = ""
+        self._vehicle_simulation = False
         self.setMinimumSize(360, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -67,6 +83,10 @@ class CameraSurface(QFrame):
         self._detections = ()
         self.update()
 
+    def set_vehicle_simulation(self, enabled: bool) -> None:
+        self._vehicle_simulation = enabled
+        self.update()
+
     def paintEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
         super().paintEvent(event)
         painter = QPainter(self)
@@ -79,29 +99,46 @@ class CameraSurface(QFrame):
         height = content.height()
         center_x = content.left() + width // 2
         center_y = content.top() + height // 2
-        if self._frame is not None and not self._frame.isNull():
-            scaled_size = self._frame.size()
+        display_frame = self._frame
+        if display_frame is not None and not display_frame.isNull() and "버드뷰" in self.title:
+            display_frame = display_frame.transformed(QTransform().rotate(90))
+        if display_frame is not None and not display_frame.isNull():
+            scaled_size = display_frame.size()
             scaled_size.scale(content.size(), Qt.AspectRatioMode.KeepAspectRatio)
             image_rect = content
             image_rect.setSize(scaled_size)
             image_rect.moveCenter(content.center())
-            painter.drawImage(image_rect, self._frame)
+            painter.drawImage(image_rect, display_frame)
         else:
             image_rect = content
             painter.setPen(QPen(QColor("#94a3b8"), 1))
             painter.drawLine(center_x, content.top() + 24, center_x, content.bottom() - 24)
             painter.drawLine(content.left() + 36, center_y, content.right() - 36, center_y)
 
-        if "버드뷰" in self.title:
-            painter.setPen(QPen(QColor("#facc15"), 3))
-            painter.drawLine(center_x, content.top() + 40, center_x, content.bottom() - 40)
-            painter.setPen(QPen(QColor("#22c55e"), 2))
-            painter.drawRect(
-                content.left() + width // 3,
-                content.top() + int(height * 0.68),
-                width // 3,
-                int(height * 0.18),
-            )
+        if self._vehicle_simulation:
+            vehicle_color = QColor("#38bdf8")
+            if "버드뷰" in self.title:
+                vehicle_rect = QRect(
+                    content.left() + int(width * 0.40),
+                    content.top() + int(height * 0.50),
+                    int(width * 0.20),
+                    int(height * 0.28),
+                )
+                painter.fillRect(vehicle_rect, QColor(56, 189, 248, 80))
+                painter.setPen(QPen(vehicle_color, 3))
+                painter.drawRect(vehicle_rect)
+                painter.drawText(vehicle_rect.adjusted(6, 4, -6, -4), Qt.AlignmentFlag.AlignTop, "진입 차량")
+            elif "정면" in self.title:
+                vehicle_rect = QRect(
+                    content.left() + int(width * 0.30),
+                    content.top() + int(height * 0.38),
+                    int(width * 0.40),
+                    int(height * 0.42),
+                )
+                painter.fillRect(vehicle_rect, QColor(56, 189, 248, 70))
+                painter.setPen(QPen(vehicle_color, 3))
+                painter.drawRect(vehicle_rect)
+                painter.drawText(vehicle_rect.adjusted(6, 4, -6, -4), Qt.AlignmentFlag.AlignTop, "차량 접근")
 
         for detection in _fresh_detections(self._detections):
             frame_size = self._frame.size() if self._frame is not None and not self._frame.isNull() else None
@@ -276,7 +313,10 @@ class OperatorWindow(QMainWindow):
         self._detection_enabled = False
         self._detection_camera_ids: tuple[str, ...] = ()
         self._detection_event_counts: dict[str, int] = {}
-        self._operator_unlocked = False
+        self._operator_unlocked = True
+        self._vehicle_entry_simulation = False
+        self._camera_layout_mode = "dashboard"
+        self.sidebar_buttons: dict[str, QPushButton] = {}
         self.clock_label = QLabel()
         self.setWindowTitle("TowerSightAI Operator Console")
         self.setStyleSheet(_stylesheet())
@@ -299,13 +339,6 @@ class OperatorWindow(QMainWindow):
         self.safety_label.setProperty("status", "ready" if model.can_show_final_ok else model.safety_status.value.lower())
         self.safety_label.style().unpolish(self.safety_label)
         self.safety_label.style().polish(self.safety_label)
-        self.driver_safety_label.setText("OK" if model.can_show_final_ok else model.safety_status.value)
-        self.driver_safety_label.setProperty("status", "ready" if model.can_show_final_ok else model.safety_status.value.lower())
-        self.driver_safety_label.style().unpolish(self.driver_safety_label)
-        self.driver_safety_label.style().polish(self.driver_safety_label)
-        self.driver_instruction_label.setText(model.instruction)
-        self.driver_warning_label.setText(model.warning)
-
         for tile in model.camera_tiles:
             self._runtime_camera_status[tile.camera_id] = tile.status_text
             widget = self.camera_widgets.get(tile.role)
@@ -411,117 +444,124 @@ class OperatorWindow(QMainWindow):
 
     def _build(self) -> None:
         self.stack = QStackedWidget()
-        self.driver_view = self._build_driver_view()
         self.operator_view = self._build_operator_view()
         self.test_view = self._build_test_view()
-        self.stack.addWidget(self.driver_view)
         self.stack.addWidget(self.operator_view)
         self.stack.addWidget(self.test_view)
         self.setCentralWidget(self.stack)
-        self._show_driver()
-
-    def _build_driver_view(self) -> QWidget:
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(32, 28, 32, 28)
-        layout.setSpacing(18)
-
-        self.driver_safety_label = QLabel("NG")
-        self.driver_safety_label.setObjectName("driverSafetyLabel")
-        self.driver_safety_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.driver_safety_label)
-
-        self.driver_instruction_label = QLabel()
-        self.driver_instruction_label.setObjectName("driverInstructionLabel")
-        self.driver_instruction_label.setWordWrap(True)
-        self.driver_instruction_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.driver_instruction_label, 2)
-
-        self.driver_warning_label = QLabel()
-        self.driver_warning_label.setObjectName("warningLabel")
-        self.driver_warning_label.setWordWrap(True)
-        self.driver_warning_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.driver_warning_label)
-
-        self.driver_clock_label = QLabel()
-        self.driver_clock_label.setObjectName("telemetryLabel")
-        self.driver_clock_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.driver_clock_label)
-        return root
+        self._show_operator_dashboard()
 
     def _build_operator_view(self) -> QWidget:
         root = QWidget()
         outer = QHBoxLayout(root)
-        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setContentsMargins(0, 0, 10, 10)
         outer.setSpacing(10)
+
+        self.operator_sidebar = QWidget()
+        self.operator_sidebar.setObjectName("sidePanel")
+        self.operator_sidebar.setFixedWidth(OPERATOR_SIDEBAR_WIDTH)
+        self.operator_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        sidebar_layout = QVBoxLayout(self.operator_sidebar)
+        sidebar_layout.setContentsMargins(14, 14, 14, 14)
+        sidebar_layout.setSpacing(8)
+        title = QLabel("운영 메뉴")
+        title.setObjectName("testTitleLabel")
+        sidebar_layout.addWidget(title)
+        self._add_sidebar_buttons(sidebar_layout)
+        sidebar_layout.addStretch(1)
+        self.operator_sidebar.setVisible(False)
+        outer.addWidget(self.operator_sidebar)
+
+        main = QWidget()
+        main_layout = QVBoxLayout(main)
+        main_layout.setContentsMargins(10, 10, 0, 0)
+        main_layout.setSpacing(10)
+        outer.addWidget(main, 1)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        main_layout.addLayout(header)
+
+        self.sidebar_toggle_button = QPushButton("메뉴")
+        self.sidebar_toggle_button.setObjectName("menuButton")
+        self.sidebar_toggle_button.setFixedWidth(88)
+        self.sidebar_toggle_button.clicked.connect(self._toggle_sidebar)
+        header.addWidget(self.sidebar_toggle_button)
+
+        self.safety_label = QLabel("NG")
+        self.safety_label.setObjectName("safetyLabel")
+        self.safety_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.safety_label.setFixedWidth(150)
+        header.addWidget(self.safety_label)
+
+        header_text = QVBoxLayout()
+        header_text.setSpacing(6)
+        header.addLayout(header_text, 1)
+
+        self.instruction_label = QLabel()
+        self.instruction_label.setObjectName("instructionLabel")
+        self.instruction_label.setWordWrap(True)
+        header_text.addWidget(self.instruction_label)
+
+        self.warning_label = QLabel()
+        self.warning_label.setObjectName("warningLabel")
+        self.warning_label.setWordWrap(True)
+        header_text.addWidget(self.warning_label)
 
         self.grid = QGridLayout()
         self.grid.setSpacing(8)
         camera_area = QWidget()
         camera_area.setLayout(self.grid)
-        outer.addWidget(camera_area, 5)
+        main_layout.addWidget(camera_area, 1)
 
         roles = [CameraRole.ceiling, CameraRole.front, CameraRole.rear_side, CameraRole.opposite_side]
-        positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
-        for role, (row, col) in zip(roles, positions, strict=True):
+        for role in roles:
             title = next((tile.title for tile in self.model.camera_tiles if tile.role is role), role.value)
             surface = CameraSurface(title)
             self.camera_widgets[role] = surface
-            self.grid.addWidget(surface, row, col)
 
-        panel = QWidget()
-        panel.setObjectName("sidePanel")
-        panel.setFixedWidth(OPERATOR_PANEL_WIDTH)
-        panel.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(14, 14, 14, 14)
-        panel_layout.setSpacing(10)
-        outer.addWidget(panel)
-
-        self.safety_label = QLabel("NG")
-        self.safety_label.setObjectName("safetyLabel")
-        self.safety_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        panel_layout.addWidget(self.safety_label)
-
-        self.instruction_label = QLabel()
-        self.instruction_label.setObjectName("instructionLabel")
-        self.instruction_label.setWordWrap(True)
-        panel_layout.addWidget(self.instruction_label)
-
-        self.warning_label = QLabel()
-        self.warning_label.setObjectName("warningLabel")
-        self.warning_label.setWordWrap(True)
-        panel_layout.addWidget(self.warning_label)
-
+        status_bar = QWidget()
+        status_bar.setObjectName("statusStrip")
+        status_layout = QHBoxLayout(status_bar)
+        status_layout.setContentsMargins(8, 4, 8, 4)
+        status_layout.setSpacing(8)
         self.state_label = QLabel()
         self.plc_label = QLabel()
         self.camera_summary_label = QLabel()
-        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.clock_label):
-            label.setObjectName("telemetryLabel")
-            panel_layout.addWidget(label)
-
-        self.to_driver_button = QPushButton("운전자 화면")
-        self.to_driver_button.clicked.connect(self._show_driver)
-        panel_layout.addWidget(self.to_driver_button)
-
-        self.to_tests_button = QPushButton("테스트")
-        self.to_tests_button.clicked.connect(self._show_tests)
-        self.to_tests_button.setEnabled(False)
-        panel_layout.addWidget(self.to_tests_button)
-
-        self.ai_detection_button = QPushButton("AI Detection")
-        self.ai_detection_button.setCheckable(True)
-        self.ai_detection_button.clicked.connect(self._toggle_ai_detection)
-        panel_layout.addWidget(self.ai_detection_button)
-
         self.ai_detection_label = QLabel("AI Detection OFF")
-        self.ai_detection_label.setObjectName("telemetryLabel")
-        self.ai_detection_label.setWordWrap(True)
-        self.ai_detection_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        panel_layout.addWidget(self.ai_detection_label)
+        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.ai_detection_label, self.clock_label):
+            label.setObjectName("telemetryLabel")
+            label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            status_layout.addWidget(label)
+        main_layout.addWidget(status_bar)
 
-        panel_layout.addStretch(1)
+        self._set_camera_layout("dashboard")
         return root
+
+    def _add_sidebar_buttons(self, layout: QVBoxLayout) -> None:
+        empty_count = 0
+        for label in SIDEBAR_ACTION_LABELS:
+            button = QPushButton(label)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            if label == "운영 대시보드":
+                button.clicked.connect(self._show_operator_dashboard)
+            elif label == "전체 카메라":
+                button.clicked.connect(self._show_all_cameras)
+            elif label == "테스트":
+                self.to_tests_button = button
+                button.clicked.connect(self._show_tests)
+            elif label == "AI Detection":
+                self.ai_detection_button = button
+                button.setCheckable(True)
+                button.clicked.connect(self._toggle_ai_detection)
+            elif label == "차량 진입 시뮬레이션":
+                button.clicked.connect(self._simulate_vehicle_entry)
+            else:
+                empty_count += 1
+                button.clicked.connect(lambda _checked=False, name=f"EMPTY {empty_count}": self._empty_action(name))
+            key = f"EMPTY_{empty_count}" if label == "EMPTY" else label
+            self.sidebar_buttons[key] = button
+            layout.addWidget(button)
 
     def _build_test_view(self) -> QWidget:
         root = QWidget()
@@ -580,9 +620,6 @@ class OperatorWindow(QMainWindow):
         back = QPushButton("운영자 화면")
         back.clicked.connect(self._show_operator)
         list_layout.addWidget(back)
-        driver = QPushButton("운전자 화면")
-        driver.clicked.connect(self._show_driver)
-        list_layout.addWidget(driver)
 
         log_panel = QWidget()
         log_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -606,14 +643,21 @@ class OperatorWindow(QMainWindow):
     def _tick(self) -> None:
         text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.clock_label.setText(text)
-        self.driver_clock_label.setText(text)
-
-    def _show_driver(self) -> None:
-        self.stack.setCurrentWidget(self.driver_view)
 
     def _show_operator(self) -> None:
         if not self._operator_unlocked:
             return
+        self._set_camera_layout(self._camera_layout_mode)
+        self.stack.setCurrentWidget(self.operator_view)
+
+    def _show_operator_dashboard(self) -> None:
+        self._operator_unlocked = True
+        self._set_camera_layout("dashboard")
+        self.stack.setCurrentWidget(self.operator_view)
+
+    def _show_all_cameras(self) -> None:
+        self._operator_unlocked = True
+        self._set_camera_layout("all")
         self.stack.setCurrentWidget(self.operator_view)
 
     def _show_tests(self) -> None:
@@ -623,8 +667,58 @@ class OperatorWindow(QMainWindow):
 
     def _unlock_operator(self) -> None:
         self._operator_unlocked = True
-        self.to_tests_button.setEnabled(True)
-        self.stack.setCurrentWidget(self.operator_view)
+        if hasattr(self, "to_tests_button"):
+            self.to_tests_button.setEnabled(True)
+        self._show_operator_dashboard()
+
+    def _toggle_sidebar(self) -> None:
+        self.operator_sidebar.setVisible(not self.operator_sidebar.isVisible())
+
+    def _empty_action(self, name: str) -> None:
+        self.warning_label.setText(f"{name}: 아직 기능이 연결되지 않았습니다. 최종 OK 차단 상태를 유지합니다.")
+
+    def _simulate_vehicle_entry(self) -> None:
+        self._vehicle_entry_simulation = True
+        for role in (CameraRole.ceiling, CameraRole.front):
+            widget = self.camera_widgets.get(role)
+            if widget is not None:
+                widget.set_vehicle_simulation(True)
+        self._show_operator_dashboard()
+        self.instruction_label.setText("진입 차량 감지: 버드뷰와 정면 영상을 확인 중입니다.")
+        self.warning_label.setText("차량 진입 시뮬레이션: UI 확인 전용이며 PLC OK는 차단됩니다.")
+
+    def _set_camera_layout(self, mode: str) -> None:
+        self._camera_layout_mode = mode
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        if mode == "all":
+            layout = (
+                (CameraRole.ceiling, 0, 0),
+                (CameraRole.front, 0, 1),
+                (CameraRole.rear_side, 1, 0),
+                (CameraRole.opposite_side, 1, 1),
+            )
+        else:
+            layout = (
+                (CameraRole.ceiling, 0, 0),
+                (CameraRole.front, 0, 1),
+            )
+        for role, row, col in layout:
+            widget = self.camera_widgets[role]
+            if mode == "dashboard" and role is CameraRole.ceiling:
+                widget.setMinimumSize(320, 520)
+                widget.setMaximumWidth(520)
+            else:
+                widget.setMinimumSize(360, 220)
+                widget.setMaximumWidth(16777215)
+            self.grid.addWidget(widget, row, col)
+        self.grid.setColumnStretch(0, 2 if mode == "dashboard" else 1)
+        self.grid.setColumnStretch(1, 5 if mode == "dashboard" else 1)
+        for row in range(2):
+            self.grid.setRowStretch(row, 1 if mode == "all" or row == 0 else 0)
 
     def _toggle_ai_detection(self, checked: bool = False) -> None:
         del checked
@@ -730,7 +824,6 @@ class OperatorWindow(QMainWindow):
             self.test_log.append(tail)
         if result.status is not DiagnosticStatus.PASS:
             self.warning_label.setText(f"테스트 실패: {result.label}")
-            self.driver_warning_label.setText("운영자 점검 필요: 최종 OK 차단")
 
     def _cleanup_diagnostic_worker(self, thread: QThread, worker: DiagnosticWorker) -> None:
         if thread in self._diagnostic_threads:
@@ -881,31 +974,6 @@ def _stylesheet() -> str:
         border-color: #facc15;
         background: #3f3410;
         color: #fef9c3;
-    }
-    #driverSafetyLabel {
-        min-height: 160px;
-        font-size: 82px;
-        font-weight: 900;
-        border: 3px solid #ef4444;
-        background: #3f1115;
-        color: #fee2e2;
-    }
-    #driverSafetyLabel[status="ready"] {
-        border-color: #22c55e;
-        background: #10351f;
-        color: #dcfce7;
-    }
-    #driverSafetyLabel[status="wait"] {
-        border-color: #facc15;
-        background: #3f3410;
-        color: #fef9c3;
-    }
-    #driverInstructionLabel {
-        font-size: 54px;
-        font-weight: 800;
-        line-height: 1.25;
-        padding: 24px;
-        border: 1px solid #4b5563;
     }
     #instructionLabel {
         font-size: 32px;

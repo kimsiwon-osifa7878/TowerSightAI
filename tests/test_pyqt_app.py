@@ -1,12 +1,20 @@
+import os
 from datetime import datetime, timedelta, timezone
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from PyQt6.QtCore import QRect, QSize
+from PyQt6.QtWidgets import QApplication
 
 from towersightai.config.settings import Settings
 from towersightai.diagnostics import DiagnosticResult, DiagnosticStatus
 from towersightai.inference.events import BoundingBox, DetectionEvent
+from towersightai.state_machine.core import ParkingState
+from towersightai.ui.model import build_operator_display
 from towersightai.ui.pyqt_app import (
     OPERATOR_PANEL_WIDTH,
+    SIDEBAR_ACTION_LABELS,
+    OperatorWindow,
     _bbox_to_rect,
     _ai_detection_label,
     _detection_label,
@@ -15,6 +23,8 @@ from towersightai.ui.pyqt_app import (
     _network_bbox_to_source_bbox,
     _streaming_camera_ids,
 )
+
+_APP: QApplication | None = None
 
 
 def _settings() -> Settings:
@@ -29,6 +39,12 @@ def _settings() -> Settings:
         calibration_path="/tmp/calibration.json",
         plc_endpoint="tcp://127.0.0.1:502",
     )
+
+
+def _qt_app() -> QApplication:
+    global _APP
+    _APP = QApplication.instance() or QApplication([])
+    return _APP
 
 
 def test_diagnostic_row_text_stays_compact_for_failures():
@@ -122,3 +138,38 @@ def test_ai_detection_label_shows_all_target_cameras_and_counts():
 
 def test_operator_side_panel_width_is_fixed_for_long_detection_status():
     assert OPERATOR_PANEL_WIDTH == 400
+
+
+def test_operator_ui_starts_on_dashboard_with_sidebar_closed():
+    app = _qt_app()
+    settings = _settings()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    window = OperatorWindow(model)
+
+    assert app is not None
+    assert window.stack.currentWidget() is window.operator_view
+    assert window.stack.count() == 2
+    assert window._camera_layout_mode == "dashboard"
+    assert window.operator_sidebar.isHidden() is True
+    assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
+    assert "운전자 화면" not in {button.text() for button in window.sidebar_buttons.values()}
+    assert sum(1 for button in window.sidebar_buttons.values() if button.text() == "EMPTY") == 7
+
+    window.sidebar_toggle_button.click()
+    assert window.operator_sidebar.isHidden() is False
+    window.close()
+
+
+def test_vehicle_entry_simulation_is_ui_only_and_keeps_final_ok_blocked():
+    _qt_app()
+    settings = _settings()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    window = OperatorWindow(model)
+
+    window.sidebar_buttons["차량 진입 시뮬레이션"].click()
+
+    assert window._vehicle_entry_simulation is True
+    assert "진입 차량 감지" in window.instruction_label.text()
+    assert "PLC OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
