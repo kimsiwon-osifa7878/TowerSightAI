@@ -6,9 +6,10 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QRect, QSize, QThread
+from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtWidgets import QApplication
 
-from towersightai.config.settings import Settings
+from towersightai.config.settings import CameraRole, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.inference.purpose_tasks import PlateOcrEvent, PURPOSE_LPR_IMAGE
 from towersightai.state_machine.core import ParkingState
@@ -179,6 +180,7 @@ def test_operator_ui_starts_on_dashboard_with_sidebar_closed():
     assert "이전 AI Detection" in {button.text() for button in window.sidebar_buttons.values()}
     assert "차량 전용 검출" in {button.text() for button in window.sidebar_buttons.values()}
     assert "번호판 이미지 LPR" in {button.text() for button in window.sidebar_buttons.values()}
+    assert "정면카메라LPR" in {button.text() for button in window.sidebar_buttons.values()}
     assert "사람 존재 감지" in {button.text() for button in window.sidebar_buttons.values()}
     assert "AI모델 선택" not in {button.text() for button in window.sidebar_buttons.values()}
     assert "테스트" not in {button.text() for button in window.sidebar_buttons.values()}
@@ -423,6 +425,114 @@ def test_lpr_no_result_updates_top_instruction_label(monkeypatch):
 
     assert window.instruction_label.text() == "번호판 인식 실패: 결과 없음"
     assert "최종 OK는 차단" in window.warning_label.text()
+    window.close()
+
+
+def test_front_camera_lpr_runs_without_stopping_ai_detection(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    stopped = False
+
+    def fake_stop_ai_detection(_self):
+        nonlocal stopped
+        stopped = True
+
+    monkeypatch.setattr(OperatorWindow, "_stop_ai_detection", fake_stop_ai_detection)
+    window = OperatorWindow(display, settings=settings)
+    frame = QImage(64, 32, QImage.Format.Format_RGB32)
+    frame.fill(QColor("#ffffff"))
+    window.camera_widgets[CameraRole.front].set_frame(frame)
+    window._detection_enabled = True
+    window._detection_workers.append(object())
+
+    window.sidebar_buttons["정면카메라LPR"].click()
+
+    assert stopped is False
+    assert window._detection_enabled is True
+    assert len(window._front_lpr_workers) == 1
+    assert window.front_lpr_button.isChecked() is True
+    assert window.front_lpr_button.text() == "정면카메라LPR ON"
+    window.close()
+
+
+def test_front_camera_lpr_runs_while_purpose_worker_exists(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    frame = QImage(64, 32, QImage.Format.Format_RGB32)
+    frame.fill(QColor("#ffffff"))
+    window.camera_widgets[CameraRole.front].set_frame(frame)
+
+    class ExistingWorker:
+        def stop(self):
+            pass
+
+    existing_worker = ExistingWorker()
+    window._purpose_workers.append(existing_worker)
+    window._purpose_task_enabled = True
+    window._purpose_task_id = "person_presence"
+
+    window.sidebar_buttons["정면카메라LPR"].click()
+
+    assert existing_worker in window._purpose_workers
+    assert len(window._front_lpr_workers) == 1
+    assert window._purpose_task_id == "person_presence"
+    window.close()
+
+
+def test_front_camera_lpr_requires_front_frame(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+
+    window.sidebar_buttons["정면카메라LPR"].click()
+
+    assert len(window._front_lpr_workers) == 0
+    assert window.instruction_label.text() == "정면카메라LPR 실패: 정면 프레임 없음"
+    assert window.front_lpr_button.isChecked() is False
+    window.close()
+
+
+def test_front_camera_lpr_result_displays_last_four_digits(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+
+    window._set_front_lpr_result({"ok": True, "plate_number": "47L1972", "last4": "1972", "log_path": "log"})
+
+    assert window.instruction_label.text() == "정면카메라LPR: 1972"
+    assert "47L1972" not in window.instruction_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    window.close()
+
+
+def test_front_camera_lpr_duplicate_click_does_not_start_second_worker(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    frame = QImage(64, 32, QImage.Format.Format_RGB32)
+    frame.fill(QColor("#ffffff"))
+    window.camera_widgets[CameraRole.front].set_frame(frame)
+
+    window.sidebar_buttons["정면카메라LPR"].click()
+    window.sidebar_buttons["정면카메라LPR"].click()
+
+    assert len(window._front_lpr_workers) == 1
+    assert "실행 중" in window.warning_label.text()
     window.close()
 
 

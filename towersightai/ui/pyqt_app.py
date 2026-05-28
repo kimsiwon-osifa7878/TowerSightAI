@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import signal
 import sys
 import time
@@ -19,6 +20,7 @@ from towersightai.inference.purpose_tasks import (
     PurposeInferenceRunner,
     build_purpose_process,
 )
+from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.ui.model import GlobalSafetyStatus, OperatorDisplayModel
 
 OPERATOR_PANEL_WIDTH = 400
@@ -32,6 +34,7 @@ SIDEBAR_ACTION_LABELS = (
     "이전 AI Detection",
     "차량 전용 검출",
     "번호판 이미지 LPR",
+    "정면카메라LPR",
     "사람 존재 감지",
     "차량 진입 시뮬레이션",
     "EMPTY",
@@ -79,6 +82,11 @@ class CameraSurface(QFrame):
         self._frame = frame
         self._frame_size_text = f"{frame.width()}x{frame.height()}"
         self.update()
+
+    def current_frame(self) -> QImage | None:
+        if self._frame is None or self._frame.isNull():
+            return None
+        return self._frame.copy()
 
     def set_detections(self, detections: tuple[DetectionEvent, ...]) -> None:
         self._detections = detections
@@ -427,6 +435,61 @@ class PurposeInferenceWorker(QObject):
         self.finished.emit(process.task_id)
 
 
+class FrontCameraLprWorker(QObject):
+    result_ready = pyqtSignal(object)
+    status_changed = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        frame: QImage,
+        *,
+        event_dir: Path = Path("artifacts/runtime/purpose-ai/front_camera_lpr"),
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.frame = frame.copy()
+        self.event_dir = event_dir
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:
+        if self._stop_requested:
+            self.finished.emit()
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = self.event_dir / f"run-{stamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = run_dir / f"front-camera-lpr-{stamp}.png"
+        event_path = self.event_dir / "lpr.jsonl"
+        log_path = self.event_dir / "lpr.gst.log"
+        manifest_path = self.event_dir / "lpr_manifest.json"
+        if not self.frame.save(str(snapshot_path), "PNG"):
+            self.result_ready.emit(
+                {
+                    "ok": False,
+                    "message": "정면카메라LPR 실패: 스냅샷 저장 실패",
+                    "log_path": str(log_path),
+                }
+            )
+            self.finished.emit()
+            return
+        self.status_changed.emit(f"정면카메라LPR 실행 중: {snapshot_path}")
+        run_fast_alpr_lpr(
+            image_dir=run_dir,
+            event_path=event_path,
+            log_path=log_path,
+            manifest_path=manifest_path,
+        )
+        payload = _front_lpr_payload(event_path)
+        payload["snapshot_path"] = str(snapshot_path)
+        payload["log_path"] = str(log_path)
+        self.result_ready.emit(payload)
+        self.finished.emit()
+
+
 class OperatorWindow(QMainWindow):
     def __init__(self, model: OperatorDisplayModel, settings: Settings | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -440,6 +503,8 @@ class OperatorWindow(QMainWindow):
         self._detection_workers: list[LiveDetectionWorker] = []
         self._purpose_threads: list[QThread] = []
         self._purpose_workers: list[PurposeInferenceWorker] = []
+        self._front_lpr_threads: list[QThread] = []
+        self._front_lpr_workers: list[FrontCameraLprWorker] = []
         self._detection_enabled = False
         self._detection_camera_ids: tuple[str, ...] = ()
         self._detection_event_counts: dict[str, int] = {}
@@ -457,6 +522,7 @@ class OperatorWindow(QMainWindow):
         self._purpose_task_started_at: float | None = None
         self._purpose_task_first_inference_seconds: float | None = None
         self._purpose_lpr_results: tuple[PlateOcrEvent, ...] = ()
+        self._front_lpr_enabled = False
         self._operator_unlocked = True
         self._vehicle_entry_simulation = False
         self._camera_layout_mode = "dashboard"
@@ -505,12 +571,16 @@ class OperatorWindow(QMainWindow):
             thread.wait(5000)
         self._stop_ai_detection()
         self._stop_purpose_inference()
+        self._stop_front_camera_lpr()
         for thread in self._detection_threads:
             thread.quit()
             thread.wait(5000)
         for thread in self._purpose_threads:
             thread.quit()
             thread.wait(5000)
+        for thread in self._front_lpr_threads:
+            thread.quit()
+            thread.wait(10000)
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
@@ -773,6 +843,10 @@ class OperatorWindow(QMainWindow):
                 button.setCheckable(True)
                 self.purpose_task_buttons[PURPOSE_LPR_IMAGE] = button
                 button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_LPR_IMAGE))
+            elif label == "정면카메라LPR":
+                self.front_lpr_button = button
+                button.setCheckable(True)
+                button.clicked.connect(self._toggle_front_camera_lpr)
             elif label == "사람 존재 감지":
                 button.setCheckable(True)
                 self.purpose_task_buttons[PURPOSE_PERSON_PRESENCE] = button
@@ -1075,6 +1149,69 @@ class OperatorWindow(QMainWindow):
             return
         self._start_purpose_inference(task_id)
 
+    def _toggle_front_camera_lpr(self, checked: bool = False) -> None:
+        del checked
+        if self._front_lpr_enabled or self._front_lpr_workers:
+            self._set_front_lpr_button_text()
+            self.warning_label.setText("정면카메라LPR 실행 중입니다. 완료 후 다시 시도해 주세요.")
+            return
+        self._start_front_camera_lpr()
+
+    def _start_front_camera_lpr(self) -> None:
+        front_widget = self.camera_widgets.get(CameraRole.front)
+        frame = front_widget.current_frame() if front_widget is not None else None
+        if frame is None and front_widget is not None and front_widget.status == "정상 수신":
+            frame = front_widget.grab().toImage()
+        if frame is None:
+            self._front_lpr_enabled = False
+            self._set_front_lpr_button_text()
+            self.instruction_label.setText("정면카메라LPR 실패: 정면 프레임 없음")
+            self.warning_label.setText("정면카메라LPR을 실행할 최신 정면 카메라 프레임이 없습니다. 최종 OK는 차단됩니다.")
+            return
+
+        self._front_lpr_enabled = True
+        self._set_front_lpr_button_text()
+        self.warning_label.setText("정면카메라LPR 실행 중입니다. 기존 AI 추론은 유지됩니다.")
+        thread = QThread(self)
+        worker = FrontCameraLprWorker(frame)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.status_changed.connect(self._set_front_lpr_status)
+        worker.result_ready.connect(self._set_front_lpr_result)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(lambda worker=worker, thread=thread: self._cleanup_front_lpr_worker(thread, worker))
+        self._front_lpr_threads.append(thread)
+        self._front_lpr_workers.append(worker)
+        thread.start()
+
+    def _set_front_lpr_status(self, message: str) -> None:
+        self.warning_label.setText(f"{message}. 최종 OK는 차단됩니다.")
+
+    def _set_front_lpr_result(self, payload: dict[str, object]) -> None:
+        if payload.get("ok"):
+            last4 = str(payload.get("last4") or "")
+            self.instruction_label.setText(f"정면카메라LPR: {last4}")
+            self.warning_label.setText(f"정면카메라LPR 완료. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
+            return
+        message = str(payload.get("message") or "정면카메라LPR 실패: 결과 없음")
+        self.instruction_label.setText(message)
+        self.warning_label.setText(f"{message}. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
+
+    def _stop_front_camera_lpr(self) -> None:
+        self._front_lpr_enabled = False
+        self._set_front_lpr_button_text()
+        for worker in tuple(self._front_lpr_workers):
+            worker.stop()
+
+    def _cleanup_front_lpr_worker(self, thread: QThread, worker: FrontCameraLprWorker) -> None:
+        if thread in self._front_lpr_threads:
+            self._front_lpr_threads.remove(thread)
+        if worker in self._front_lpr_workers:
+            self._front_lpr_workers.remove(worker)
+        if not self._front_lpr_workers:
+            self._front_lpr_enabled = False
+            self._set_front_lpr_button_text()
+
     def _start_purpose_inference(self, task_id: str) -> None:
         if self.settings is None:
             self._set_purpose_buttons_checked(False)
@@ -1249,6 +1386,13 @@ class OperatorWindow(QMainWindow):
             label = PURPOSE_TASK_SPECS[task_id].label
             button.setText(f"{label} ON" if self._purpose_task_enabled and self._purpose_task_id == task_id else label)
 
+    def _set_front_lpr_button_text(self) -> None:
+        button = getattr(self, "front_lpr_button", None)
+        if button is None:
+            return
+        button.setChecked(self._front_lpr_enabled)
+        button.setText("정면카메라LPR ON" if self._front_lpr_enabled else "정면카메라LPR")
+
     def _cleanup_detection_worker(self, thread: QThread, worker: LiveDetectionWorker) -> None:
         if thread in self._detection_threads:
             self._detection_threads.remove(thread)
@@ -1313,6 +1457,30 @@ def _rotation_label(rotation_degrees: int) -> str:
         180: "180도",
         270: "CW 90도",
     }[rotation_degrees % 360]
+
+
+def _front_lpr_payload(event_path: Path) -> dict[str, object]:
+    if not event_path.exists():
+        return {"ok": False, "message": "정면카메라LPR 실패: 결과 없음"}
+    best_plate = ""
+    for line in event_path.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("type") != "plate_ocr":
+            continue
+        plate_number = str(payload.get("plate_number") or "").strip()
+        if plate_number:
+            best_plate = plate_number
+    digits = "".join(char for char in best_plate if char.isdigit())
+    if not digits:
+        return {"ok": False, "message": "정면카메라LPR 실패: 결과 없음"}
+    return {
+        "ok": True,
+        "plate_number": best_plate,
+        "last4": digits[-4:],
+    }
 
 
 def _rotate_cv_frame(cv2, frame, rotation_degrees: int):  # noqa: ANN001, ANN201 - cv2/numpy are optional runtime deps.
