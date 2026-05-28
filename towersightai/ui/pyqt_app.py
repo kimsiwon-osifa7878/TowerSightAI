@@ -27,8 +27,10 @@ OPERATOR_PANEL_WIDTH = 400
 OPERATOR_SIDEBAR_WIDTH = 300
 DETECTION_TTL_SECONDS = 1.0
 FIRST_INFERENCE_TIMEOUT_SECONDS = 30.0
+PERSON_ALERT_STREAK_THRESHOLD = 2
+PERSON_ALERT_STALE_SECONDS = 3.0
 SIDEBAR_ACTION_LABELS = (
-    "운영 대시보드",
+    "사용자모드",
     "전체 카메라",
     "카메라 설정",
     "이전 AI Detection",
@@ -65,6 +67,7 @@ class CameraSurface(QFrame):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.title = title
+        self.display_mode = "contain"
         self.status = "NG: 프레임 대기"
         self._frame: QImage | None = None
         self._detections: tuple[DetectionEvent, ...] = ()
@@ -100,6 +103,12 @@ class CameraSurface(QFrame):
         self._vehicle_simulation = enabled
         self.update()
 
+    def set_display_mode(self, mode: str) -> None:
+        if mode not in {"contain", "cover"}:
+            raise ValueError(f"Unsupported camera display mode: {mode}")
+        self.display_mode = mode
+        self.update()
+
     def paintEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
         super().paintEvent(event)
         painter = QPainter(self)
@@ -113,13 +122,19 @@ class CameraSurface(QFrame):
         center_x = content.left() + width // 2
         center_y = content.top() + height // 2
         display_frame = self._frame
+        source_crop_rect = None
         if display_frame is not None and not display_frame.isNull():
-            scaled_size = display_frame.size()
-            scaled_size.scale(content.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            image_rect = content
-            image_rect.setSize(scaled_size)
-            image_rect.moveCenter(content.center())
-            painter.drawImage(image_rect, display_frame)
+            if self.display_mode == "cover":
+                image_rect = content
+                source_crop_rect = _cover_source_rect(display_frame.size(), content.size())
+                painter.drawImage(image_rect, display_frame, source_crop_rect)
+            else:
+                scaled_size = display_frame.size()
+                scaled_size.scale(content.size(), Qt.AspectRatioMode.KeepAspectRatio)
+                image_rect = content
+                image_rect.setSize(scaled_size)
+                image_rect.moveCenter(content.center())
+                painter.drawImage(image_rect, display_frame)
         else:
             image_rect = content
             painter.setPen(QPen(QColor("#94a3b8"), 1))
@@ -153,7 +168,7 @@ class CameraSurface(QFrame):
 
         for detection in _fresh_detections(self._detections):
             frame_size = self._frame.size() if self._frame is not None and not self._frame.isNull() else None
-            box = _bbox_to_rect(detection, image_rect, source_size=frame_size)
+            box = _bbox_to_rect(detection, image_rect, source_size=frame_size, source_crop_rect=source_crop_rect)
             if box is None:
                 continue
             color = _detection_color(detection.label)
@@ -523,6 +538,11 @@ class OperatorWindow(QMainWindow):
         self._purpose_task_first_inference_seconds: float | None = None
         self._purpose_lpr_results: tuple[PlateOcrEvent, ...] = ()
         self._front_lpr_enabled = False
+        self._user_mode_state = "idle"
+        self._pending_user_purpose_task_id = ""
+        self._person_detection_streak = 0
+        self._last_person_detection_at: float | None = None
+        self._person_detected_camera_ids: set[str] = set()
         self._operator_unlocked = True
         self._vehicle_entry_simulation = False
         self._camera_layout_mode = "dashboard"
@@ -550,6 +570,10 @@ class OperatorWindow(QMainWindow):
         self.state_label.setText(model.state.value)
         self.instruction_label.setText(model.instruction)
         self.warning_label.setText(model.warning)
+        if hasattr(self, "user_instruction_label"):
+            self.user_instruction_label.setText(model.instruction)
+        if hasattr(self, "user_warning_label"):
+            self.user_warning_label.setText(model.warning)
         self.plc_label.setText(f"PLC {model.plc_state.value}")
         self.camera_summary_label.setText(model.camera_health_summary)
         self.safety_label.setText("OK" if model.can_show_final_ok else model.safety_status.value)
@@ -655,7 +679,23 @@ class OperatorWindow(QMainWindow):
                     first_inference_seconds=self._purpose_task_first_inference_seconds,
                 )
             )
+        self._update_user_person_alert(camera_id, detections)
+        self._refresh_user_mode_labels()
         widget.set_detections(detections)
+
+    def _update_user_person_alert(self, camera_id: str, detections: tuple[DetectionEvent, ...]) -> None:
+        if self._purpose_task_id != PURPOSE_PERSON_PRESENCE:
+            return
+        if not any(event.label.strip().lower() in {"person", "human"} for event in detections):
+            return
+        self._person_detection_streak += 1
+        self._last_person_detection_at = time.monotonic()
+        self._person_detected_camera_ids.add(camera_id)
+        if self._person_detection_streak >= PERSON_ALERT_STREAK_THRESHOLD:
+            cameras = ", ".join(sorted(self._person_detected_camera_ids))
+            message = f"사람이 감지되었습니다. ({cameras})"
+            self.user_warning_label.setText(f"{message} 최종 OK는 차단됩니다.")
+            self.warning_label.setText(f"{message} 최종 OK는 차단됩니다.")
 
     def _set_detection_status(self, camera_id: str, message: str) -> None:
         if "실행 중" in message or "재시도 중" in message or "재시작 대기" in message:
@@ -726,11 +766,72 @@ class OperatorWindow(QMainWindow):
     def _build(self) -> None:
         self.stack = QStackedWidget()
         self.operator_view = self._build_operator_view()
+        self.user_view = self._build_user_view()
         self.settings_view = self._build_settings_view()
         self.stack.addWidget(self.operator_view)
+        self.stack.addWidget(self.user_view)
         self.stack.addWidget(self.settings_view)
         self.setCentralWidget(self.stack)
-        self._show_operator_dashboard()
+        self._show_user_mode()
+
+    def _build_user_view(self) -> QWidget:
+        root = QWidget()
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        outer.addLayout(top)
+
+        status = QVBoxLayout()
+        status.setSpacing(6)
+        top.addLayout(status, 1)
+
+        self.user_instruction_label = QLabel()
+        self.user_instruction_label.setObjectName("userInstructionLabel")
+        self.user_instruction_label.setWordWrap(True)
+        status.addWidget(self.user_instruction_label)
+
+        self.user_warning_label = QLabel()
+        self.user_warning_label.setObjectName("userWarningLabel")
+        self.user_warning_label.setWordWrap(True)
+        status.addWidget(self.user_warning_label)
+
+        self.user_plate_label = QLabel("번호판: -")
+        self.user_plate_label.setObjectName("userPlateLabel")
+        self.user_plate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top.addWidget(self.user_plate_label)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        top.addLayout(controls)
+        self.user_mode_buttons: dict[str, QPushButton] = {}
+        for label, handler in (
+            ("IDLE", self._user_idle),
+            ("진입", self._user_entry),
+            ("진입완료", self._user_entry_complete),
+            ("번호판인식", self._user_plate_recognition),
+            ("주차시작", self._user_parking_started),
+            ("운영모드", self._show_operator_dashboard),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("smallModeButton")
+            button.setFixedHeight(34)
+            button.clicked.connect(handler)
+            self.user_mode_buttons[label] = button
+            controls.addWidget(button)
+
+        self.user_grid = QGridLayout()
+        self.user_grid.setSpacing(8)
+        camera_area = QWidget()
+        camera_area.setLayout(self.user_grid)
+        outer.addWidget(camera_area, 1)
+
+        self.user_progress_label = QLabel("IDLE")
+        self.user_progress_label.setObjectName("telemetryLabel")
+        outer.addWidget(self.user_progress_label)
+        return root
 
     def _build_operator_view(self) -> QWidget:
         root = QWidget()
@@ -825,8 +926,8 @@ class OperatorWindow(QMainWindow):
         for label in SIDEBAR_ACTION_LABELS:
             button = QPushButton(label)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            if label == "운영 대시보드":
-                button.clicked.connect(self._show_operator_dashboard)
+            if label == "사용자모드":
+                button.clicked.connect(self._show_user_mode)
             elif label == "전체 카메라":
                 button.clicked.connect(self._show_all_cameras)
             elif label == "카메라 설정":
@@ -909,6 +1010,11 @@ class OperatorWindow(QMainWindow):
     def _tick(self) -> None:
         text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.clock_label.setText(text)
+        if self._last_person_detection_at is not None and time.monotonic() - self._last_person_detection_at >= PERSON_ALERT_STALE_SECONDS:
+            self._reset_person_alert()
+            if self._purpose_task_id == PURPOSE_PERSON_PRESENCE and hasattr(self, "user_warning_label"):
+                self.user_warning_label.setText("사람 감지 중입니다. 최종 OK는 차단됩니다.")
+        self._refresh_user_mode_labels()
         if (
             self._detection_enabled
             and not self._detection_legacy_mode
@@ -937,6 +1043,11 @@ class OperatorWindow(QMainWindow):
             return
         self._set_camera_layout(self._camera_layout_mode)
         self.stack.setCurrentWidget(self.operator_view)
+
+    def _show_user_mode(self) -> None:
+        self._set_user_camera_layout()
+        self.stack.setCurrentWidget(self.user_view)
+        self._refresh_user_mode_labels()
 
     def _show_operator_dashboard(self) -> None:
         self._operator_unlocked = True
@@ -973,6 +1084,131 @@ class OperatorWindow(QMainWindow):
         self._show_operator_dashboard()
         self.instruction_label.setText("진입 차량 감지: 버드뷰와 정면 영상을 확인 중입니다.")
         self.warning_label.setText("차량 진입 시뮬레이션: UI 확인 전용이며 PLC OK는 차단됩니다.")
+
+    def _user_idle(self) -> None:
+        self._user_mode_state = "idle"
+        self._reset_person_alert()
+        self._set_user_status("대기 중: 주차기 내부 사람 감지 중", "사람 감지 AI 실행 준비 중입니다.")
+        self._switch_user_purpose_task(PURPOSE_PERSON_PRESENCE)
+
+    def _user_entry(self) -> None:
+        self._user_mode_state = "entry"
+        self._reset_person_alert()
+        self._set_user_status("진입 차량 감지 중", "정면 카메라 차량 감지 AI로 전환합니다.")
+        self._switch_user_purpose_task(PURPOSE_VEHICLE_DETECTION)
+
+    def _user_entry_complete(self) -> None:
+        self._user_mode_state = "entry_complete"
+        self._reset_person_alert()
+        self._set_user_status("진입 완료: 사람 감지 중", "차량 감지 AI를 종료하고 사람 감지를 다시 시작합니다.")
+        self._switch_user_purpose_task(PURPOSE_PERSON_PRESENCE)
+
+    def _user_plate_recognition(self) -> None:
+        self._user_mode_state = "plate_recognition"
+        self._set_user_status("번호판 인식 중", "정면 카메라 스냅샷으로 번호판을 인식합니다.")
+        self._start_front_camera_lpr()
+
+    def _user_parking_started(self) -> None:
+        self._user_mode_state = "parking_started"
+        self._pending_user_purpose_task_id = ""
+        self._stop_purpose_inference()
+        self._stop_ai_detection()
+        self._stop_front_camera_lpr()
+        self._reset_person_alert()
+        self._set_user_status("주차 시작: AI 감시 종료", "모든 AI 추론을 종료했습니다. 최종 OK는 차단됩니다.")
+
+    def _switch_user_purpose_task(self, task_id: str) -> None:
+        if task_id == PURPOSE_PERSON_PRESENCE and not self._user_person_detection_can_start():
+            if self._purpose_task_enabled or self._purpose_workers:
+                self._stop_purpose_inference()
+            self._pending_user_purpose_task_id = ""
+            self._set_purpose_buttons_checked(False)
+            requirement = "정상 수신 중인 카메라가 있을 때 시작합니다." if self._user_mode_state == "idle" else "4대 카메라가 모두 정상 수신일 때 시작합니다."
+            self._set_user_status(
+                self.user_instruction_label.text(),
+                f"사람 감지는 {requirement}",
+            )
+            return
+        if self._purpose_task_enabled and self._purpose_task_id == task_id:
+            self._refresh_user_mode_labels()
+            return
+        if self._purpose_workers:
+            self._pending_user_purpose_task_id = task_id
+            self._stop_purpose_inference()
+            self._set_user_status(self.user_instruction_label.text(), "기존 AI 추론 종료 후 다음 추론을 시작합니다.")
+            return
+        self._pending_user_purpose_task_id = ""
+        self._start_purpose_inference(task_id)
+
+    def _set_user_status(self, instruction: str, warning: str) -> None:
+        self.user_instruction_label.setText(instruction)
+        self.user_warning_label.setText(f"{warning} 최종 OK는 차단됩니다.")
+        self.user_progress_label.setText(self._user_progress_text())
+
+    def _all_user_person_cameras_ready(self) -> bool:
+        if self.settings is None:
+            return False
+        configured_ids = {camera.id for camera in self.settings.cameras}
+        streaming_ids = set(_streaming_camera_ids(self.settings, self._runtime_camera_status))
+        return bool(configured_ids) and configured_ids.issubset(streaming_ids)
+
+    def _user_person_detection_can_start(self) -> bool:
+        if self.settings is None:
+            return False
+        if self._user_mode_state == "idle":
+            return bool(_streaming_camera_ids(self.settings, self._runtime_camera_status))
+        return self._all_user_person_cameras_ready()
+
+    def _refresh_user_mode_labels(self) -> None:
+        if not hasattr(self, "user_progress_label"):
+            return
+        self.user_progress_label.setText(self._user_progress_text())
+        for label, button in self.user_mode_buttons.items():
+            active = (
+                (label == "IDLE" and self._user_mode_state == "idle")
+                or (label == "진입" and self._user_mode_state == "entry")
+                or (label == "진입완료" and self._user_mode_state == "entry_complete")
+                or (label == "번호판인식" and self._user_mode_state == "plate_recognition")
+                or (label == "주차시작" and self._user_mode_state == "parking_started")
+            )
+            button.setProperty("active", active)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _user_progress_text(self) -> str:
+        task = self._purpose_task_label or "AI OFF"
+        if self._front_lpr_enabled:
+            task = "정면카메라LPR 실행 중"
+        return f"{self._user_mode_state.upper()} / {task} / {self.ai_detection_label.text() if hasattr(self, 'ai_detection_label') else ''}"
+
+    def _set_user_camera_layout(self) -> None:
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        while self.user_grid.count():
+            item = self.user_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        for role, col, stretch in ((CameraRole.ceiling, 0, 4), (CameraRole.front, 1, 5)):
+            widget = self.camera_widgets[role]
+            widget.set_display_mode("cover")
+            if role is CameraRole.ceiling:
+                widget.setMinimumSize(320, 520)
+                widget.setMaximumWidth(560)
+            else:
+                widget.setMinimumSize(520, 360)
+                widget.setMaximumWidth(16777215)
+            self.user_grid.addWidget(widget, 0, col)
+            self.user_grid.setColumnStretch(col, stretch)
+        self.user_grid.setRowStretch(0, 1)
+
+    def _reset_person_alert(self) -> None:
+        self._person_detection_streak = 0
+        self._last_person_detection_at = None
+        self._person_detected_camera_ids.clear()
 
     def _rotate_camera(self, camera_id: str) -> None:
         next_rotation = _next_rotation(self._camera_rotations.get(camera_id, 0))
@@ -1015,6 +1251,14 @@ class OperatorWindow(QMainWindow):
 
     def _set_camera_layout(self, mode: str) -> None:
         self._camera_layout_mode = mode
+        for widget in self.camera_widgets.values():
+            widget.set_display_mode("contain")
+        if hasattr(self, "user_grid"):
+            while self.user_grid.count():
+                item = self.user_grid.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
         while self.grid.count():
             item = self.grid.takeAt(0)
             widget = item.widget()
@@ -1167,6 +1411,8 @@ class OperatorWindow(QMainWindow):
             self._set_front_lpr_button_text()
             self.instruction_label.setText("정면카메라LPR 실패: 정면 프레임 없음")
             self.warning_label.setText("정면카메라LPR을 실행할 최신 정면 카메라 프레임이 없습니다. 최종 OK는 차단됩니다.")
+            if hasattr(self, "user_warning_label"):
+                self.user_warning_label.setText("번호판 인식 실패: 정면 프레임 없음. 최종 OK는 차단됩니다.")
             return
 
         self._front_lpr_enabled = True
@@ -1186,16 +1432,24 @@ class OperatorWindow(QMainWindow):
 
     def _set_front_lpr_status(self, message: str) -> None:
         self.warning_label.setText(f"{message}. 최종 OK는 차단됩니다.")
+        if hasattr(self, "user_warning_label"):
+            self.user_warning_label.setText(f"{message}. 최종 OK는 차단됩니다.")
 
     def _set_front_lpr_result(self, payload: dict[str, object]) -> None:
         if payload.get("ok"):
             last4 = str(payload.get("last4") or "")
             self.instruction_label.setText(f"정면카메라LPR: {last4}")
             self.warning_label.setText(f"정면카메라LPR 완료. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
+            if hasattr(self, "user_plate_label"):
+                self.user_plate_label.setText(f"번호판: {last4}")
+                self.user_instruction_label.setText(f"번호판 인식: {last4}")
+                self.user_warning_label.setText("번호판 인식 완료. 최종 OK는 차단됩니다.")
             return
         message = str(payload.get("message") or "정면카메라LPR 실패: 결과 없음")
         self.instruction_label.setText(message)
         self.warning_label.setText(f"{message}. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
+        if hasattr(self, "user_warning_label"):
+            self.user_warning_label.setText(f"{message}. 최종 OK는 차단됩니다.")
 
     def _stop_front_camera_lpr(self) -> None:
         self._front_lpr_enabled = False
@@ -1243,6 +1497,9 @@ class OperatorWindow(QMainWindow):
         self.model_status_label.setText(f"목적 모델 로드 중: {spec.label}")
         self.ai_detection_label.setText(_purpose_detection_label(spec.label, camera_ids, self._detection_event_counts, loading_seconds=0.0))
         self.warning_label.setText(f"{spec.label} 실행 준비 중: 최종 OK는 차단됩니다.")
+        if hasattr(self, "user_warning_label"):
+            self.user_warning_label.setText(f"{spec.label} 실행 준비 중입니다. 최종 OK는 차단됩니다.")
+            self._refresh_user_mode_labels()
         self._set_detection_buttons_checked(False)
         self._set_detection_button_texts()
         self._set_purpose_buttons_checked(True, task_id=task_id)
@@ -1293,6 +1550,9 @@ class OperatorWindow(QMainWindow):
         self.ai_detection_label.setText(_purpose_detection_label(label, self._detection_camera_ids, self._detection_event_counts, loading_seconds=0.0))
         self.model_status_label.setText(f"목적 모델 실행: {label}")
         self.warning_label.setText(f"{label} 추론 시작 중. 로그: {self._purpose_task_log_path}")
+        if hasattr(self, "user_warning_label"):
+            self.user_warning_label.setText(f"{label} 추론 시작 중입니다. 최종 OK는 차단됩니다.")
+            self._refresh_user_mode_labels()
 
     def _set_purpose_first_inference_ready(self, elapsed_seconds: float) -> None:
         self._purpose_task_first_inference_seconds = elapsed_seconds
@@ -1306,6 +1566,9 @@ class OperatorWindow(QMainWindow):
         )
         self.model_status_label.setText(f"목적 모델 실행: {self._purpose_task_label}")
         self.warning_label.setText(f"{self._purpose_task_label} 추론 확인: {elapsed_seconds:.1f}s. 최종 OK는 차단됩니다.")
+        if hasattr(self, "user_warning_label"):
+            self.user_warning_label.setText(f"{self._purpose_task_label} 추론 확인: {elapsed_seconds:.1f}s. 최종 OK는 차단됩니다.")
+            self._refresh_user_mode_labels()
 
     def _set_lpr_results(self, events: tuple[PlateOcrEvent, ...]) -> None:
         if self._purpose_task_id != PURPOSE_LPR_IMAGE:
@@ -1337,6 +1600,8 @@ class OperatorWindow(QMainWindow):
         self.ai_detection_label.setText(f"{self._purpose_task_label or '목적 추론'} 오류")
         self.model_status_label.setText(f"목적 추론 실패: {self._purpose_task_label or target_id}")
         self.warning_label.setText(f"{self._purpose_task_label or target_id} 문제: {message[:120]}")
+        if hasattr(self, "user_warning_label"):
+            self.user_warning_label.setText(f"{self._purpose_task_label or target_id} 문제: {message[:120]}. 최종 OK는 차단됩니다.")
 
     def _stop_purpose_inference(self) -> None:
         self._purpose_task_enabled = False
@@ -1376,6 +1641,10 @@ class OperatorWindow(QMainWindow):
                 self.ai_detection_label.setText(f"{label} 완료")
                 self.model_status_label.setText(f"목적 추론 완료: {label}")
                 self.warning_label.setText(f"{label} 실행이 종료되었습니다. 결과는 로그를 확인하세요. 최종 OK는 차단됩니다.")
+        pending_task_id = self._pending_user_purpose_task_id
+        if pending_task_id and not self._purpose_workers:
+            self._pending_user_purpose_task_id = ""
+            self._start_purpose_inference(pending_task_id)
 
     def _set_purpose_buttons_checked(self, checked: bool, *, task_id: str = "") -> None:
         for current_task_id, button in self.purpose_task_buttons.items():
@@ -1494,15 +1763,75 @@ def _rotate_cv_frame(cv2, frame, rotation_degrees: int):  # noqa: ANN001, ANN201
     return frame
 
 
-def _bbox_to_rect(event: DetectionEvent, image_rect: QRect, *, source_size: QSize | None = None) -> QRect | None:
+def _cover_source_rect(source_size: QSize, target_size: QSize) -> QRect:
+    source_width = source_size.width()
+    source_height = source_size.height()
+    target_width = target_size.width()
+    target_height = target_size.height()
+    if source_width <= 0 or source_height <= 0 or target_width <= 0 or target_height <= 0:
+        return QRect(0, 0, max(0, source_width), max(0, source_height))
+    source_aspect = source_width / source_height
+    target_aspect = target_width / target_height
+    if source_aspect > target_aspect:
+        crop_width = max(1, min(source_width, int(round(source_height * target_aspect))))
+        left = (source_width - crop_width) // 2
+        return QRect(left, 0, crop_width, source_height)
+    crop_height = max(1, min(source_height, int(round(source_width / target_aspect))))
+    top = (source_height - crop_height) // 2
+    return QRect(0, top, source_width, crop_height)
+
+
+def _bbox_to_rect(
+    event: DetectionEvent,
+    image_rect: QRect,
+    *,
+    source_size: QSize | None = None,
+    source_crop_rect: QRect | None = None,
+) -> QRect | None:
     bbox = event.bbox
     if bbox.w <= 0 or bbox.h <= 0:
         return None
     x_norm, y_norm, w_norm, h_norm = _network_bbox_to_source_bbox(bbox.x, bbox.y, bbox.w, bbox.h, source_size)
+    if source_size is not None and source_crop_rect is not None:
+        return _cropped_bbox_to_rect(x_norm, y_norm, w_norm, h_norm, source_size, source_crop_rect, image_rect)
     x = image_rect.left() + int(x_norm * image_rect.width())
     y = image_rect.top() + int(y_norm * image_rect.height())
     width = max(2, int(w_norm * image_rect.width()))
     height = max(2, int(h_norm * image_rect.height()))
+    rect = QRect(x, y, width, height).intersected(image_rect)
+    if rect.isEmpty():
+        return None
+    return rect
+
+
+def _cropped_bbox_to_rect(
+    x_norm: float,
+    y_norm: float,
+    w_norm: float,
+    h_norm: float,
+    source_size: QSize,
+    source_crop_rect: QRect,
+    image_rect: QRect,
+) -> QRect | None:
+    source_width = source_size.width()
+    source_height = source_size.height()
+    if source_width <= 0 or source_height <= 0 or source_crop_rect.width() <= 0 or source_crop_rect.height() <= 0:
+        return None
+    source_box = QRect(
+        int(round(x_norm * source_width)),
+        int(round(y_norm * source_height)),
+        max(1, int(round(w_norm * source_width))),
+        max(1, int(round(h_norm * source_height))),
+    )
+    visible_box = source_box.intersected(source_crop_rect)
+    if visible_box.isEmpty():
+        return None
+    scale_x = image_rect.width() / source_crop_rect.width()
+    scale_y = image_rect.height() / source_crop_rect.height()
+    x = image_rect.left() + int(round((visible_box.left() - source_crop_rect.left()) * scale_x))
+    y = image_rect.top() + int(round((visible_box.top() - source_crop_rect.top()) * scale_y))
+    width = max(2, int(round(visible_box.width() * scale_x)))
+    height = max(2, int(round(visible_box.height() * scale_y)))
     rect = QRect(x, y, width, height).intersected(image_rect)
     if rect.isEmpty():
         return None
@@ -1681,6 +2010,29 @@ def _stylesheet() -> str:
         padding: 12px;
         border: 1px solid #4b5563;
     }
+    #userInstructionLabel {
+        font-size: 34px;
+        font-weight: 800;
+        line-height: 1.25;
+        padding: 10px;
+        border: 1px solid #4b5563;
+    }
+    #userWarningLabel {
+        font-size: 22px;
+        font-weight: 700;
+        color: #fecaca;
+        padding: 8px;
+        border: 1px solid #7f1d1d;
+        background: #241316;
+    }
+    #userPlateLabel {
+        min-width: 190px;
+        font-size: 30px;
+        font-weight: 800;
+        padding: 10px;
+        border: 1px solid #4b5563;
+        background: #101820;
+    }
     #warningLabel {
         font-size: 22px;
         font-weight: 600;
@@ -1712,6 +2064,16 @@ def _stylesheet() -> str:
     QPushButton:disabled {
         color: #6b7280;
         background: #111827;
+    }
+    #smallModeButton {
+        min-height: 30px;
+        font-size: 14px;
+        padding: 4px 8px;
+    }
+    #smallModeButton[active="true"] {
+        border-color: #38bdf8;
+        background: #123142;
+        color: #e0f2fe;
     }
     #testLog {
         font-size: 15px;
