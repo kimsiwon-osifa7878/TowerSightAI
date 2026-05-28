@@ -84,6 +84,8 @@ def test_person_presence_process_uses_detector_without_reid_embedding(tmp_path: 
     assert process.task_id == PURPOSE_PERSON_PRESENCE
     assert process.camera_ids == ("ceiling", "front")
     assert "yolov5s_personface_reid.hef" in command
+    assert command.count("video/x-raw,format=RGB,width=640,height=640,pixel-aspect-ratio=1/1") == 3
+    assert "force-writable=true" in command
     assert "function-name=yolov5_personface_letterbox" in command
     assert "hailopython" in command
     assert "allowed_labels=('person', 'human')" in (tmp_path / "events/person_presence/person_presence_callback_ceiling.py").read_text(encoding="utf-8")

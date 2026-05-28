@@ -14,11 +14,14 @@ from typing import Callable, Iterable
 from towersightai.camera.pipeline import display_orientation_element
 from towersightai.config.settings import CameraConfig, Settings
 from towersightai.inference.events import DetectionEvent
-from towersightai.inference.image_smoke import _gst_runtime_env
+from towersightai.inference.image_smoke import NETWORK_FORMAT, NETWORK_HEIGHT, NETWORK_WIDTH, _gst_runtime_env
 from towersightai.inference.live_detection import DetectionFileTail, _read_log_tail, latest_events
 
 
 DEFAULT_PURPOSE_TASK_DIR = Path("artifacts/runtime/purpose-ai")
+PERSON_PRESENCE_NETWORK_CAPS = (
+    f"video/x-raw,format={NETWORK_FORMAT},width={NETWORK_WIDTH},height={NETWORK_HEIGHT},pixel-aspect-ratio=1/1"
+)
 FATAL_GSTREAMER_PATTERNS = (
     "HAILO_OUT_OF_PHYSICAL_DEVICES",
     "Failed to create vdevice",
@@ -355,7 +358,7 @@ def person_presence_process(
             "hailoroundrobin mode=0 name=fun",
             "! queue name=person_pre_convert_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
             "! videoconvert n-threads=1 qos=false",
-            "! video/x-raw,format=RGB,pixel-aspect-ratio=1/1",
+            f"! {PERSON_PRESENCE_NETWORK_CAPS}",
             "! queue name=person_pre_cropper_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
             f"! hailocropper so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/cropping_algorithms/libwhole_buffer.so'} "
             "function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true name=cropper1",
@@ -365,7 +368,8 @@ def person_presence_process(
             "! agg1.",
             "cropper1.",
             "! queue name=person_detector_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={resources / 'yolov5s_personface_reid.hef'} scheduling-algorithm=1 vdevice-group-id=1",
+            f"! hailonet hef-path={resources / 'yolov5s_personface_reid.hef'} scheduling-algorithm=1 "
+            "vdevice-group-id=1 force-writable=true",
             "! queue name=person_detector_post_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
             f"! hailofilter so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/libyolo_post.so'} "
             f"config-path={resources / 'configs/yolov5_personface.json'} function-name=yolov5_personface_letterbox qos=false",
@@ -449,7 +453,7 @@ def _person_presence_source_branch(
             f"! {orientation}" if orientation else "",
             "! videoscale add-borders=true n-threads=2",
             "! videoconvert n-threads=3",
-            "! video/x-raw,format=RGB,pixel-aspect-ratio=1/1",
+            f"! {PERSON_PRESENCE_NETWORK_CAPS}",
             f"! queue name=person_roundrobin_q_{index} leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
             f"! fun.sink_{index}",
             f"sid.src_{index}",
