@@ -68,6 +68,30 @@ def run_with_config(
     return _flow_ok()
 
 
+def run_lpr_ocr_with_config(
+    video_frame: _VideoFrame,
+    *,
+    event_path: str | None = None,
+    min_confidence: float = 0.0,
+    source_image: str | None = None,
+    frame_index: int | None = None,
+):
+    events = _extract_lpr_ocr_events(video_frame, min_confidence=min_confidence)
+    _write_lpr_ocr_events(events, event_path=event_path)
+    _write_lpr_ocr_attempt(
+        events,
+        event_path=event_path,
+        source_image=source_image,
+        frame_index=frame_index,
+    )
+    if events:
+        plates = ", ".join(f"{event['plate_number']}:{event['confidence']:.2f}" for event in events)
+        print(f"TowerSightAI LPR image attempt: image={source_image or 'unknown'} frame={frame_index} result={plates}")
+    else:
+        print(f"TowerSightAI LPR image attempt: image={source_image or 'unknown'} frame={frame_index} result=no_result")
+    return _flow_ok()
+
+
 def close() -> None:
     print("TowerSightAI Hailo callback closed")
 
@@ -79,6 +103,98 @@ def _extract_detections(video_frame: Any) -> list[Any]:
     hailo = _hailo if _hailo is not None else importlib.import_module("hailo")
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
     return list(detections or [])
+
+
+def _extract_lpr_ocr_events(video_frame: Any, *, min_confidence: float = 0.0) -> tuple[dict[str, Any], ...]:
+    roi = getattr(video_frame, "roi", None)
+    if roi is None:
+        return ()
+    events: list[dict[str, Any]] = []
+    timestamp = datetime.now(timezone.utc).isoformat()
+    seen: set[tuple[str, float]] = set()
+    for classification in _iter_lpr_ocr_classifications(roi):
+        label = str(_read_hailo_value(classification, ("get_label", "label")) or "").strip()
+        if not label:
+            continue
+        confidence_raw = _read_hailo_value(classification, ("get_confidence", "confidence"))
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            continue
+        if confidence < min_confidence:
+            continue
+        key = (label, round(confidence, 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        events.append(
+            {
+                "type": "plate_ocr",
+                "plate_number": label,
+                "confidence": confidence,
+                "timestamp": timestamp,
+                "source": "hailo_lpr_image",
+            }
+        )
+    return tuple(events)
+
+
+def _iter_lpr_ocr_classifications(roi: Any) -> list[Any]:
+    classifications: list[Any] = []
+    for vehicle in _objects_typed(roi, "HAILO_DETECTION"):
+        for plate in _objects_typed(vehicle, "HAILO_DETECTION"):
+            for classification in _objects_typed(plate, "HAILO_CLASSIFICATION"):
+                if _is_lpr_ocr_classification(classification):
+                    classifications.append(classification)
+    if classifications:
+        return classifications
+    return _iter_lpr_classifications(roi)
+
+
+def _iter_lpr_classifications(obj: Any) -> list[Any]:
+    classifications: list[Any] = []
+    direct = _objects_typed(obj, "HAILO_CLASSIFICATION")
+    for classification in direct:
+        if _is_lpr_ocr_classification(classification, allow_missing_type=True):
+            classifications.append(classification)
+    for detection in _objects_typed(obj, "HAILO_DETECTION"):
+        classifications.extend(_iter_lpr_classifications(detection))
+    return classifications
+
+
+def _is_lpr_ocr_classification(classification: Any, *, allow_missing_type: bool = False) -> bool:
+    classification_type = str(
+        _read_hailo_value(classification, ("get_classification_type", "classification_type", "type")) or ""
+    ).lower()
+    if not classification_type:
+        return allow_missing_type
+    return classification_type == "ocr"
+
+
+def _objects_typed(obj: Any, hailo_type_name: str) -> list[Any]:
+    get_objects_typed = getattr(obj, "get_objects_typed", None)
+    if callable(get_objects_typed):
+        try:
+            hailo = _hailo if _hailo is not None else importlib.import_module("hailo")
+            value = getattr(hailo, hailo_type_name)
+            return list(get_objects_typed(value) or [])
+        except (ImportError, AttributeError, TypeError):
+            pass
+    attr_name = "classifications" if hailo_type_name == "HAILO_CLASSIFICATION" else "detections"
+    value = getattr(obj, attr_name, None)
+    if value is None:
+        return []
+    value = value() if callable(value) else value
+    return list(value or [])
+
+
+def _read_hailo_value(obj: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        if not hasattr(obj, name):
+            continue
+        value = getattr(obj, name)
+        return value() if callable(value) else value
+    return None
 
 
 def _flow_ok() -> Any:
@@ -107,6 +223,48 @@ def _write_events(events: tuple[Any, ...], *, event_path: str | None = None) -> 
     with path.open("a", encoding="utf-8") as fp:
         for event in events:
             fp.write(json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _write_lpr_ocr_events(events: tuple[dict[str, Any], ...], *, event_path: str | None = None) -> None:
+    event_path = event_path or os.environ.get("TOWERSIGHTAI_LPR_EVENT_PATH")
+    if not event_path or not events:
+        return
+    path = Path(event_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fp:
+        for event in events:
+            fp.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _write_lpr_ocr_attempt(
+    events: tuple[dict[str, Any], ...],
+    *,
+    event_path: str | None = None,
+    source_image: str | None,
+    frame_index: int | None,
+) -> None:
+    event_path = event_path or os.environ.get("TOWERSIGHTAI_LPR_EVENT_PATH")
+    if not event_path:
+        return
+    path = Path(event_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    attempt = {
+        "type": "plate_ocr_attempt",
+        "source": "hailo_lpr_image",
+        "source_image": source_image,
+        "frame_index": frame_index,
+        "status": "recognized" if events else "no_result",
+        "plates": tuple(
+            {
+                "plate_number": event["plate_number"],
+                "confidence": event["confidence"],
+            }
+            for event in events
+        ),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(attempt, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _print_summary(events: tuple[Any, ...]) -> None:

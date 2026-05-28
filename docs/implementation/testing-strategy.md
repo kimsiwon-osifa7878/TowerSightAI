@@ -80,7 +80,7 @@ Manual or semi-automated checklist:
 - Click `전체 카메라` and confirm the four-camera inspection layout is visible.
 - For Hailo regression isolation, click `이전 AI Detection` and compare whether detection events resume through the previous `HAILO_HEF_PATH` launch path.
 - Click `차량 전용 검출` and confirm the status strip shows the purpose task, the front camera is the only target, and `artifacts/runtime/purpose-ai/vehicle_detection/vehicle.gst.log` contains `yolov5m_vehicles.hef`.
-- Click `번호판 이미지 LPR` and confirm `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` contains `yolov5m_vehicles.hef`, `tiny_yolov4_license_plates.hef`, `lprnet.hef`, and OCR postprocess output or errors.
+- Click `번호판 이미지 LPR` and confirm `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` contains FastALPR model names, per-image inference time, and OCR result or failure status.
 - Click `사람 존재 감지` and confirm `artifacts/runtime/purpose-ai/person_presence/person_presence.gst.log` contains `yolov5s_personface_reid.hef` and `yolov5_personface_letterbox`, but does not contain `repvgg_a0_person_reid_2048.hef` or `hailogallery`.
 - Click `차량 진입 시뮬레이션` and confirm only test overlay/instruction text changes.
 - Click at least one `EMPTY` button and confirm it is a safe no-op.

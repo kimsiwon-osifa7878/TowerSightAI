@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import QApplication
 
 from towersightai.config.settings import Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
+from towersightai.inference.purpose_tasks import PlateOcrEvent, PURPOSE_LPR_IMAGE
 from towersightai.state_machine.core import ParkingState
 from towersightai.ui.model import build_operator_display
 from towersightai.ui.pyqt_app import (
@@ -383,6 +384,45 @@ def test_lpr_purpose_button_starts_image_task_without_camera(monkeypatch):
     assert len(window._purpose_workers) == 1
     assert window._purpose_workers[0].camera_ids == ()
     assert window.ai_detection_label.text() == "번호판 이미지 LPR ON / loading 0.0s"
+    window.close()
+
+
+def test_lpr_result_updates_top_instruction_label_and_keeps_ok_blocked(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    window._purpose_task_id = PURPOSE_LPR_IMAGE
+
+    window._set_lpr_results(
+        (
+            PlateOcrEvent(
+                plate_number="12가3456",
+                confidence=0.94,
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+    )
+
+    assert window.instruction_label.text() == "번호판 인식: 12가3456"
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_lpr_no_result_updates_top_instruction_label(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    window._purpose_task_id = PURPOSE_LPR_IMAGE
+
+    window._set_lpr_results(())
+
+    assert window.instruction_label.text() == "번호판 인식 실패: 결과 없음"
+    assert "최종 OK는 차단" in window.warning_label.text()
     window.close()
 
 

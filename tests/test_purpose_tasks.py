@@ -1,7 +1,12 @@
 import subprocess
+import json
+import sys
+import types
 from pathlib import Path
 
+from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.config.settings import Settings
+from towersightai.inference.callback import run_lpr_ocr_with_config
 from towersightai.inference.purpose_tasks import (
     PURPOSE_LPR_IMAGE,
     PURPOSE_PERSON_PRESENCE,
@@ -9,6 +14,7 @@ from towersightai.inference.purpose_tasks import (
     PurposeInferenceProcess,
     PurposeInferenceRunner,
     build_purpose_process,
+    parse_plate_ocr_json,
 )
 
 
@@ -46,11 +52,12 @@ def test_vehicle_detection_process_uses_lpr_vehicle_model_and_callback(tmp_path:
     assert "hailopython" in command
 
 
-def test_lpr_image_process_uses_three_lpr_models(tmp_path: Path):
+def test_lpr_image_process_uses_fast_alpr_batch_runner(tmp_path: Path):
     settings = _settings(tmp_path)
     image_dir = tmp_path / "images"
     image_dir.mkdir()
     (image_dir / "plate.png").write_bytes(b"png")
+    (image_dir / "plate.jpg").write_bytes(b"jpg")
 
     process = build_purpose_process(
         PURPOSE_LPR_IMAGE,
@@ -61,12 +68,161 @@ def test_lpr_image_process_uses_three_lpr_models(tmp_path: Path):
     command = " ".join(process.command)
 
     assert process.task_id == PURPOSE_LPR_IMAGE
-    assert "yolov5m_vehicles.hef" in command
-    assert "tiny_yolov4_license_plates.hef" in command
-    assert "lprnet.hef" in command
-    assert "function-name=tiny_yolov4_license_plates" in command
-    assert "libocr_post.so" in command
-    assert "liblpr_ocrsink.so" in command
+    assert process.command[:3] == (sys.executable, "-m", "towersightai.cli.fast_alpr_lpr")
+    assert "--image-dir" in process.command
+    assert "gst-launch" not in command
+    assert "yolov5m_vehicles.hef" not in command
+    assert "tiny_yolov4_license_plates.hef" not in command
+    assert "lprnet.hef" not in command
+    assert "hailopython" not in command
+    assert "liblpr_ocrsink.so" not in command
+    manifest = json.loads((tmp_path / "events/lpr_image/lpr_manifest.json").read_text(encoding="utf-8"))
+    assert [image["source_image"] for image in manifest["images"]] == [
+        str(image_dir / "plate.jpg"),
+        str(image_dir / "plate.png"),
+    ]
+
+
+def test_fast_alpr_runner_writes_per_image_results(tmp_path: Path, monkeypatch):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "a.png").write_bytes(b"a")
+    (image_dir / "b.jpg").write_bytes(b"b")
+    event_path = tmp_path / "events/lpr.jsonl"
+    log_path = tmp_path / "events/lpr.gst.log"
+    manifest_path = tmp_path / "events/lpr_manifest.json"
+
+    class BoundingBox:
+        x1 = 1
+        y1 = 2
+        x2 = 3
+        y2 = 4
+
+    class Detection:
+        label = "license_plate"
+        confidence = 0.88
+        bounding_box = BoundingBox()
+
+    class Ocr:
+        text = "12가3456"
+        confidence = [0.9, 0.95]
+        region = None
+        region_confidence = None
+
+    class Result:
+        detection = Detection()
+        ocr = Ocr()
+
+    class ALPR:
+        def __init__(self, **_kwargs):
+            pass
+
+        def predict(self, _path):
+            return [Result()]
+
+    monkeypatch.setitem(sys.modules, "fast_alpr", types.SimpleNamespace(ALPR=ALPR))
+
+    assert run_fast_alpr_lpr(
+        image_dir=image_dir,
+        event_path=event_path,
+        log_path=log_path,
+        manifest_path=manifest_path,
+    ) == 0
+
+    lines = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    plate_events = [line for line in lines if line["type"] == "plate_ocr"]
+    attempts = [line for line in lines if line["type"] == "plate_ocr_attempt"]
+
+    assert len(plate_events) == 2
+    assert len(attempts) == 2
+    assert all(attempt["status"] == "recognized" for attempt in attempts)
+    assert all(attempt["elapsed_ms"] >= 0 for attempt in attempts)
+    assert attempts[0]["best_plate"]["plate_number"] == "12가3456"
+    assert "recognized-images=2/2" in log_path.read_text(encoding="utf-8")
+
+
+def test_lpr_ocr_callback_writes_plate_event(tmp_path: Path, monkeypatch):
+    event_path = tmp_path / "lpr.jsonl"
+
+    class Classification:
+        def get_classification_type(self):
+            return "ocr"
+
+        def get_label(self):
+            return "12가3456"
+
+        def get_confidence(self):
+            return 0.94
+
+    class PlateDetection:
+        classifications = (Classification(),)
+        detections = ()
+
+    class VehicleDetection:
+        classifications = ()
+        detections = (PlateDetection(),)
+
+    class Roi:
+        classifications = ()
+        detections = (VehicleDetection(),)
+
+    class VideoFrame:
+        roi = Roi()
+
+    monkeypatch.setattr("towersightai.inference.callback._flow_ok", lambda: "OK")
+
+    assert (
+        run_lpr_ocr_with_config(
+            VideoFrame(),
+            event_path=str(event_path),
+            min_confidence=0.9,
+            source_image="tmp/car_number-test/plate.png",
+            frame_index=0,
+        )
+        == "OK"
+    )
+    lines = event_path.read_text(encoding="utf-8").splitlines()
+    event = parse_plate_ocr_json(lines[0])
+    attempt = json.loads(lines[1])
+
+    assert event is not None
+    assert event.plate_number == "12가3456"
+    assert event.confidence == 0.94
+    assert attempt["type"] == "plate_ocr_attempt"
+    assert attempt["source_image"] == "tmp/car_number-test/plate.png"
+    assert attempt["frame_index"] == 0
+    assert attempt["status"] == "recognized"
+    assert attempt["plates"][0]["plate_number"] == "12가3456"
+
+
+def test_lpr_ocr_callback_writes_no_result_attempt(tmp_path: Path, monkeypatch):
+    event_path = tmp_path / "lpr.jsonl"
+
+    class Roi:
+        classifications = ()
+        detections = ()
+
+    class VideoFrame:
+        roi = Roi()
+
+    monkeypatch.setattr("towersightai.inference.callback._flow_ok", lambda: "OK")
+
+    assert (
+        run_lpr_ocr_with_config(
+            VideoFrame(),
+            event_path=str(event_path),
+            source_image="tmp/car_number-test/no-result.png",
+            frame_index=7,
+        )
+        == "OK"
+    )
+    attempt = json.loads(event_path.read_text(encoding="utf-8"))
+
+    assert attempt["type"] == "plate_ocr_attempt"
+    assert attempt["source_image"] == "tmp/car_number-test/no-result.png"
+    assert attempt["frame_index"] == 7
+    assert attempt["status"] == "no_result"
+    assert attempt["plates"] == []
 
 
 def test_person_presence_process_uses_detector_without_reid_embedding(tmp_path: Path):

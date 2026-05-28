@@ -46,7 +46,7 @@ Current connected entries:
 Purpose-specific AI controls should use fixed, known-compatible TAPPAS example model sets:
 
 - `차량 전용 검출`: front camera only, Hailo LPR example `yolov5m_vehicles`.
-- `번호판 이미지 LPR`: image-set test using `tmp/car_number-test` and the Hailo LPR example vehicle, plate, and OCR models.
+- `번호판 이미지 LPR`: image-set test using `tmp/car_number-test` and FastALPR ONNX. It must log per-image inference time and OCR results.
 - `사람 존재 감지`: currently streaming cameras using the TAPPAS person detector path. It must infer only whether a person exists; do not run Re-ID embedding, gallery matching, or same-person tracking.
 
 These controls are for integration diagnosis and staged feature development. They must show running/error/log status in the operator status strip and keep final OK blocked.

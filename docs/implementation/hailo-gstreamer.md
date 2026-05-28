@@ -83,7 +83,7 @@ The state machine must not parse raw Hailo objects directly.
 - Initial object detection may use YOLO HEF paths from TAPPAS references.
 - Purpose-specific operator controls use fixed known model sets instead of arbitrary runtime HEF selection:
   - `차량 전용 검출`: LPR example `yolov5m_vehicles`.
-  - `번호판 이미지 LPR`: LPR example vehicle, plate, and OCR models.
+  - `번호판 이미지 LPR`: `tmp/car_number-test` still-image diagnostic path using FastALPR ONNX, not the Hailo stream pipeline.
   - `사람 존재 감지`: TAPPAS multi-person tracking detector stage only, using `yolov5s_personface_reid.hef` and `yolov5_personface_letterbox`.
 - Person-presence detection must not run Re-ID embedding, `hailogallery`, or same-person tracking; it only emits normalized `person`/`human` detections so safety logic can conservatively block OK.
 - Plate OCR and in-vehicle occupancy may require separate models or CPU-side modules. Keep those behind interfaces until the model is selected.

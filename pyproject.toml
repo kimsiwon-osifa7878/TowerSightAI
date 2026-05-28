@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = [
+  "fast-alpr[onnx]>=0.4.0",
   "opencv-python>=4.8",
   "PyQt6>=6.6",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from towersightai.config.settings import CameraRole, Settings
 from towersightai.inference.events import DetectionEvent
 from towersightai.inference.live_detection import LiveDetectionRunner, latest_events, live_multistream_detection_process
 from towersightai.inference.purpose_tasks import (
+    PlateOcrEvent,
     PURPOSE_LPR_IMAGE,
     PURPOSE_PERSON_PRESENCE,
     PURPOSE_TASK_SPECS,
@@ -336,6 +338,7 @@ class LiveDetectionWorker(QObject):
 
 class PurposeInferenceWorker(QObject):
     detections_ready = pyqtSignal(str, object)
+    lpr_results_ready = pyqtSignal(object)
     status_changed = pyqtSignal(str, str)
     task_started = pyqtSignal(str, str, str)
     first_inference_ready = pyqtSignal(float)
@@ -384,6 +387,7 @@ class PurposeInferenceWorker(QObject):
 
         started_at = time.monotonic()
         first_event_sent = False
+        lpr_result_sent = False
         failed = False
         self.task_started.emit(process.task_id, process.label, str(process.log_path))
         for camera_id in process.camera_ids:
@@ -400,14 +404,25 @@ class PurposeInferenceWorker(QObject):
             for camera_id, camera_events in grouped.items():
                 self.detections_ready.emit(camera_id, latest_events(camera_events))
 
+        def on_lpr_results(events: tuple[PlateOcrEvent, ...]) -> None:
+            nonlocal first_event_sent, lpr_result_sent
+            if events:
+                lpr_result_sent = True
+            if events and not first_event_sent:
+                first_event_sent = True
+                self.first_inference_ready.emit(time.monotonic() - started_at)
+            self.lpr_results_ready.emit(events)
+
         def on_error(message: str) -> None:
             nonlocal failed
             failed = True
             self.status_changed.emit(process.task_id, message)
 
-        self._runner = PurposeInferenceRunner(process, on_events=on_events, on_error=on_error)
+        self._runner = PurposeInferenceRunner(process, on_events=on_events, on_lpr_results=on_lpr_results, on_error=on_error)
         self._runner.run()
-        if not failed and not first_event_sent and process.task_id in {PURPOSE_LPR_IMAGE, PURPOSE_PERSON_PRESENCE} and not self._stop_requested:
+        if not failed and process.task_id == PURPOSE_LPR_IMAGE and not lpr_result_sent and not self._stop_requested:
+            self.lpr_results_ready.emit(())
+        if not failed and not first_event_sent and process.task_id == PURPOSE_PERSON_PRESENCE and not self._stop_requested:
             self.first_inference_ready.emit(time.monotonic() - started_at)
         self.finished.emit(process.task_id)
 
@@ -441,6 +456,7 @@ class OperatorWindow(QMainWindow):
         self._purpose_task_log_path: Path | None = None
         self._purpose_task_started_at: float | None = None
         self._purpose_task_first_inference_seconds: float | None = None
+        self._purpose_lpr_results: tuple[PlateOcrEvent, ...] = ()
         self._operator_unlocked = True
         self._vehicle_entry_simulation = False
         self._camera_layout_mode = "dashboard"
@@ -1082,6 +1098,7 @@ class OperatorWindow(QMainWindow):
         self._purpose_task_log_path = None
         self._purpose_task_started_at = time.monotonic()
         self._purpose_task_first_inference_seconds = None
+        self._purpose_lpr_results = ()
         self._detection_enabled = False
         self._detection_failed = False
         self._detection_camera_ids = camera_ids
@@ -1104,6 +1121,7 @@ class OperatorWindow(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.detections_ready.connect(self._set_camera_detections)
+        worker.lpr_results_ready.connect(self._set_lpr_results)
         worker.status_changed.connect(self._set_purpose_status)
         worker.task_started.connect(self._set_purpose_started)
         worker.first_inference_ready.connect(self._set_purpose_first_inference_ready)
@@ -1134,6 +1152,7 @@ class OperatorWindow(QMainWindow):
         self._purpose_task_log_path = Path(log_path) if log_path else None
         self._purpose_task_started_at = time.monotonic()
         self._purpose_task_first_inference_seconds = None
+        self._purpose_lpr_results = ()
         self.ai_detection_label.setText(_purpose_detection_label(label, self._detection_camera_ids, self._detection_event_counts, loading_seconds=0.0))
         self.model_status_label.setText(f"목적 모델 실행: {label}")
         self.warning_label.setText(f"{label} 추론 시작 중. 로그: {self._purpose_task_log_path}")
@@ -1150,6 +1169,21 @@ class OperatorWindow(QMainWindow):
         )
         self.model_status_label.setText(f"목적 모델 실행: {self._purpose_task_label}")
         self.warning_label.setText(f"{self._purpose_task_label} 추론 확인: {elapsed_seconds:.1f}s. 최종 OK는 차단됩니다.")
+
+    def _set_lpr_results(self, events: tuple[PlateOcrEvent, ...]) -> None:
+        if self._purpose_task_id != PURPOSE_LPR_IMAGE:
+            return
+        if not events:
+            self._purpose_lpr_results = ()
+            self.instruction_label.setText("번호판 인식 실패: 결과 없음")
+            self.warning_label.setText("번호판 이미지 LPR 결과가 없습니다. 최종 OK는 차단됩니다.")
+            return
+        merged = self._purpose_lpr_results + tuple(events)
+        self._purpose_lpr_results = tuple(sorted(merged, key=lambda event: event.timestamp, reverse=True))
+        latest = self._purpose_lpr_results[0]
+        suffix = f" 외 {len(self._purpose_lpr_results) - 1}건" if len(self._purpose_lpr_results) > 1 else ""
+        self.instruction_label.setText(f"번호판 인식: {latest.plate_number}{suffix}")
+        self.warning_label.setText("번호판 이미지 LPR 결과입니다. 최종 OK는 차단됩니다.")
 
     def _set_purpose_status(self, target_id: str, message: str) -> None:
         if "실행 중" in message:
@@ -1174,6 +1208,7 @@ class OperatorWindow(QMainWindow):
         self._purpose_task_log_path = None
         self._purpose_task_started_at = None
         self._purpose_task_first_inference_seconds = None
+        self._purpose_lpr_results = ()
         self._set_purpose_buttons_checked(False)
         self._set_purpose_button_texts()
         for worker in tuple(self._purpose_workers):
@@ -1195,6 +1230,7 @@ class OperatorWindow(QMainWindow):
             self._purpose_task_log_path = None
             self._purpose_task_started_at = None
             self._purpose_task_first_inference_seconds = None
+            self._purpose_lpr_results = ()
             self._set_purpose_buttons_checked(False)
             self._set_purpose_button_texts()
             if failed:
@@ -1412,12 +1448,28 @@ def _purpose_detection_label(
 def launch_operator_ui(model: OperatorDisplayModel, settings: Settings | None = None) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     window = OperatorWindow(model, settings=settings)
+    previous_handlers = {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    def stop_ui(_signum, _frame) -> None:  # noqa: ANN001 - Python signal handler signature.
+        window.close()
+        app.quit()
+
+    for signum in previous_handlers:
+        signal.signal(signum, stop_ui)
     if model.fullscreen:
         window.showFullScreen()
     else:
         window.resize(1440, 900)
         window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        window.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def launch_from_settings(settings: Settings, model: OperatorDisplayModel) -> int:
