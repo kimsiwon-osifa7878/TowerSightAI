@@ -28,5 +28,6 @@ exclude = ["refers*"]
 
 [project.scripts]
 towersightai-check-settings = "towersightai.cli.check_settings:main"
+towersightai-ai-diagnostics = "towersightai.cli.ai_diagnostics:main"
 towersightai-operator-ui = "towersightai.cli.operator_ui:main"
 towersightai-hailo-image-smoke = "towersightai.cli.hailo_image_smoke:main"

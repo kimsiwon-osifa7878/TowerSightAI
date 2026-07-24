@@ -3,18 +3,24 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
+import os
 import statistics
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from towersightai.runtime_logging import new_run_id, path_diagnostic, write_run_status
+
 
 DETECTOR_MODEL = "yolo-v9-t-384-license-plate-end2end"
 OCR_MODEL = "cct-xs-v2-global-model"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
+LOGGER = logging.getLogger("towersightai.ai.fast_alpr")
 
 
 @dataclass(frozen=True)
@@ -31,8 +37,13 @@ def main() -> int:
     parser.add_argument("--manifest-path", required=True, help="Image manifest JSON path.")
     parser.add_argument("--detector-model", default=DETECTOR_MODEL, help="FastALPR detector model name or path.")
     parser.add_argument("--ocr-model", default=OCR_MODEL, help="FastALPR OCR model name or path.")
+    parser.add_argument("--run-id", default="", help="Run identifier used to correlate launcher and result logs.")
     parser.add_argument("--append-log", action="store_true", help="Append to an existing launcher log instead of overwriting.")
     args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, os.environ.get("TOWERSIGHTAI_LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s [%(threadName)s] %(message)s",
+    )
 
     return run_fast_alpr_lpr(
         image_dir=Path(args.image_dir),
@@ -41,6 +52,7 @@ def main() -> int:
         manifest_path=Path(args.manifest_path),
         detector_model=args.detector_model,
         ocr_model=args.ocr_model,
+        run_id=args.run_id,
         append_log=args.append_log,
     )
 
@@ -53,8 +65,13 @@ def run_fast_alpr_lpr(
     manifest_path: Path,
     detector_model: str = DETECTOR_MODEL,
     ocr_model: str = OCR_MODEL,
+    run_id: str = "",
+    status_path: Path | None = None,
     append_log: bool = False,
 ) -> int:
+    run_id = run_id or new_run_id("fast-alpr")
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
     images = _discover_images(image_dir)
     event_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,14 +88,47 @@ def run_fast_alpr_lpr(
     log_context = contextlib.nullcontext(sys.stdout) if append_log else log_path.open("w", encoding="utf-8")
     with log_context as log_fp:
         log_fp.write("\nTowerSightAI FastALPR image LPR run\n")
+        log_fp.write(f"run-id={run_id}\n")
+        log_fp.write(f"cwd={Path.cwd()}\n")
+        log_fp.write(f"python={sys.executable}\n")
         log_fp.write(f"detector-model={detector_model}\n")
         log_fp.write(f"ocr-model={ocr_model}\n")
         log_fp.write(f"image-dir={image_dir}\n")
         log_fp.write(f"image-count={len(images)}\n")
+        for image in images:
+            log_fp.write(f"input-image={path_diagnostic(image.path)}\n")
         log_fp.flush()
+        LOGGER.info(
+            "fast-alpr-start run-id=%s detector=%s ocr=%s image-dir=%s image-count=%s",
+            run_id,
+            detector_model,
+            ocr_model,
+            image_dir.resolve(strict=False),
+            len(images),
+        )
+        _write_fast_alpr_status(
+            status_path,
+            run_id=run_id,
+            status="starting",
+            started_at=started_at,
+            duration_seconds=0.0,
+            image_count=len(images),
+            recognized_images=0,
+        )
 
         if not images:
             log_fp.write("status=error reason=no_images\n")
+            LOGGER.error("fast-alpr-error run-id=%s reason=no_images image-dir=%s", run_id, image_dir.resolve(strict=False))
+            _write_fast_alpr_status(
+                status_path,
+                run_id=run_id,
+                status="failed",
+                started_at=started_at,
+                duration_seconds=time.monotonic() - started_monotonic,
+                image_count=0,
+                recognized_images=0,
+                error="no_images",
+            )
             return 2
 
         try:
@@ -88,9 +138,28 @@ def run_fast_alpr_lpr(
             alpr = ALPR(detector_model=detector_model, ocr_model=ocr_model, ocr_device="cpu")
             init_ms = (time.perf_counter() - init_started) * 1000.0
             log_fp.write(f"model-init-ms={init_ms:.2f}\n")
+            log_fp.write("model-init-status=ready\n")
             log_fp.flush()
+            LOGGER.info("fast-alpr-model-ready run-id=%s init-ms=%.2f", run_id, init_ms)
         except Exception as exc:
-            _write_error(log_fp, event_path=event_path, message=f"fast-alpr initialization failed: {exc}")
+            trace = traceback.format_exc()
+            _write_error(
+                log_fp,
+                event_path=event_path,
+                message=f"fast-alpr initialization failed: {exc}",
+                traceback_text=trace,
+            )
+            LOGGER.exception("fast-alpr-init-failed run-id=%s", run_id)
+            _write_fast_alpr_status(
+                status_path,
+                run_id=run_id,
+                status="failed",
+                started_at=started_at,
+                duration_seconds=time.monotonic() - started_monotonic,
+                image_count=len(images),
+                recognized_images=0,
+                error=f"fast-alpr initialization failed: {exc}",
+            )
             return 1
 
         recognized_images = 0
@@ -104,6 +173,13 @@ def run_fast_alpr_lpr(
                 except Exception as exc:
                     elapsed_ms = (time.perf_counter() - started) * 1000.0
                     payload = _error_payload(image=image, elapsed_ms=elapsed_ms, message=str(exc))
+                    payload["traceback"] = traceback.format_exc()
+                    LOGGER.exception(
+                        "fast-alpr-predict-failed run-id=%s image-index=%s image=%s",
+                        run_id,
+                        image.index,
+                        image.path.resolve(strict=False),
+                    )
 
                 if payload["status"] == "recognized":
                     recognized_images += 1
@@ -125,12 +201,40 @@ def run_fast_alpr_lpr(
                 event_fp.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
                 event_fp.flush()
                 _write_attempt_log(log_fp, payload)
+                LOGGER.info(
+                    "fast-alpr-result run-id=%s image-index=%s status=%s elapsed-ms=%.2f detections=%s result=%s",
+                    run_id,
+                    payload["image_index"],
+                    payload["status"],
+                    payload["elapsed_ms"],
+                    len(payload.get("detections") or ()),
+                    (payload.get("best_plate") or {}).get("plate_number") or "no_result",
+                )
 
         log_fp.write("\nTowerSightAI FastALPR image summary\n")
         for image in images:
             log_fp.write(f"image[{image.index}]={image.path}\n")
         log_fp.write(f"recognized-images={recognized_images}/{len(images)}\n")
         log_fp.write("status=recognized_all\n" if recognized_images == len(images) else "status=missing_results\n")
+        duration_seconds = time.monotonic() - started_monotonic
+        log_fp.write(f"duration-seconds={duration_seconds:.3f}\n")
+        LOGGER.info(
+            "fast-alpr-end run-id=%s status=%s duration-seconds=%.3f recognized-images=%s/%s",
+            run_id,
+            "recognized_all" if recognized_images == len(images) else "missing_results",
+            duration_seconds,
+            recognized_images,
+            len(images),
+        )
+        _write_fast_alpr_status(
+            status_path,
+            run_id=run_id,
+            status="completed" if recognized_images == len(images) else "no_result",
+            started_at=started_at,
+            duration_seconds=duration_seconds,
+            image_count=len(images),
+            recognized_images=recognized_images,
+        )
     return 0
 
 
@@ -247,11 +351,29 @@ def _write_attempt_log(log_fp: Any, payload: dict[str, Any]) -> None:
         )
         + "\n"
     )
+    if payload.get("error"):
+        log_fp.write(f"error={payload['error']}\n")
+    if payload.get("traceback"):
+        log_fp.write("traceback:\n")
+        log_fp.write(str(payload["traceback"]))
+        if not str(payload["traceback"]).endswith("\n"):
+            log_fp.write("\n")
     log_fp.flush()
 
 
-def _write_error(log_fp: Any, *, event_path: Path, message: str) -> None:
+def _write_error(
+    log_fp: Any,
+    *,
+    event_path: Path,
+    message: str,
+    traceback_text: str | None = None,
+) -> None:
     log_fp.write(f"status=error reason={message}\n")
+    if traceback_text:
+        log_fp.write("traceback:\n")
+        log_fp.write(traceback_text)
+        if not traceback_text.endswith("\n"):
+            log_fp.write("\n")
     log_fp.flush()
     with event_path.open("a", encoding="utf-8") as event_fp:
         event_fp.write(
@@ -267,6 +389,33 @@ def _write_error(log_fp: Any, *, event_path: Path, message: str) -> None:
             )
             + "\n"
         )
+
+
+def _write_fast_alpr_status(
+    status_path: Path | None,
+    *,
+    run_id: str,
+    status: str,
+    started_at: datetime,
+    duration_seconds: float,
+    image_count: int,
+    recognized_images: int,
+    error: str | None = None,
+) -> None:
+    if status_path is None:
+        return
+    write_run_status(
+        status_path,
+        run_id=run_id,
+        task_id="front_camera_lpr",
+        status=status,
+        started_at=started_at.isoformat(),
+        returncode=0 if status in {"completed", "no_result"} else None,
+        duration_seconds=round(duration_seconds, 3),
+        image_count=image_count,
+        recognized_images=recognized_images,
+        error=error,
+    )
 
 
 if __name__ == "__main__":

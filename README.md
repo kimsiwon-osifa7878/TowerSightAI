@@ -226,6 +226,36 @@ These checks validate installation and inference wiring only. They never authori
 - `artifacts/runtime/purpose-ai/vehicle_detection/vehicle.gst.log` for vehicle-only detection.
 - `artifacts/runtime/purpose-ai/person_presence/person_presence.gst.log` for person-presence detection.
 - `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` for FastALPR image LPR.
+- `artifacts/runtime/purpose-ai/front_camera_lpr/lpr.gst.log` for front-camera snapshot LPR.
+
+### Collect AI Failure Results
+
+Run the operator UI with diagnostic logging enabled:
+
+```bash
+LOG_LEVEL=DEBUG towersightai-operator-ui --env .env
+```
+
+The terminal and `artifacts/runtime/towersightai.log` show each AI run ID, resolved model/config/library paths, process ID, first result, event counts, exit code, and the relevant raw-log path. RTSP credentials are redacted.
+
+Immediately after reproducing a failure, and before launching a different AI task, collect the latest evidence into one text file:
+
+```bash
+# Run this once after pulling the logging update so the new CLI is registered.
+python -m pip install -e ".[ui]"
+
+towersightai-ai-diagnostics --env .env \
+  --output artifacts/runtime/ai-diagnostics.txt
+```
+
+If the console script is not yet on `PATH`, use the equivalent module command:
+
+```bash
+python -m towersightai.cli.ai_diagnostics --env .env \
+  --output artifacts/runtime/ai-diagnostics.txt
+```
+
+The collector does not start a camera, GStreamer pipeline, Hailo inference, or FastALPR inference. It only reads the existing run-status files, JSONL events, log tails, configured resource metadata, executable locations, and FastALPR cache metadata. Missing files are reported as `missing` instead of aborting collection. Send the resulting `artifacts/runtime/ai-diagnostics.txt` when reporting the failure; the `.env` contents and RTSP credentials are not included.
 
 ## Environment
 

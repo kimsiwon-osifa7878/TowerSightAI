@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import signal
 import sys
 import time
@@ -21,6 +22,7 @@ from towersightai.inference.purpose_tasks import (
     build_purpose_process,
 )
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
+from towersightai.runtime_logging import new_run_id
 from towersightai.ui.model import GlobalSafetyStatus, OperatorDisplayModel
 
 OPERATOR_PANEL_WIDTH = 400
@@ -349,7 +351,16 @@ class LiveDetectionWorker(QObject):
                     self.status_changed.emit(camera_id, message)
 
             self._runner = LiveDetectionRunner(process, on_events=on_events, on_error=on_error)
-            started = self._runner.run()
+            try:
+                started = self._runner.run()
+            except Exception as exc:  # noqa: BLE001 - worker boundary must expose unexpected runtime failures.
+                logging.getLogger("towersightai.ai.general").exception(
+                    "live-detection-worker-crashed cameras=%s",
+                    self.camera_ids,
+                )
+                for camera_id in self.camera_ids:
+                    self.status_changed.emit(camera_id, f"AI detection worker failed: {exc}")
+                break
             if self._stop_requested:
                 break
             if not started:
@@ -445,7 +456,15 @@ class PurposeInferenceWorker(QObject):
             self.status_changed.emit(process.task_id, message)
 
         self._runner = PurposeInferenceRunner(process, on_events=on_events, on_lpr_results=on_lpr_results, on_error=on_error)
-        self._runner.run()
+        try:
+            self._runner.run()
+        except Exception as exc:  # noqa: BLE001 - worker boundary must expose unexpected runtime failures.
+            failed = True
+            logging.getLogger("towersightai.ai.purpose").exception(
+                "purpose-inference-worker-crashed task=%s",
+                process.task_id,
+            )
+            self.status_changed.emit(process.task_id, f"Purpose AI worker failed: {exc}")
         if not failed and process.task_id == PURPOSE_LPR_IMAGE and not lpr_result_sent and not self._stop_requested:
             self.lpr_results_ready.emit(())
         if not failed and not first_event_sent and process.task_id == PURPOSE_PERSON_PRESENCE and not self._stop_requested:
@@ -484,6 +503,9 @@ class FrontCameraLprWorker(QObject):
         event_path = self.event_dir / "lpr.jsonl"
         log_path = self.event_dir / "lpr.gst.log"
         manifest_path = self.event_dir / "lpr_manifest.json"
+        status_path = self.event_dir / "run-status.json"
+        run_id = new_run_id("front-camera-lpr")
+        logger = logging.getLogger("towersightai.ai.front_camera_lpr")
         if not self.frame.save(str(snapshot_path), "PNG"):
             self.result_ready.emit(
                 {
@@ -495,15 +517,43 @@ class FrontCameraLprWorker(QObject):
             self.finished.emit()
             return
         self.status_changed.emit(f"정면카메라LPR 실행 중: {snapshot_path}")
-        run_fast_alpr_lpr(
-            image_dir=run_dir,
-            event_path=event_path,
-            log_path=log_path,
-            manifest_path=manifest_path,
+        logger.info(
+            "front-camera-lpr-start run-id=%s snapshot=%s log=%s",
+            run_id,
+            snapshot_path.resolve(strict=False),
+            log_path.resolve(strict=False),
         )
-        payload = _front_lpr_payload(event_path)
+        try:
+            returncode = run_fast_alpr_lpr(
+                image_dir=run_dir,
+                event_path=event_path,
+                log_path=log_path,
+                manifest_path=manifest_path,
+                run_id=run_id,
+                status_path=status_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - worker boundary must report failures to the operator.
+            logger.exception("front-camera-lpr-crashed run-id=%s snapshot=%s", run_id, snapshot_path)
+            payload = {
+                "ok": False,
+                "message": f"Front camera LPR failed: {exc}",
+            }
+        else:
+            payload = _front_lpr_payload(event_path)
+            if returncode != 0:
+                payload = {
+                    "ok": False,
+                    "message": f"Front camera LPR failed: FastALPR exit code {returncode}",
+                }
+            logger.info(
+                "front-camera-lpr-end run-id=%s returncode=%s ok=%s",
+                run_id,
+                returncode,
+                payload.get("ok"),
+            )
         payload["snapshot_path"] = str(snapshot_path)
         payload["log_path"] = str(log_path)
+        payload["run_id"] = run_id
         self.result_ready.emit(payload)
         self.finished.emit()
 

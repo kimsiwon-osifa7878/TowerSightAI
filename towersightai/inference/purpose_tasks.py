@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import re
 import shlex
 import shutil
@@ -9,8 +10,9 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -19,6 +21,13 @@ from towersightai.config.settings import CameraConfig, Settings
 from towersightai.inference.events import DetectionEvent
 from towersightai.inference.image_smoke import NETWORK_FORMAT, NETWORK_HEIGHT, NETWORK_WIDTH, _gst_runtime_env
 from towersightai.inference.live_detection import _read_log_tail, latest_events, parse_detection_json
+from towersightai.runtime_logging import (
+    missing_resource_paths,
+    new_run_id,
+    path_diagnostic,
+    redact_sensitive_text,
+    write_run_status,
+)
 
 
 DEFAULT_PURPOSE_TASK_DIR = Path("artifacts/runtime/purpose-ai")
@@ -52,6 +61,9 @@ class PurposeInferenceProcess:
     camera_ids: tuple[str, ...] = ()
     expected_runtime_seconds: float | None = None
     metadata_paths: tuple[Path, ...] = ()
+    run_id: str = ""
+    status_path: Path | None = None
+    validate_resource_paths: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,8 +131,68 @@ class PurposeInferenceRunner:
         self._terminate_process()
 
     def run(self) -> bool:
+        logger = logging.getLogger("towersightai.ai.purpose")
+        run_id = self.process.run_id or new_run_id(self.process.task_id)
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
+        event_counts: Counter[str] = Counter()
+        lpr_result_count = 0
+        logger.info(
+            "ai-launch run-id=%s task=%s cameras=%s cwd=%s python=%s event-path=%s raw-log=%s",
+            run_id,
+            self.process.task_id,
+            self.process.camera_ids,
+            Path.cwd(),
+            sys.executable,
+            self.process.event_path.resolve(strict=False),
+            self.process.log_path.resolve(strict=False),
+        )
+        for resource in self.process.model_paths:
+            logger.info(
+                "ai-resource run-id=%s task=%s detail=%s",
+                run_id,
+                self.process.task_id,
+                path_diagnostic(resource),
+            )
+        logger.info(
+            "ai-command run-id=%s task=%s executable=%s command=%s virtualenv=%s",
+            run_id,
+            self.process.task_id,
+            shutil.which(self.process.command[0]) or "missing",
+            _redacted_command_text(self.process.command),
+            self.process.env.get("VIRTUAL_ENV", "not-used"),
+        )
+
+        missing = missing_resource_paths(self.process.model_paths) if self.process.validate_resource_paths else ()
+        if missing:
+            message = "missing AI resource(s): " + ", ".join(str(path.resolve(strict=False)) for path in missing)
+            logger.error("ai-preflight-failed run-id=%s task=%s reason=%s", run_id, self.process.task_id, message)
+            self._write_status(
+                run_id=run_id,
+                status="preflight_failed",
+                started_at=started_at,
+                returncode=None,
+                duration_seconds=0.0,
+                event_counts=event_counts,
+                lpr_result_count=0,
+                error=message,
+            )
+            self.on_error(message)
+            return False
         if shutil.which(self.process.command[0]) is None:
-            self.on_error(f"{self.process.command[0]} not found")
+            message = f"{self.process.command[0]} not found"
+            logger.error("ai-preflight-failed run-id=%s task=%s reason=%s", run_id, self.process.task_id, message)
+            self._write_status(
+                run_id=run_id,
+                status="preflight_failed",
+                started_at=started_at,
+                returncode=None,
+                duration_seconds=0.0,
+                event_counts=event_counts,
+                lpr_result_count=0,
+                error=message,
+            )
+            self.on_error(message)
             return False
 
         self.process.event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,47 +203,202 @@ class PurposeInferenceRunner:
         with self.process.log_path.open("w", encoding="utf-8") as log_fp:
             log_fp.write(_launch_log_text(self.process))
             log_fp.flush()
-            self._process = subprocess.Popen(
-                self.process.command,
-                stdout=log_fp,
-                stderr=log_fp,
-                text=True,
-                env=self.process.env,
-                start_new_session=True,
+            try:
+                self._process = subprocess.Popen(
+                    self.process.command,
+                    stdout=log_fp,
+                    stderr=log_fp,
+                    text=True,
+                    env=self.process.env,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                message = f"failed to launch {self.process.command[0]}: {exc}"
+                logger.exception("ai-launch-failed run-id=%s task=%s", run_id, self.process.task_id)
+                self._write_status(
+                    run_id=run_id,
+                    status="launch_failed",
+                    started_at=started_at,
+                    returncode=None,
+                    duration_seconds=time.monotonic() - started_monotonic,
+                    event_counts=event_counts,
+                    lpr_result_count=0,
+                    error=message,
+                )
+                self.on_error(message)
+                return False
+            process_pid = getattr(self._process, "pid", None)
+            logger.info(
+                "ai-process-start run-id=%s task=%s pid=%s",
+                run_id,
+                self.process.task_id,
+                process_pid,
+            )
+            self._write_status(
+                run_id=run_id,
+                status="running",
+                started_at=started_at,
+                returncode=None,
+                duration_seconds=0.0,
+                event_counts=event_counts,
+                lpr_result_count=0,
+                pid=process_pid,
             )
 
             deadline = None
             if self.process.expected_runtime_seconds is not None:
                 deadline = time.monotonic() + self.process.expected_runtime_seconds
+            first_event_logged = False
+            next_activity_log = time.monotonic() + 30.0
 
             while self._running:
                 events, lpr_results = tail.read_new_events()
                 if events:
+                    event_counts.update(event.camera_id for event in events)
                     self.on_events(events)
                 if lpr_results:
+                    lpr_result_count += len(lpr_results)
                     self.on_lpr_results(lpr_results)
+                if (events or lpr_results) and not first_event_logged:
+                    first_event_logged = True
+                    logger.info(
+                        "ai-first-result run-id=%s task=%s elapsed-seconds=%.3f events=%s lpr-results=%s",
+                        run_id,
+                        self.process.task_id,
+                        time.monotonic() - started_monotonic,
+                        dict(event_counts),
+                        lpr_result_count,
+                    )
+                    self._write_status(
+                        run_id=run_id,
+                        status="running",
+                        started_at=started_at,
+                        returncode=None,
+                        duration_seconds=time.monotonic() - started_monotonic,
+                        event_counts=event_counts,
+                        lpr_result_count=lpr_result_count,
+                    )
                 fatal_message = _fatal_log_message(self.process.log_path)
                 if fatal_message:
-                    self.on_error(fatal_message)
+                    safe_message = redact_sensitive_text(fatal_message)
+                    logger.error(
+                        "ai-fatal run-id=%s task=%s log-tail=%s",
+                        run_id,
+                        self.process.task_id,
+                        safe_message,
+                    )
+                    self.on_error(safe_message)
                     self._terminate_process(force=True)
                     break
                 if self._process.poll() is not None:
                     break
                 if deadline is not None and time.monotonic() >= deadline:
                     break
+                if time.monotonic() >= next_activity_log:
+                    log_method = logger.warning if not event_counts and not lpr_result_count else logger.info
+                    log_method(
+                        "ai-activity run-id=%s task=%s process-alive=true events=%s lpr-results=%s elapsed-seconds=%.1f",
+                        run_id,
+                        self.process.task_id,
+                        dict(event_counts),
+                        lpr_result_count,
+                        time.monotonic() - started_monotonic,
+                    )
+                    self._write_status(
+                        run_id=run_id,
+                        status="running",
+                        started_at=started_at,
+                        returncode=None,
+                        duration_seconds=time.monotonic() - started_monotonic,
+                        event_counts=event_counts,
+                        lpr_result_count=lpr_result_count,
+                    )
+                    next_activity_log = time.monotonic() + 30.0
                 time.sleep(self.poll_seconds)
 
             events, lpr_results = tail.read_new_events()
             if events:
+                event_counts.update(event.camera_id for event in events)
                 self.on_events(events)
             if lpr_results:
+                lpr_result_count += len(lpr_results)
                 self.on_lpr_results(lpr_results)
             if self._running and self._process.poll() not in (None, 0):
-                self.on_error(_process_error_message(self._process.returncode, self.process.log_path))
+                message = redact_sensitive_text(_process_error_message(self._process.returncode, self.process.log_path))
+                logger.error(
+                    "ai-process-error run-id=%s task=%s returncode=%s log-tail=%s",
+                    run_id,
+                    self.process.task_id,
+                    self._process.returncode,
+                    message,
+                )
+                self.on_error(message)
         self._terminate_process()
         if self.process.task_id == PURPOSE_LPR_IMAGE:
             _append_lpr_image_summary(self.process)
+        returncode = self._process.returncode if self._process is not None else None
+        duration_seconds = time.monotonic() - started_monotonic
+        if not self._running:
+            status = "stopped"
+        elif returncode != 0:
+            status = "failed"
+        elif self.process.task_id == PURPOSE_LPR_IMAGE and lpr_result_count == 0:
+            status = "no_result"
+        else:
+            status = "completed"
+        logger.info(
+            "ai-process-end run-id=%s task=%s status=%s returncode=%s duration-seconds=%.3f events=%s lpr-results=%s",
+            run_id,
+            self.process.task_id,
+            status,
+            returncode,
+            duration_seconds,
+            dict(event_counts),
+            lpr_result_count,
+        )
+        self._write_status(
+            run_id=run_id,
+            status=status,
+            started_at=started_at,
+            returncode=returncode,
+            duration_seconds=duration_seconds,
+            event_counts=event_counts,
+            lpr_result_count=lpr_result_count,
+        )
         return True
+
+    def _write_status(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        started_at: datetime,
+        returncode: int | None,
+        duration_seconds: float,
+        event_counts: Counter[str],
+        lpr_result_count: int,
+        pid: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        if self.process.status_path is None:
+            return
+        effective_pid = pid if pid is not None else (getattr(self._process, "pid", None) if self._process is not None else None)
+        write_run_status(
+            self.process.status_path,
+            run_id=run_id,
+            task_id=self.process.task_id,
+            status=status,
+            started_at=started_at.isoformat(),
+            pid=effective_pid,
+            returncode=returncode,
+            duration_seconds=round(duration_seconds, 3),
+            event_counts=dict(event_counts),
+            event_total=sum(event_counts.values()),
+            lpr_result_count=lpr_result_count,
+            event_path=str(self.process.event_path.resolve(strict=False)),
+            log_path=str(self.process.log_path.resolve(strict=False)),
+            error=error,
+        )
 
     def _terminate_process(self, *, force: bool = False) -> None:
         process = self._process
@@ -247,8 +474,11 @@ def vehicle_detection_process(
         env=env,
         log_path=log_path,
         event_path=event_path,
-        model_paths=(hef_path,),
+        model_paths=(hef_path, config_path, postprocess_so),
         camera_ids=(camera.id,),
+        run_id=new_run_id(PURPOSE_VEHICLE_DETECTION),
+        status_path=event_dir / "run-status.json",
+        validate_resource_paths=True,
     )
 
 
@@ -260,6 +490,7 @@ def lpr_image_process(
     gst_launch: str = "gst-launch-1.0",
 ) -> PurposeInferenceProcess:
     event_dir.mkdir(parents=True, exist_ok=True)
+    run_id = new_run_id(PURPOSE_LPR_IMAGE)
     prepared = _prepare_lpr_images(image_dir, event_dir)
     if not prepared:
         raise ValueError(f"LPR test image not found: {image_dir}")
@@ -287,6 +518,8 @@ def lpr_image_process(
         settings.fast_alpr_detector_model,
         "--ocr-model",
         settings.fast_alpr_ocr_model,
+        "--run-id",
+        run_id,
         "--append-log",
     )
     env = os.environ.copy()
@@ -299,6 +532,9 @@ def lpr_image_process(
         event_path=event_path,
         model_paths=(),
         metadata_paths=(manifest_path,),
+        run_id=run_id,
+        status_path=event_dir / "run-status.json",
+        validate_resource_paths=True,
     )
 
 
@@ -377,8 +613,11 @@ def person_presence_process(
         env=env,
         log_path=log_path,
         event_path=event_path,
-        model_paths=(hef_path,),
+        model_paths=(hef_path, config_path, postprocess_so, crop_so),
         camera_ids=tuple(camera.id for camera in cameras),
+        run_id=new_run_id(PURPOSE_PERSON_PRESENCE),
+        status_path=event_dir / "run-status.json",
+        validate_resource_paths=True,
     )
 
 
@@ -659,11 +898,17 @@ def _launch_log_text(process: PurposeInferenceProcess) -> str:
         (
             "",
             "TowerSightAI purpose AI launch",
+            f"run-id={process.run_id or '-'}",
             f"task-id={process.task_id}",
             f"task-label={process.label}",
+            f"cwd={Path.cwd()}",
+            f"python={sys.executable}",
             f"active-model-paths={models}",
+            *(f"resource={path_diagnostic(path)}" for path in process.model_paths),
             f"metadata-paths={metadata}",
             f"event-path={process.event_path}",
+            f"virtualenv={process.env.get('VIRTUAL_ENV', 'not-used')}",
+            f"executable={shutil.which(process.command[0]) or 'missing'}",
             f"command-redacted={_redacted_command_text(process.command)}",
             "",
         )
@@ -732,7 +977,7 @@ def _redacted_command_text(command: tuple[str, ...]) -> str:
 
 
 def _redact_rtsp_credentials(text: str) -> str:
-    return re.sub(r"(rtsp://)([^:/@\s]+):([^@\s]+)@", r"\1***:***@", text)
+    return re.sub(r"(rtsp://)([^@\s/]+)@", r"\1***:***@", text)
 
 
 def _process_error_message(returncode: int | None, log_path: Path) -> str:
