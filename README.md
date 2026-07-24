@@ -92,7 +92,9 @@ TowerSightAI keeps deployment-local model resources under `models/hailo/` in thi
 | Person-presence postprocess | `${HAILO_MODEL_DIR}/postprocess/libyolo_post.so` |
 | Person-presence crop helper | `${HAILO_MODEL_DIR}/postprocess/cropping_algorithms/libwhole_buffer.so` |
 
-The vehicle-only and person-presence buttons resolve their fixed resources below `HAILO_MODEL_DIR`. `TAPPAS_WORKSPACE` is still required for the compatible TAPPAS runtime and virtual environment, but model files are no longer loaded from the TAPPAS installation tree.
+Each active Hailo function has its own explicit `.env` path. The defaults place those files below `HAILO_MODEL_DIR`, but each path can be overridden independently. `TAPPAS_WORKSPACE` is still required for the compatible TAPPAS runtime and virtual environment, but model files are no longer loaded from the TAPPAS installation tree.
+
+The general-AI model selector exposes only `HAILO_HEF_PATH`. Vehicle and person HEFs are intentionally excluded because they require different JSON/postprocess pairings and must run only through their purpose-specific pipelines.
 
 ### Install Or Copy The Resources
 
@@ -147,6 +149,15 @@ HAILO_MODEL_DIR=models/hailo
 HAILO_HEF_PATH=${HAILO_MODEL_DIR}/general/yolov5m_wo_spp_60p.hef
 HAILO_POSTPROCESS_SO=${HAILO_MODEL_DIR}/postprocess/libyolo_hailortpp_post.so
 HAILO_NETWORK_NAME=yolov5
+HAILO_VEHICLE_DETECTION_HEF_PATH=${HAILO_MODEL_DIR}/vehicle_detection/yolov5m_vehicles.hef
+HAILO_VEHICLE_DETECTION_CONFIG_PATH=${HAILO_MODEL_DIR}/vehicle_detection/configs/yolov5_vehicle_detection.json
+HAILO_VEHICLE_DETECTION_POSTPROCESS_SO=${HAILO_MODEL_DIR}/postprocess/libyolo_hailortpp_post.so
+HAILO_PERSON_PRESENCE_HEF_PATH=${HAILO_MODEL_DIR}/person_presence/yolov5s_personface_reid.hef
+HAILO_PERSON_PRESENCE_CONFIG_PATH=${HAILO_MODEL_DIR}/person_presence/configs/yolov5_personface.json
+HAILO_PERSON_PRESENCE_POSTPROCESS_SO=${HAILO_MODEL_DIR}/postprocess/libyolo_post.so
+HAILO_PERSON_PRESENCE_CROP_SO=${HAILO_MODEL_DIR}/postprocess/cropping_algorithms/libwhole_buffer.so
+FAST_ALPR_DETECTOR_MODEL=yolo-v9-t-384-license-plate-end2end
+FAST_ALPR_OCR_MODEL=cct-xs-v2-global-model
 ```
 
 ### FastALPR Models
@@ -156,7 +167,7 @@ HAILO_NETWORK_NAME=yolov5
 - Detector: `yolo-v9-t-384-license-plate-end2end`
 - OCR: `cct-xs-v2-global-model`
 
-Installing this project with `python -m pip install -e ".[ui]"` installs `fast-alpr[onnx]`. FastALPR prepares its ONNX models when it is first initialized, so the first `번호판 이미지 LPR` run may require internet access. On an offline deployment, initialize FastALPR once while online under the same deployment user and Python environment, then preserve that user's resulting model cache. This path is independent of `TAPPAS_WORKSPACE`.
+Installing this project with `python -m pip install -e ".[ui]"` installs `fast-alpr[onnx]`. `FAST_ALPR_DETECTOR_MODEL` and `FAST_ALPR_OCR_MODEL` select the two active FastALPR models. FastALPR prepares its ONNX models when it is first initialized, so the first `번호판 이미지 LPR` run may require internet access. On an offline deployment, initialize FastALPR once while online under the same deployment user and Python environment, then preserve that user's resulting model cache. This path is independent of `TAPPAS_WORKSPACE`.
 
 ### Verify The Installation
 
@@ -197,7 +208,7 @@ done
 towersightai-check-settings --env .env --check-hailo
 ```
 
-`towersightai-check-settings --check-hailo` checks the Hailo device, required GStreamer elements, `HAILO_HEF_PATH`, and `HAILO_POSTPROCESS_SO`. It does not currently check the fixed vehicle-only or person-presence resources, which is why the explicit `required_files` check above is also necessary.
+`towersightai-check-settings --check-hailo` checks the Hailo device, required GStreamer elements, and every active general, vehicle, and person Hailo HEF/config/postprocess path. The explicit `required_files` loop remains useful as a copy-time check before launching the application.
 
 After the checks pass, run the hardware image smoke test:
 
@@ -228,8 +239,10 @@ Important values:
 
 - `TAPPAS_WORKSPACE`: TAPPAS workspace path.
 - `HAILO_MODEL_DIR`: project-local Hailo resource root; defaults to `models/hailo`.
-- `HAILO_HEF_PATH`: YOLO HEF file path.
-- `HAILO_POSTPROCESS_SO`: Hailo postprocess `.so`.
+- `HAILO_HEF_PATH`, `HAILO_POSTPROCESS_SO`, `HAILO_NETWORK_NAME`: previous/general AI model mapping.
+- `HAILO_VEHICLE_DETECTION_*`: vehicle-only HEF, JSON config, and postprocess mapping.
+- `HAILO_PERSON_PRESENCE_*`: person-presence HEF, JSON config, postprocess, and crop helper mapping.
+- `FAST_ALPR_DETECTOR_MODEL`, `FAST_ALPR_OCR_MODEL`: CPU-side plate detector and OCR model selection.
 - `HAILO_NETWORK_NAME`: defaults to `yolov5`.
 - `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, RTSP URL, optional username/password, and `CAMERA_N_ROTATION_DEGREES`.
 - `CALIBRATION_PATH`: calibration JSON path.

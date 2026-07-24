@@ -23,7 +23,7 @@ def _settings(tmp_path: Path, hef_path: Path) -> Settings:
     )
 
 
-def test_discover_hailo_hef_models_scans_configured_and_project_model_dirs(tmp_path: Path):
+def test_discover_hailo_hef_models_returns_only_configured_general_model(tmp_path: Path):
     default_dir = tmp_path / "models"
     default_dir.mkdir()
     default_hef = default_dir / "b_default.hef"
@@ -36,7 +36,8 @@ def test_discover_hailo_hef_models_scans_configured_and_project_model_dirs(tmp_p
 
     models = discover_hailo_hef_models(_settings(tmp_path, default_hef))
 
-    assert models == (project_hef, default_hef)
+    assert models == (default_hef,)
+    assert project_hef not in models
 
 
 def test_discover_hailo_hef_models_falls_back_to_config_path_when_no_hef_found(tmp_path: Path):

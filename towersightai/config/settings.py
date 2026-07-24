@@ -73,6 +73,15 @@ class Settings:
     app_env: str = "development"
     log_level: str = "INFO"
     hailo_model_dir: Path = Path("models/hailo")
+    hailo_vehicle_detection_hef_path: Path = Path("models/hailo/vehicle_detection/yolov5m_vehicles.hef")
+    hailo_vehicle_detection_config_path: Path = Path("models/hailo/vehicle_detection/configs/yolov5_vehicle_detection.json")
+    hailo_vehicle_detection_postprocess_so: Path = Path("models/hailo/postprocess/libyolo_hailortpp_post.so")
+    hailo_person_presence_hef_path: Path = Path("models/hailo/person_presence/yolov5s_personface_reid.hef")
+    hailo_person_presence_config_path: Path = Path("models/hailo/person_presence/configs/yolov5_personface.json")
+    hailo_person_presence_postprocess_so: Path = Path("models/hailo/postprocess/libyolo_post.so")
+    hailo_person_presence_crop_so: Path = Path("models/hailo/postprocess/cropping_algorithms/libwhole_buffer.so")
+    fast_alpr_detector_model: str = "yolo-v9-t-384-license-plate-end2end"
+    fast_alpr_ocr_model: str = "cct-xs-v2-global-model"
     hailo_network_name: str = "yolov5"
     ui_fullscreen: bool = True
     ui_camera_resolution: CameraResolution | tuple[int, int] | str = CameraResolution()

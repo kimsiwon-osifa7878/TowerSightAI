@@ -29,6 +29,8 @@ def main() -> int:
     parser.add_argument("--event-path", required=True, help="JSONL output path.")
     parser.add_argument("--log-path", required=True, help="Human-readable log path.")
     parser.add_argument("--manifest-path", required=True, help="Image manifest JSON path.")
+    parser.add_argument("--detector-model", default=DETECTOR_MODEL, help="FastALPR detector model name or path.")
+    parser.add_argument("--ocr-model", default=OCR_MODEL, help="FastALPR OCR model name or path.")
     parser.add_argument("--append-log", action="store_true", help="Append to an existing launcher log instead of overwriting.")
     args = parser.parse_args()
 
@@ -37,6 +39,8 @@ def main() -> int:
         event_path=Path(args.event_path),
         log_path=Path(args.log_path),
         manifest_path=Path(args.manifest_path),
+        detector_model=args.detector_model,
+        ocr_model=args.ocr_model,
         append_log=args.append_log,
     )
 
@@ -47,6 +51,8 @@ def run_fast_alpr_lpr(
     event_path: Path,
     log_path: Path,
     manifest_path: Path,
+    detector_model: str = DETECTOR_MODEL,
+    ocr_model: str = OCR_MODEL,
     append_log: bool = False,
 ) -> int:
     images = _discover_images(image_dir)
@@ -56,12 +62,17 @@ def run_fast_alpr_lpr(
     if event_path.exists():
         event_path.unlink()
 
-    _write_manifest(images=images, manifest_path=manifest_path)
+    _write_manifest(
+        images=images,
+        manifest_path=manifest_path,
+        detector_model=detector_model,
+        ocr_model=ocr_model,
+    )
     log_context = contextlib.nullcontext(sys.stdout) if append_log else log_path.open("w", encoding="utf-8")
     with log_context as log_fp:
         log_fp.write("\nTowerSightAI FastALPR image LPR run\n")
-        log_fp.write(f"detector-model={DETECTOR_MODEL}\n")
-        log_fp.write(f"ocr-model={OCR_MODEL}\n")
+        log_fp.write(f"detector-model={detector_model}\n")
+        log_fp.write(f"ocr-model={ocr_model}\n")
         log_fp.write(f"image-dir={image_dir}\n")
         log_fp.write(f"image-count={len(images)}\n")
         log_fp.flush()
@@ -74,7 +85,7 @@ def run_fast_alpr_lpr(
             from fast_alpr import ALPR
 
             init_started = time.perf_counter()
-            alpr = ALPR(detector_model=DETECTOR_MODEL, ocr_model=OCR_MODEL, ocr_device="cpu")
+            alpr = ALPR(detector_model=detector_model, ocr_model=ocr_model, ocr_device="cpu")
             init_ms = (time.perf_counter() - init_started) * 1000.0
             log_fp.write(f"model-init-ms={init_ms:.2f}\n")
             log_fp.flush()
@@ -201,12 +212,18 @@ def _bbox_payload(bbox: Any) -> dict[str, int] | None:
     }
 
 
-def _write_manifest(*, images: tuple[ImageInput, ...], manifest_path: Path) -> None:
+def _write_manifest(
+    *,
+    images: tuple[ImageInput, ...],
+    manifest_path: Path,
+    detector_model: str,
+    ocr_model: str,
+) -> None:
     payload = {
         "type": "fast_alpr_image_manifest",
         "created_at": datetime.now().isoformat(),
-        "detector_model": DETECTOR_MODEL,
-        "ocr_model": OCR_MODEL,
+        "detector_model": detector_model,
+        "ocr_model": ocr_model,
         "images": tuple({"image_index": image.index, "source_image": str(image.path)} for image in images),
     }
     manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

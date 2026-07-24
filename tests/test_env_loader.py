@@ -24,6 +24,15 @@ HAILO_MODEL_DIR=models/hailo
 HAILO_HEF_PATH=${{HAILO_MODEL_DIR}}/general/model.hef
 HAILO_POSTPROCESS_SO=${{HAILO_MODEL_DIR}}/postprocess/post.so
 HAILO_NETWORK_NAME=yolov5
+HAILO_VEHICLE_DETECTION_HEF_PATH=${{HAILO_MODEL_DIR}}/vehicle_detection/vehicle.hef
+HAILO_VEHICLE_DETECTION_CONFIG_PATH=${{HAILO_MODEL_DIR}}/vehicle_detection/configs/vehicle.json
+HAILO_VEHICLE_DETECTION_POSTPROCESS_SO=${{HAILO_MODEL_DIR}}/postprocess/vehicle.so
+HAILO_PERSON_PRESENCE_HEF_PATH=${{HAILO_MODEL_DIR}}/person_presence/person.hef
+HAILO_PERSON_PRESENCE_CONFIG_PATH=${{HAILO_MODEL_DIR}}/person_presence/configs/person.json
+HAILO_PERSON_PRESENCE_POSTPROCESS_SO=${{HAILO_MODEL_DIR}}/postprocess/person.so
+HAILO_PERSON_PRESENCE_CROP_SO=${{HAILO_MODEL_DIR}}/postprocess/cropping_algorithms/crop.so
+FAST_ALPR_DETECTOR_MODEL=detector-test-model
+FAST_ALPR_OCR_MODEL=ocr-test-model
 CAMERA_1_ID=ceiling
 CAMERA_1_ROLE=ceiling
 CAMERA_1_RTSP_URL=rtsp://user:secret@192.0.2.1/stream1
@@ -66,6 +75,10 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
     assert settings.hailo_model_dir == Path("models/hailo")
     assert settings.hailo_hef_path == Path("models/hailo/general/model.hef")
     assert settings.hailo_postprocess_so == Path("models/hailo/postprocess/post.so")
+    assert settings.hailo_vehicle_detection_hef_path == Path("models/hailo/vehicle_detection/vehicle.hef")
+    assert settings.hailo_person_presence_hef_path == Path("models/hailo/person_presence/person.hef")
+    assert settings.fast_alpr_detector_model == "detector-test-model"
+    assert settings.fast_alpr_ocr_model == "ocr-test-model"
     assert [camera.id for camera in settings.cameras] == ["ceiling", "front", "rear_side", "opposite_side"]
     assert [camera.rotation_degrees for camera in settings.cameras] == [90, 0, 0, 0]
 
@@ -90,6 +103,8 @@ def test_load_settings_from_env_expands_home_and_config_variables(tmp_path: Path
     assert settings.hailo_model_dir == home / "tower-models"
     assert settings.hailo_hef_path == home / "tower-models" / "model.hef"
     assert settings.hailo_postprocess_so == home / "tower-models" / "post.so"
+    assert settings.hailo_vehicle_detection_hef_path == home / "tower-models" / "vehicle_detection" / "vehicle.hef"
+    assert settings.hailo_person_presence_hef_path == home / "tower-models" / "person_presence" / "person.hef"
 
 
 def test_inspect_env_allows_partial_camera_configuration(tmp_path: Path):

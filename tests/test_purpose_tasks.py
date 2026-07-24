@@ -19,11 +19,21 @@ from towersightai.inference.purpose_tasks import (
 
 
 def _settings(tmp_path: Path) -> Settings:
+    model_dir = tmp_path / "models" / "hailo"
     return Settings(
         tappas_workspace=tmp_path / "tappas",
-        hailo_model_dir=tmp_path / "models" / "hailo",
+        hailo_model_dir=model_dir,
         hailo_hef_path=tmp_path / "default.hef",
         hailo_postprocess_so=tmp_path / "post.so",
+        hailo_vehicle_detection_hef_path=model_dir / "vehicle_detection/yolov5m_vehicles.hef",
+        hailo_vehicle_detection_config_path=model_dir / "vehicle_detection/configs/yolov5_vehicle_detection.json",
+        hailo_vehicle_detection_postprocess_so=model_dir / "postprocess/libyolo_hailortpp_post.so",
+        hailo_person_presence_hef_path=model_dir / "person_presence/yolov5s_personface_reid.hef",
+        hailo_person_presence_config_path=model_dir / "person_presence/configs/yolov5_personface.json",
+        hailo_person_presence_postprocess_so=model_dir / "postprocess/libyolo_post.so",
+        hailo_person_presence_crop_so=model_dir / "postprocess/cropping_algorithms/libwhole_buffer.so",
+        fast_alpr_detector_model="detector-test-model",
+        fast_alpr_ocr_model="ocr-test-model",
         camera_1={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://a", "rotation_degrees": 90},
         camera_2={"id": "front", "role": "front", "rtsp_url": "rtsp://b"},
         camera_3={"id": "rear_side", "role": "rear_side", "rtsp_url": "rtsp://c"},
@@ -48,8 +58,9 @@ def test_vehicle_detection_process_uses_lpr_vehicle_model_and_callback(tmp_path:
     assert process.task_id == PURPOSE_VEHICLE_DETECTION
     assert process.camera_ids == ("front",)
     assert "yolov5m_vehicles.hef" in command
-    assert (settings.hailo_model_dir / "vehicle_detection/yolov5m_vehicles.hef").as_posix() in command
-    assert (settings.hailo_model_dir / "postprocess/libyolo_hailortpp_post.so").as_posix() in command
+    assert settings.hailo_vehicle_detection_hef_path.as_posix() in command
+    assert settings.hailo_vehicle_detection_config_path.as_posix() in command
+    assert settings.hailo_vehicle_detection_postprocess_so.as_posix() in command
     assert "function-name=yolov5m_vehicles" in command
     assert "configs/yolov5_vehicle_detection.json" in command
     assert "hailopython" in command
@@ -73,6 +84,8 @@ def test_lpr_image_process_uses_fast_alpr_batch_runner(tmp_path: Path):
     assert process.task_id == PURPOSE_LPR_IMAGE
     assert process.command[:3] == (sys.executable, "-m", "towersightai.cli.fast_alpr_lpr")
     assert "--image-dir" in process.command
+    assert process.command[process.command.index("--detector-model") + 1] == settings.fast_alpr_detector_model
+    assert process.command[process.command.index("--ocr-model") + 1] == settings.fast_alpr_ocr_model
     assert "gst-launch" not in command
     assert "yolov5m_vehicles.hef" not in command
     assert "tiny_yolov4_license_plates.hef" not in command
@@ -80,6 +93,8 @@ def test_lpr_image_process_uses_fast_alpr_batch_runner(tmp_path: Path):
     assert "hailopython" not in command
     assert "liblpr_ocrsink.so" not in command
     manifest = json.loads((tmp_path / "events/lpr_image/lpr_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["detector_model"] == "detector-test-model"
+    assert manifest["ocr_model"] == "ocr-test-model"
     assert [image["source_image"] for image in manifest["images"]] == [
         str(image_dir / "plate.jpg"),
         str(image_dir / "plate.png"),
@@ -116,9 +131,11 @@ def test_fast_alpr_runner_writes_per_image_results(tmp_path: Path, monkeypatch):
         detection = Detection()
         ocr = Ocr()
 
+    init_kwargs = {}
+
     class ALPR:
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            init_kwargs.update(kwargs)
 
         def predict(self, _path):
             return [Result()]
@@ -130,6 +147,8 @@ def test_fast_alpr_runner_writes_per_image_results(tmp_path: Path, monkeypatch):
         event_path=event_path,
         log_path=log_path,
         manifest_path=manifest_path,
+        detector_model="detector-test-model",
+        ocr_model="ocr-test-model",
     ) == 0
 
     lines = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
@@ -141,6 +160,11 @@ def test_fast_alpr_runner_writes_per_image_results(tmp_path: Path, monkeypatch):
     assert all(attempt["status"] == "recognized" for attempt in attempts)
     assert all(attempt["elapsed_ms"] >= 0 for attempt in attempts)
     assert attempts[0]["best_plate"]["plate_number"] == "12가3456"
+    assert init_kwargs == {
+        "detector_model": "detector-test-model",
+        "ocr_model": "ocr-test-model",
+        "ocr_device": "cpu",
+    }
     assert "recognized-images=2/2" in log_path.read_text(encoding="utf-8")
 
 
@@ -243,9 +267,10 @@ def test_person_presence_process_uses_detector_without_reid_embedding(tmp_path: 
     assert process.task_id == PURPOSE_PERSON_PRESENCE
     assert process.camera_ids == ("ceiling", "front")
     assert "yolov5s_personface_reid.hef" in command
-    assert (settings.hailo_model_dir / "person_presence/yolov5s_personface_reid.hef").as_posix() in command
-    assert (settings.hailo_model_dir / "postprocess/libyolo_post.so").as_posix() in command
-    assert (settings.hailo_model_dir / "postprocess/cropping_algorithms/libwhole_buffer.so").as_posix() in command
+    assert settings.hailo_person_presence_hef_path.as_posix() in command
+    assert settings.hailo_person_presence_config_path.as_posix() in command
+    assert settings.hailo_person_presence_postprocess_so.as_posix() in command
+    assert settings.hailo_person_presence_crop_so.as_posix() in command
     assert command.count("video/x-raw,format=RGB,width=640,height=640,pixel-aspect-ratio=1/1") == 3
     assert "force-writable=true" in command
     assert "function-name=yolov5_personface_letterbox" in command

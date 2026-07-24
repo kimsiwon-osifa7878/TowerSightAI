@@ -202,8 +202,9 @@ def vehicle_detection_process(
     min_confidence: float = 0.1,
     gst_launch: str = "gst-launch-1.0",
 ) -> PurposeInferenceProcess:
-    resources = _lpr_resources(settings)
-    postprocess = settings.hailo_model_dir / "postprocess"
+    hef_path = settings.hailo_vehicle_detection_hef_path
+    config_path = settings.hailo_vehicle_detection_config_path
+    postprocess_so = settings.hailo_vehicle_detection_postprocess_so
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "vehicle.jsonl"
     log_path = event_dir / "vehicle.gst.log"
@@ -227,11 +228,11 @@ def vehicle_detection_process(
             "! video/x-raw,pixel-aspect-ratio=1/1",
             "! videoconvert n-threads=3",
             "! queue name=vehicle_hailonet_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={(resources / 'yolov5m_vehicles.hef').as_posix()} batch-size=1 nms-score-threshold={min_confidence} "
+            f"! hailonet hef-path={hef_path.as_posix()} batch-size=1 nms-score-threshold={min_confidence} "
             "nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32",
             "! queue name=vehicle_hailofilter_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={(postprocess / 'libyolo_hailortpp_post.so').as_posix()} "
-            f"config-path={(resources / 'configs/yolov5_vehicle_detection.json').as_posix()} function-name=yolov5m_vehicles qos=false",
+            f"! hailofilter so-path={postprocess_so.as_posix()} "
+            f"config-path={config_path.as_posix()} function-name=yolov5m_vehicles qos=false",
             "! queue name=vehicle_callback_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
             f"! hailopython module={callback_module} qos=false",
             "! queue name=vehicle_sink_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
@@ -246,7 +247,7 @@ def vehicle_detection_process(
         env=env,
         log_path=log_path,
         event_path=event_path,
-        model_paths=(resources / "yolov5m_vehicles.hef",),
+        model_paths=(hef_path,),
         camera_ids=(camera.id,),
     )
 
@@ -264,7 +265,12 @@ def lpr_image_process(
         raise ValueError(f"LPR test image not found: {image_dir}")
     event_path = event_dir / "lpr.jsonl"
     log_path = event_dir / "lpr.gst.log"
-    manifest_path = _write_lpr_manifest(event_dir=event_dir, prepared=prepared)
+    manifest_path = _write_lpr_manifest(
+        event_dir=event_dir,
+        prepared=prepared,
+        detector_model=settings.fast_alpr_detector_model,
+        ocr_model=settings.fast_alpr_ocr_model,
+    )
     command = (
         sys.executable,
         "-m",
@@ -277,6 +283,10 @@ def lpr_image_process(
         str(log_path),
         "--manifest-path",
         str(manifest_path),
+        "--detector-model",
+        settings.fast_alpr_detector_model,
+        "--ocr-model",
+        settings.fast_alpr_ocr_model,
         "--append-log",
     )
     env = os.environ.copy()
@@ -292,71 +302,6 @@ def lpr_image_process(
     )
 
 
-def _legacy_hailo_lpr_pipeline(settings: Settings, resources: Path, callback_module: Path, location: Path, stop_index: int) -> str:
-    return " ".join(
-        (
-            f"multifilesrc location={location} index=0 stop-index={stop_index} caps=image/png,framerate=1/1",
-            "! pngdec",
-            "! videoscale n-threads=2",
-            "! video/x-raw,pixel-aspect-ratio=1/1",
-            "! videoconvert n-threads=3",
-            "! queue name=lpr_vehicle_hailonet_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={resources / 'yolov5m_vehicles.hef'} vdevice-group-id=1 scheduling-algorithm=1 "
-            "scheduler-threshold=1 scheduler-timeout-ms=100 batch-size=1 nms-score-threshold=0.3 "
-            "nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32",
-            "! queue name=lpr_vehicle_hailofilter_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/libyolo_hailortpp_post.so'} "
-            f"config-path={resources / 'configs/yolov5_vehicle_detection.json'} function-name=yolov5m_vehicles qos=false",
-            "! queue name=lpr_tracker_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            "! hailotracker name=hailo_tracker keep-past-metadata=true kalman-dist-thr=.5 iou-thr=.6 keep-tracked-frames=2 keep-lost-frames=2",
-            "! queue name=lpr_tee_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            "! tee name=context_tee",
-            "context_tee.",
-            "! queue name=lpr_overlay_sink_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            "! fakesink sync=false async=false",
-            "context_tee.",
-            "! queue name=lpr_plate_crop_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailocropper so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/cropping_algorithms/liblpr_croppers.so'} "
-            "function-name=vehicles_without_ocr internal-offset=true drop-uncropped-buffers=true name=cropper1",
-            "hailoaggregator name=agg1",
-            "cropper1.",
-            "! queue name=lpr_lp_bypass_q leaky=no max-size-buffers=50 max-size-bytes=0 max-size-time=0",
-            "! agg1.",
-            "cropper1.",
-            "! queue name=lpr_plate_hailonet_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={resources / 'tiny_yolov4_license_plates.hef'} vdevice-group-id=1 scheduling-algorithm=1 "
-            "scheduler-threshold=5 scheduler-timeout-ms=100",
-            "! queue name=lpr_plate_hailofilter_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/libyolo_post.so'} "
-            f"config-path={resources / 'configs/yolov4_license_plate.json'} function-name=tiny_yolov4_license_plates qos=false",
-            "! queue name=lpr_plate_to_agg_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            "! agg1.",
-            "agg1.",
-            "! queue name=lpr_ocr_crop_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailocropper so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/cropping_algorithms/liblpr_croppers.so'} "
-            "function-name=license_plate_quality_estimation internal-offset=true drop-uncropped-buffers=true name=cropper2",
-            "hailoaggregator name=agg2",
-            "cropper2.",
-            "! queue name=lpr_ocr_bypass_q leaky=no max-size-buffers=50 max-size-bytes=0 max-size-time=0",
-            "! agg2.",
-            "cropper2.",
-            "! queue name=lpr_ocr_hailonet_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={resources / 'lprnet.hef'} vdevice-group-id=1 scheduling-algorithm=1 "
-            "scheduler-threshold=1 scheduler-timeout-ms=100",
-            "! queue name=lpr_ocr_post_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/libocr_post.so'} qos=false",
-            "! queue name=lpr_ocr_to_agg_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            "! agg2.",
-            "agg2.",
-            "! queue name=lpr_ocr_callback_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailopython module={callback_module} qos=false",
-            "! queue name=lpr_ocrsink_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter use-gst-buffer=true so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/apps/license_plate_recognition/liblpr_ocrsink.so'} qos=false",
-            "! fakesink sync=false",
-        )
-    )
-
-
 def person_presence_process(
     settings: Settings,
     cameras: tuple[CameraConfig, ...],
@@ -369,8 +314,10 @@ def person_presence_process(
 ) -> PurposeInferenceProcess:
     if not cameras:
         raise ValueError("At least one camera is required for person presence detection.")
-    resources = _person_presence_resources(settings)
-    postprocess = settings.hailo_model_dir / "postprocess"
+    hef_path = settings.hailo_person_presence_hef_path
+    config_path = settings.hailo_person_presence_config_path
+    postprocess_so = settings.hailo_person_presence_postprocess_so
+    crop_so = settings.hailo_person_presence_crop_so
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "person_presence.jsonl"
     log_path = event_dir / "person_presence.gst.log"
@@ -401,7 +348,7 @@ def person_presence_process(
             "! videoconvert n-threads=1 qos=false",
             f"! {PERSON_PRESENCE_NETWORK_CAPS}",
             "! queue name=person_pre_cropper_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailocropper so-path={(postprocess / 'cropping_algorithms/libwhole_buffer.so').as_posix()} "
+            f"! hailocropper so-path={crop_so.as_posix()} "
             "function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true name=cropper1",
             "hailoaggregator name=agg1",
             "cropper1.",
@@ -409,11 +356,11 @@ def person_presence_process(
             "! agg1.",
             "cropper1.",
             "! queue name=person_detector_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={(resources / 'yolov5s_personface_reid.hef').as_posix()} scheduling-algorithm=1 "
+            f"! hailonet hef-path={hef_path.as_posix()} scheduling-algorithm=1 "
             "vdevice-group-id=1 force-writable=true",
             "! queue name=person_detector_post_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={(postprocess / 'libyolo_post.so').as_posix()} "
-            f"config-path={(resources / 'configs/yolov5_personface.json').as_posix()} function-name=yolov5_personface_letterbox qos=false",
+            f"! hailofilter so-path={postprocess_so.as_posix()} "
+            f"config-path={config_path.as_posix()} function-name=yolov5_personface_letterbox qos=false",
             "! queue name=person_detector_to_agg_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
             "! agg1.",
             "agg1.",
@@ -430,7 +377,7 @@ def person_presence_process(
         env=env,
         log_path=log_path,
         event_path=event_path,
-        model_paths=(resources / "yolov5s_personface_reid.hef",),
+        model_paths=(hef_path,),
         camera_ids=tuple(camera.id for camera in cameras),
     )
 
@@ -506,14 +453,6 @@ def _person_presence_source_branch(
     )
 
 
-def _lpr_resources(settings: Settings) -> Path:
-    return settings.hailo_model_dir / "vehicle_detection"
-
-
-def _person_presence_resources(settings: Settings) -> Path:
-    return settings.hailo_model_dir / "person_presence"
-
-
 def _write_person_presence_callback_module(
     *,
     event_dir: Path,
@@ -563,7 +502,13 @@ def _prepare_lpr_images(image_dir: Path, event_dir: Path, *, frames_per_image: i
     return tuple(prepared)
 
 
-def _write_lpr_manifest(*, event_dir: Path, prepared: tuple[LprPreparedFrame, ...]) -> Path:
+def _write_lpr_manifest(
+    *,
+    event_dir: Path,
+    prepared: tuple[LprPreparedFrame, ...],
+    detector_model: str,
+    ocr_model: str,
+) -> Path:
     manifest_path = event_dir / "lpr_manifest.json"
     images: dict[str, dict[str, Any]] = {}
     frames: list[dict[str, Any]] = []
@@ -585,8 +530,8 @@ def _write_lpr_manifest(*, event_dir: Path, prepared: tuple[LprPreparedFrame, ..
     payload = {
         "type": "fast_alpr_image_manifest",
         "created_at": datetime.now().isoformat(),
-        "detector_model": "yolo-v9-t-384-license-plate-end2end",
-        "ocr_model": "cct-xs-v2-global-model",
+        "detector_model": detector_model,
+        "ocr_model": ocr_model,
         "images": tuple(sorted(images.values(), key=lambda image: image["image_index"])),
         "frames": tuple(frames),
     }

@@ -41,6 +41,13 @@ def check_hailo_installation(settings: Settings, *, timeout_seconds: int = 10) -
         items.append(_check_gstreamer_element(element, timeout_seconds=timeout_seconds))
     items.append(_check_path("HEF path", settings.hailo_hef_path))
     items.append(_check_path("postprocess so", settings.hailo_postprocess_so))
+    items.append(_check_path("vehicle HEF", settings.hailo_vehicle_detection_hef_path))
+    items.append(_check_path("vehicle config", settings.hailo_vehicle_detection_config_path))
+    items.append(_check_path("vehicle postprocess", settings.hailo_vehicle_detection_postprocess_so))
+    items.append(_check_path("person HEF", settings.hailo_person_presence_hef_path))
+    items.append(_check_path("person config", settings.hailo_person_presence_config_path))
+    items.append(_check_path("person postprocess", settings.hailo_person_presence_postprocess_so))
+    items.append(_check_path("person crop helper", settings.hailo_person_presence_crop_so))
     return HailoCheckResult(tuple(items))
 
 

@@ -80,13 +80,56 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
     if missing:
         raise ValueError(f"Missing required settings: {', '.join(missing)}")
 
+    hailo_model_dir = values.get("HAILO_MODEL_DIR", "models/hailo")
     return Settings(
         app_env=values.get("APP_ENV", "development"),
         log_level=values.get("LOG_LEVEL", "INFO"),
         tappas_workspace=_expand_config_path(values["TAPPAS_WORKSPACE"], values),
-        hailo_model_dir=_expand_config_path(values.get("HAILO_MODEL_DIR", "models/hailo"), values),
+        hailo_model_dir=_expand_config_path(hailo_model_dir, values),
         hailo_hef_path=_expand_config_path(values["HAILO_HEF_PATH"], values),
         hailo_postprocess_so=_expand_config_path(values["HAILO_POSTPROCESS_SO"], values),
+        hailo_vehicle_detection_hef_path=_expand_config_path(
+            values.get("HAILO_VEHICLE_DETECTION_HEF_PATH", f"{hailo_model_dir}/vehicle_detection/yolov5m_vehicles.hef"),
+            values,
+        ),
+        hailo_vehicle_detection_config_path=_expand_config_path(
+            values.get(
+                "HAILO_VEHICLE_DETECTION_CONFIG_PATH",
+                f"{hailo_model_dir}/vehicle_detection/configs/yolov5_vehicle_detection.json",
+            ),
+            values,
+        ),
+        hailo_vehicle_detection_postprocess_so=_expand_config_path(
+            values.get(
+                "HAILO_VEHICLE_DETECTION_POSTPROCESS_SO",
+                f"{hailo_model_dir}/postprocess/libyolo_hailortpp_post.so",
+            ),
+            values,
+        ),
+        hailo_person_presence_hef_path=_expand_config_path(
+            values.get("HAILO_PERSON_PRESENCE_HEF_PATH", f"{hailo_model_dir}/person_presence/yolov5s_personface_reid.hef"),
+            values,
+        ),
+        hailo_person_presence_config_path=_expand_config_path(
+            values.get(
+                "HAILO_PERSON_PRESENCE_CONFIG_PATH",
+                f"{hailo_model_dir}/person_presence/configs/yolov5_personface.json",
+            ),
+            values,
+        ),
+        hailo_person_presence_postprocess_so=_expand_config_path(
+            values.get("HAILO_PERSON_PRESENCE_POSTPROCESS_SO", f"{hailo_model_dir}/postprocess/libyolo_post.so"),
+            values,
+        ),
+        hailo_person_presence_crop_so=_expand_config_path(
+            values.get(
+                "HAILO_PERSON_PRESENCE_CROP_SO",
+                f"{hailo_model_dir}/postprocess/cropping_algorithms/libwhole_buffer.so",
+            ),
+            values,
+        ),
+        fast_alpr_detector_model=values.get("FAST_ALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end"),
+        fast_alpr_ocr_model=values.get("FAST_ALPR_OCR_MODEL", "cct-xs-v2-global-model"),
         hailo_network_name=values.get("HAILO_NETWORK_NAME", "yolov5"),
         camera_1=_camera_dict(values, 1),
         camera_2=_camera_dict(values, 2),
