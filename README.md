@@ -69,6 +69,153 @@ python -m pip install -e ".[ui]" pytest
 
 On the Ubuntu/Hailo target, HailoRT/TAPPAS and the Hailo GStreamer plugins must also be installed. The code expects elements such as `hailonet`, `hailofilter`, `hailopython`, `hailoroundrobin`, and `hailostreamrouter`.
 
+## Hailo Models And Resources
+
+### Supported Hailo Stack
+
+The current pipelines and paths are based on the Hailo-8 layout from **TAPPAS 3.31.0 with the HailoRT 4.20 series**. The [official TAPPAS 3.31.0 README](https://github.com/hailo-ai/tappas/blob/v3.31.0/README.rst) identifies HailoRT 4.20 as the compatible runtime.
+
+Newer TAPPAS and Hailo Apps releases changed application and model-resource layouts. Copying only these HEF files into a newer installation is not a supported migration: the matching postprocess libraries, JSON configurations, GStreamer elements, and HailoRT ABI must also be compatible. Supporting the current Hailo Apps layout requires a separate code migration.
+
+### Required Files
+
+TowerSightAI keeps deployment-local model resources under `models/hailo/` in this project. Set `HAILO_MODEL_DIR` to that directory; the default assumes commands are run from the repository root.
+
+| Function | Required file |
+|---|---|
+| Previous/general AI detection | `${HAILO_MODEL_DIR}/general/yolov5m_wo_spp_60p.hef` |
+| Previous/general AI postprocess | `${HAILO_MODEL_DIR}/postprocess/libyolo_hailortpp_post.so` |
+| Vehicle-only detection model | `${HAILO_MODEL_DIR}/vehicle_detection/yolov5m_vehicles.hef` |
+| Vehicle-only detection config | `${HAILO_MODEL_DIR}/vehicle_detection/configs/yolov5_vehicle_detection.json` |
+| Person-presence model | `${HAILO_MODEL_DIR}/person_presence/yolov5s_personface_reid.hef` |
+| Person-presence config | `${HAILO_MODEL_DIR}/person_presence/configs/yolov5_personface.json` |
+| Person-presence postprocess | `${HAILO_MODEL_DIR}/postprocess/libyolo_post.so` |
+| Person-presence crop helper | `${HAILO_MODEL_DIR}/postprocess/cropping_algorithms/libwhole_buffer.so` |
+
+The vehicle-only and person-presence buttons resolve their fixed resources below `HAILO_MODEL_DIR`. `TAPPAS_WORKSPACE` is still required for the compatible TAPPAS runtime and virtual environment, but model files are no longer loaded from the TAPPAS installation tree.
+
+### Install Or Copy The Resources
+
+Preferred installation:
+
+1. Download a mutually compatible Hailo-8 HailoRT/TAPPAS package set from the [Hailo Developer Zone](https://hailo.ai/developer-zone/).
+2. Install HailoRT, its PCIe driver, and TAPPAS 3.31.0 by following the vendor instructions. Allow the TAPPAS installer/downloader to install its example resources rather than downloading arbitrary HEFs individually.
+3. Set `TAPPAS_WORKSPACE` to the installed workspace root. `/opt/hailo/tappas` is this project's example runtime path, not a mandatory Hailo installation path.
+4. Copy the downloaded resources into this project's `models/hailo/` tree with the commands below.
+
+From the TowerSightAI repository root, copy the required resources out of the compatible TAPPAS workspace:
+
+```bash
+export PROJECT_ROOT="$PWD"
+export TAPPAS_WORKSPACE=/opt/hailo/tappas
+export HAILO_MODEL_DIR="$PROJECT_ROOT/models/hailo"
+
+mkdir -p \
+  "$HAILO_MODEL_DIR/general" \
+  "$HAILO_MODEL_DIR/vehicle_detection/configs" \
+  "$HAILO_MODEL_DIR/person_presence/configs" \
+  "$HAILO_MODEL_DIR/postprocess/cropping_algorithms"
+
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/resources/hef/yolov5m_wo_spp_60p.hef" \
+  "$HAILO_MODEL_DIR/general/"
+
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/general/license_plate_recognition/resources/yolov5m_vehicles.hef" \
+  "$HAILO_MODEL_DIR/vehicle_detection/"
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/general/license_plate_recognition/resources/configs/yolov5_vehicle_detection.json" \
+  "$HAILO_MODEL_DIR/vehicle_detection/configs/"
+
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/general/multi_person_multi_camera_tracking/resources/yolov5s_personface_reid.hef" \
+  "$HAILO_MODEL_DIR/person_presence/"
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/general/multi_person_multi_camera_tracking/resources/configs/yolov5_personface.json" \
+  "$HAILO_MODEL_DIR/person_presence/configs/"
+
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/libs/post_processes/libyolo_hailortpp_post.so" \
+  "$HAILO_MODEL_DIR/postprocess/"
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/libs/post_processes/libyolo_post.so" \
+  "$HAILO_MODEL_DIR/postprocess/"
+cp "$TAPPAS_WORKSPACE/apps/h8/gstreamer/libs/post_processes/cropping_algorithms/libwhole_buffer.so" \
+  "$HAILO_MODEL_DIR/postprocess/cropping_algorithms/"
+```
+
+If the target computer cannot download the TAPPAS resources, run the same copy from another computer with the same Hailo-8, HailoRT, and TAPPAS versions, then transfer the completed `models/hailo/` directory to the same location inside the target TowerSightAI checkout. Model binaries and shared libraries under this directory are ignored by Git. Do not mix resources from different TAPPAS releases or commit them to the repository.
+
+Configure `.env` with the actual paths:
+
+```dotenv
+TAPPAS_WORKSPACE=/opt/hailo/tappas
+HAILO_MODEL_DIR=models/hailo
+HAILO_HEF_PATH=${HAILO_MODEL_DIR}/general/yolov5m_wo_spp_60p.hef
+HAILO_POSTPROCESS_SO=${HAILO_MODEL_DIR}/postprocess/libyolo_hailortpp_post.so
+HAILO_NETWORK_NAME=yolov5
+```
+
+### FastALPR Models
+
+`번호판 이미지 LPR` does **not** use the TAPPAS `tiny_yolov4_license_plates.hef` or `lprnet.hef` pipeline. The current implementation uses [FastALPR](https://github.com/ankandrew/fast-alpr) on the CPU with:
+
+- Detector: `yolo-v9-t-384-license-plate-end2end`
+- OCR: `cct-xs-v2-global-model`
+
+Installing this project with `python -m pip install -e ".[ui]"` installs `fast-alpr[onnx]`. FastALPR prepares its ONNX models when it is first initialized, so the first `번호판 이미지 LPR` run may require internet access. On an offline deployment, initialize FastALPR once while online under the same deployment user and Python environment, then preserve that user's resulting model cache. This path is independent of `TAPPAS_WORKSPACE`.
+
+### Verify The Installation
+
+Run these commands inside the TowerSightAI virtual environment on the Ubuntu/Hailo target:
+
+```bash
+source .venv/bin/activate
+export TAPPAS_WORKSPACE=/opt/hailo/tappas
+export HAILO_MODEL_DIR="$PWD/models/hailo"
+
+hailortcli fw-control identify
+
+for element in hailonet hailofilter hailopython hailoroundrobin hailostreamrouter; do
+  gst-inspect-1.0 "$element" >/dev/null || {
+    echo "Missing GStreamer element: $element" >&2
+    exit 1
+  }
+done
+
+required_files=(
+  "$HAILO_MODEL_DIR/general/yolov5m_wo_spp_60p.hef"
+  "$HAILO_MODEL_DIR/postprocess/libyolo_hailortpp_post.so"
+  "$HAILO_MODEL_DIR/vehicle_detection/yolov5m_vehicles.hef"
+  "$HAILO_MODEL_DIR/vehicle_detection/configs/yolov5_vehicle_detection.json"
+  "$HAILO_MODEL_DIR/person_presence/yolov5s_personface_reid.hef"
+  "$HAILO_MODEL_DIR/person_presence/configs/yolov5_personface.json"
+  "$HAILO_MODEL_DIR/postprocess/libyolo_post.so"
+  "$HAILO_MODEL_DIR/postprocess/cropping_algorithms/libwhole_buffer.so"
+)
+
+for file in "${required_files[@]}"; do
+  test -f "$file" || {
+    echo "Missing Hailo resource: $file" >&2
+    exit 1
+  }
+done
+
+towersightai-check-settings --env .env --check-hailo
+```
+
+`towersightai-check-settings --check-hailo` checks the Hailo device, required GStreamer elements, `HAILO_HEF_PATH`, and `HAILO_POSTPROCESS_SO`. It does not currently check the fixed vehicle-only or person-presence resources, which is why the explicit `required_files` check above is also necessary.
+
+After the checks pass, run the hardware image smoke test:
+
+```bash
+RUN_HARDWARE_TESTS=1 towersightai-hailo-image-smoke \
+  --env .env \
+  --image data/samples/test-car.png \
+  --check-installation \
+  --run
+```
+
+These checks validate installation and inference wiring only. They never authorize PLC OK. If an AI button still fails, inspect:
+
+- `artifacts/runtime/detections/` for previous/general AI detection.
+- `artifacts/runtime/purpose-ai/vehicle_detection/vehicle.gst.log` for vehicle-only detection.
+- `artifacts/runtime/purpose-ai/person_presence/person_presence.gst.log` for person-presence detection.
+- `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` for FastALPR image LPR.
+
 ## Environment
 
 Create a site-local `.env` from the placeholder file:
@@ -80,6 +227,7 @@ cp .env.example .env
 Important values:
 
 - `TAPPAS_WORKSPACE`: TAPPAS workspace path.
+- `HAILO_MODEL_DIR`: project-local Hailo resource root; defaults to `models/hailo`.
 - `HAILO_HEF_PATH`: YOLO HEF file path.
 - `HAILO_POSTPROCESS_SO`: Hailo postprocess `.so`.
 - `HAILO_NETWORK_NAME`: defaults to `yolov5`.
@@ -120,9 +268,9 @@ Disconnected cameras remain visible as NG tiles and are not used as inference ta
 
 Purpose-specific AI buttons use fixed TAPPAS example model sets and always keep PLC OK blocked:
 
-- `차량 전용 검출`: `apps/h8/gstreamer/general/license_plate_recognition/resources/yolov5m_vehicles.hef`.
-- `번호판 이미지 LPR`: `yolov5m_vehicles.hef`, `tiny_yolov4_license_plates.hef`, and `lprnet.hef`.
-- `사람 존재 감지`: `apps/h8/gstreamer/general/multi_person_multi_camera_tracking/resources/yolov5s_personface_reid.hef` with `yolov5_personface_letterbox`; it does not run Re-ID embedding, gallery matching, or same-person tracking.
+- `차량 전용 검출`: `${HAILO_MODEL_DIR}/vehicle_detection/yolov5m_vehicles.hef`.
+- `번호판 이미지 LPR`: CPU-side FastALPR with `yolo-v9-t-384-license-plate-end2end` and `cct-xs-v2-global-model`; it does not use the legacy TAPPAS LPR HEFs.
+- `사람 존재 감지`: `${HAILO_MODEL_DIR}/person_presence/yolov5s_personface_reid.hef` with `yolov5_personface_letterbox`; it does not run Re-ID embedding, gallery matching, or same-person tracking.
 
 Logs are written under `artifacts/runtime/purpose-ai/`. These buttons are implementation and integration checks only; they do not authorize PLC OK.
 

@@ -21,6 +21,7 @@ from towersightai.inference.purpose_tasks import (
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         tappas_workspace=tmp_path / "tappas",
+        hailo_model_dir=tmp_path / "models" / "hailo",
         hailo_hef_path=tmp_path / "default.hef",
         hailo_postprocess_so=tmp_path / "post.so",
         camera_1={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://a", "rotation_degrees": 90},
@@ -47,6 +48,8 @@ def test_vehicle_detection_process_uses_lpr_vehicle_model_and_callback(tmp_path:
     assert process.task_id == PURPOSE_VEHICLE_DETECTION
     assert process.camera_ids == ("front",)
     assert "yolov5m_vehicles.hef" in command
+    assert (settings.hailo_model_dir / "vehicle_detection/yolov5m_vehicles.hef").as_posix() in command
+    assert (settings.hailo_model_dir / "postprocess/libyolo_hailortpp_post.so").as_posix() in command
     assert "function-name=yolov5m_vehicles" in command
     assert "configs/yolov5_vehicle_detection.json" in command
     assert "hailopython" in command
@@ -240,6 +243,9 @@ def test_person_presence_process_uses_detector_without_reid_embedding(tmp_path: 
     assert process.task_id == PURPOSE_PERSON_PRESENCE
     assert process.camera_ids == ("ceiling", "front")
     assert "yolov5s_personface_reid.hef" in command
+    assert (settings.hailo_model_dir / "person_presence/yolov5s_personface_reid.hef").as_posix() in command
+    assert (settings.hailo_model_dir / "postprocess/libyolo_post.so").as_posix() in command
+    assert (settings.hailo_model_dir / "postprocess/cropping_algorithms/libwhole_buffer.so").as_posix() in command
     assert command.count("video/x-raw,format=RGB,width=640,height=640,pixel-aspect-ratio=1/1") == 3
     assert "force-writable=true" in command
     assert "function-name=yolov5_personface_letterbox" in command

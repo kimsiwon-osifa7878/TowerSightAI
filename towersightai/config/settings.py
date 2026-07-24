@@ -72,6 +72,7 @@ class Settings:
     plc_endpoint: str
     app_env: str = "development"
     log_level: str = "INFO"
+    hailo_model_dir: Path = Path("models/hailo")
     hailo_network_name: str = "yolov5"
     ui_fullscreen: bool = True
     ui_camera_resolution: CameraResolution | tuple[int, int] | str = CameraResolution()
