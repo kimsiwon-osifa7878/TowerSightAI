@@ -88,7 +88,7 @@ if [[ -n "$WINDOW_ID" ]]; then
     local rel_x="$1"
     local rel_y="$2"
     xdotool windowactivate "$WINDOW_ID" 2>/dev/null || true
-    xdotool mousemove $((WINDOW_X + rel_x)) $((WINDOW_Y + rel_y)) click 1
+    xdotool mousemove --window "$WINDOW_ID" "$rel_x" "$rel_y" click 1
     sleep 1
   }
 

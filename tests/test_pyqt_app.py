@@ -18,6 +18,9 @@ from towersightai.ui.pyqt_app import (
     OPERATOR_PANEL_WIDTH,
     SIDEBAR_ACTION_LABELS,
     PERSON_ALERT_STREAK_THRESHOLD,
+    WINDOWED_DEFAULT_HEIGHT,
+    WINDOWED_DEFAULT_WIDTH,
+    WINDOWED_MAX_WIDTH,
     LiveDetectionWorker,
     OperatorWindow,
     PurposeInferenceWorker,
@@ -28,6 +31,7 @@ from towersightai.ui.pyqt_app import (
     _fresh_detections,
     _legacy_ai_detection_label,
     _network_bbox_to_source_bbox,
+    _prepare_operator_window,
     _purpose_detection_label,
     _rotate_cv_frame,
     _rotation_label,
@@ -55,6 +59,31 @@ def _qt_app() -> QApplication:
     global _APP
     _APP = QApplication.instance() or QApplication([])
     return _APP
+
+
+def test_windowed_operator_window_width_is_capped_at_1920():
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+
+    _prepare_operator_window(window, fullscreen=False)
+
+    assert window.maximumWidth() == WINDOWED_MAX_WIDTH
+    assert window.width() == min(WINDOWED_DEFAULT_WIDTH, WINDOWED_MAX_WIDTH)
+    assert window.height() == WINDOWED_DEFAULT_HEIGHT
+    window.close()
+
+
+def test_fullscreen_operator_window_does_not_keep_windowed_width_cap():
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+
+    _prepare_operator_window(window, fullscreen=False)
+    _prepare_operator_window(window, fullscreen=True)
+
+    assert window.maximumWidth() > WINDOWED_MAX_WIDTH
+    window.close()
 
 
 def test_detection_bbox_maps_to_image_rect():

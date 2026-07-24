@@ -25,6 +25,9 @@ from towersightai.ui.model import GlobalSafetyStatus, OperatorDisplayModel
 
 OPERATOR_PANEL_WIDTH = 400
 OPERATOR_SIDEBAR_WIDTH = 300
+WINDOWED_MAX_WIDTH = 1920
+WINDOWED_DEFAULT_WIDTH = 1440
+WINDOWED_DEFAULT_HEIGHT = 900
 DETECTION_TTL_SECONDS = 1.0
 FIRST_INFERENCE_TIMEOUT_SECONDS = 30.0
 PERSON_ALERT_STREAK_THRESHOLD = 2
@@ -1942,6 +1945,14 @@ def _purpose_detection_label(
     return text
 
 
+def _prepare_operator_window(window: OperatorWindow, *, fullscreen: bool) -> None:
+    if fullscreen:
+        window.setMaximumWidth(16777215)
+        return
+    window.setMaximumWidth(WINDOWED_MAX_WIDTH)
+    window.resize(min(WINDOWED_DEFAULT_WIDTH, WINDOWED_MAX_WIDTH), WINDOWED_DEFAULT_HEIGHT)
+
+
 def launch_operator_ui(model: OperatorDisplayModel, settings: Settings | None = None) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     window = OperatorWindow(model, settings=settings)
@@ -1956,10 +1967,10 @@ def launch_operator_ui(model: OperatorDisplayModel, settings: Settings | None = 
 
     for signum in previous_handlers:
         signal.signal(signum, stop_ui)
+    _prepare_operator_window(window, fullscreen=model.fullscreen)
     if model.fullscreen:
         window.showFullScreen()
     else:
-        window.resize(1440, 900)
         window.show()
     try:
         return app.exec()
