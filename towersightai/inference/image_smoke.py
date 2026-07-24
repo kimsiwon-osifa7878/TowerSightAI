@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from towersightai.config.settings import Settings
+from towersightai.config.settings import CameraConfig, CameraRole, Settings
+from towersightai.inference.hailo_apps_runtime import hailo_apps_detection_command, hailo_apps_runtime_env
 
 NETWORK_WIDTH = 640
 NETWORK_HEIGHT = 640
@@ -76,16 +77,24 @@ def image_smoke_command(
     show_fps: bool = False,
     min_confidence: float = 0.3,
     gst_launch: str = "gst-launch-1.0",
+    event_path: Path = Path("artifacts/hailo/sample-detections.jsonl"),
+    camera_id: str = "sample_image",
 ) -> list[str]:
-    pipeline = build_image_hailo_pipeline(
-        settings,
-        image_path=image_path,
-        output_image_path=output_image_path,
-        display=display,
-        show_fps=show_fps,
-        min_confidence=min_confidence,
+    source = CameraConfig(
+        id=camera_id,
+        role=CameraRole.front,
+        rtsp_url=str(image_path.resolve(strict=False)),
     )
-    return [gst_launch, "-q", *pipeline.split()]
+    return list(
+        hailo_apps_detection_command(
+            settings,
+            (source,),
+            event_path=event_path,
+            hef_path=settings.hailo_hef_path,
+            postprocess_so=settings.hailo_postprocess_so,
+            min_confidence=min_confidence,
+        )
+    )
 
 
 def run_image_hailo_smoke(
@@ -111,12 +120,14 @@ def run_image_hailo_smoke(
             show_fps=show_fps,
             min_confidence=min_confidence,
             gst_launch=gst_launch,
+            event_path=event_path,
+            camera_id=camera_id,
         )
     )
     if require_opt_in and os.environ.get("RUN_HARDWARE_TESTS") != "1":
         return HailoImageSmokeResult(False, command, event_path, output_image_path, "", "", "RUN_HARDWARE_TESTS=1 is required")
-    if shutil.which(gst_launch) is None:
-        return HailoImageSmokeResult(False, command, event_path, output_image_path, "", "", f"{gst_launch} not found")
+    if shutil.which(command[0]) is None:
+        return HailoImageSmokeResult(False, command, event_path, None, "", "", f"{command[0]} not found")
     if not image_path.exists():
         return HailoImageSmokeResult(False, command, event_path, output_image_path, "", "", f"missing sample image: {image_path}")
 
@@ -126,14 +137,7 @@ def run_image_hailo_smoke(
     if output_image_path is not None:
         output_image_path.parent.mkdir(parents=True, exist_ok=True)
 
-    env = _gst_runtime_env(settings)
-    env.update(
-        {
-            "TOWERSIGHTAI_HAILO_CAMERA_ID": camera_id,
-            "TOWERSIGHTAI_HAILO_EVENT_PATH": str(event_path),
-            "TOWERSIGHTAI_HAILO_MIN_CONFIDENCE": str(min_confidence),
-        }
-    )
+    env = hailo_apps_runtime_env(settings)
     try:
         completed = _run_gst_command(command, timeout_seconds=timeout_seconds, env=env)
     except subprocess.TimeoutExpired as exc:
@@ -147,8 +151,8 @@ def run_image_hailo_smoke(
             f"gst-launch timed out after {timeout_seconds} seconds",
         )
     ok = completed.returncode == 0 and event_path.exists()
-    reason = None if ok else f"gst-launch exit code {completed.returncode}; detection event file missing or pipeline failed"
-    return HailoImageSmokeResult(ok, command, event_path, output_image_path, completed.stdout, completed.stderr, reason)
+    reason = None if ok else f"Hailo Apps exit code {completed.returncode}; detection event file missing or pipeline failed"
+    return HailoImageSmokeResult(ok, command, event_path, None, completed.stdout, completed.stderr, reason)
 
 
 def redacted_command(command: Sequence[str]) -> str:

@@ -73,24 +73,22 @@ def _settings_report(settings: Settings) -> list[str]:
         ("general-hef", settings.hailo_hef_path),
         ("general-postprocess", settings.hailo_postprocess_so),
         ("vehicle-hef", settings.hailo_vehicle_detection_hef_path),
-        ("vehicle-config", settings.hailo_vehicle_detection_config_path),
         ("vehicle-postprocess", settings.hailo_vehicle_detection_postprocess_so),
         ("person-hef", settings.hailo_person_presence_hef_path),
-        ("person-config", settings.hailo_person_presence_config_path),
         ("person-postprocess", settings.hailo_person_presence_postprocess_so),
-        ("person-crop", settings.hailo_person_presence_crop_so),
     )
-    tappas_venv = settings.tappas_workspace / "hailo_tappas_venv"
     lines = [
         "",
         "[SETTINGS]",
         "status=loaded",
         f"log-level={settings.log_level}",
         f"hailo-network-name={settings.hailo_network_name}",
+        f"hailo-arch={settings.hailo_arch}",
         f"fast-alpr-detector-model={settings.fast_alpr_detector_model}",
         f"fast-alpr-ocr-model={settings.fast_alpr_ocr_model}",
-        f"tappas-workspace={path_diagnostic(settings.tappas_workspace)}",
-        f"tappas-venv={path_diagnostic(tappas_venv)}",
+        f"hailo-apps-workspace={path_diagnostic(settings.hailo_apps_workspace)}",
+        f"hailo-apps-resources={path_diagnostic(settings.hailo_apps_resources)}",
+        f"hailo-apps-python={path_diagnostic(settings.hailo_apps_python)}",
     ]
     for name, path in resources:
         lines.append(f"resource[{name}]={path_diagnostic(path)}")

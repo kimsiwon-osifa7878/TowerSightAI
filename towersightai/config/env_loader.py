@@ -8,7 +8,6 @@ from typing import Mapping
 from towersightai.config.settings import CameraRole, Settings
 
 REQUIRED_SETTINGS_KEYS = (
-    "TAPPAS_WORKSPACE",
     "HAILO_HEF_PATH",
     "HAILO_POSTPROCESS_SO",
     "CALIBRATION_PATH",
@@ -80,57 +79,58 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
     if missing:
         raise ValueError(f"Missing required settings: {', '.join(missing)}")
 
-    hailo_model_dir = values.get("HAILO_MODEL_DIR", "models/hailo")
+    hailo_apps_workspace = values.get("HAILO_APPS_WORKSPACE", "~/hailo-apps")
+    hailo_apps_resources = values.get("HAILO_APPS_RESOURCES", f"{hailo_apps_workspace}/resources")
+    hailo_arch = values.get("HAILO_ARCH", "hailo8")
+    hailo_model_dir = values.get("HAILO_MODEL_DIR", f"{hailo_apps_resources}/models/{hailo_arch}")
     return Settings(
         app_env=values.get("APP_ENV", "development"),
         log_level=values.get("LOG_LEVEL", "INFO"),
-        tappas_workspace=_expand_config_path(values["TAPPAS_WORKSPACE"], values),
+        tappas_workspace=_expand_config_path(values.get("TAPPAS_WORKSPACE", hailo_apps_workspace), values),
+        hailo_apps_workspace=_expand_config_path(hailo_apps_workspace, values),
+        hailo_apps_resources=_expand_config_path(hailo_apps_resources, values),
+        hailo_apps_python=_expand_config_path(
+            values.get("HAILO_APPS_PYTHON", f"{hailo_apps_workspace}/venv_hailo_apps/bin/python"),
+            values,
+        ),
+        hailo_arch=hailo_arch,
         hailo_model_dir=_expand_config_path(hailo_model_dir, values),
         hailo_hef_path=_expand_config_path(values["HAILO_HEF_PATH"], values),
         hailo_postprocess_so=_expand_config_path(values["HAILO_POSTPROCESS_SO"], values),
         hailo_vehicle_detection_hef_path=_expand_config_path(
-            values.get("HAILO_VEHICLE_DETECTION_HEF_PATH", f"{hailo_model_dir}/vehicle_detection/yolov5m_vehicles.hef"),
+            values.get("HAILO_VEHICLE_DETECTION_HEF_PATH", values["HAILO_HEF_PATH"]),
             values,
         ),
         hailo_vehicle_detection_config_path=_expand_config_path(
-            values.get(
-                "HAILO_VEHICLE_DETECTION_CONFIG_PATH",
-                f"{hailo_model_dir}/vehicle_detection/configs/yolov5_vehicle_detection.json",
-            ),
+            values.get("HAILO_VEHICLE_DETECTION_CONFIG_PATH", ""),
             values,
         ),
         hailo_vehicle_detection_postprocess_so=_expand_config_path(
             values.get(
                 "HAILO_VEHICLE_DETECTION_POSTPROCESS_SO",
-                f"{hailo_model_dir}/postprocess/libyolo_hailortpp_post.so",
+                values["HAILO_POSTPROCESS_SO"],
             ),
             values,
         ),
         hailo_person_presence_hef_path=_expand_config_path(
-            values.get("HAILO_PERSON_PRESENCE_HEF_PATH", f"{hailo_model_dir}/person_presence/yolov5s_personface_reid.hef"),
+            values.get("HAILO_PERSON_PRESENCE_HEF_PATH", values["HAILO_HEF_PATH"]),
             values,
         ),
         hailo_person_presence_config_path=_expand_config_path(
-            values.get(
-                "HAILO_PERSON_PRESENCE_CONFIG_PATH",
-                f"{hailo_model_dir}/person_presence/configs/yolov5_personface.json",
-            ),
+            values.get("HAILO_PERSON_PRESENCE_CONFIG_PATH", ""),
             values,
         ),
         hailo_person_presence_postprocess_so=_expand_config_path(
-            values.get("HAILO_PERSON_PRESENCE_POSTPROCESS_SO", f"{hailo_model_dir}/postprocess/libyolo_post.so"),
+            values.get("HAILO_PERSON_PRESENCE_POSTPROCESS_SO", values["HAILO_POSTPROCESS_SO"]),
             values,
         ),
         hailo_person_presence_crop_so=_expand_config_path(
-            values.get(
-                "HAILO_PERSON_PRESENCE_CROP_SO",
-                f"{hailo_model_dir}/postprocess/cropping_algorithms/libwhole_buffer.so",
-            ),
+            values.get("HAILO_PERSON_PRESENCE_CROP_SO", ""),
             values,
         ),
         fast_alpr_detector_model=values.get("FAST_ALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end"),
         fast_alpr_ocr_model=values.get("FAST_ALPR_OCR_MODEL", "cct-xs-v2-global-model"),
-        hailo_network_name=values.get("HAILO_NETWORK_NAME", "yolov5"),
+        hailo_network_name=values.get("HAILO_NETWORK_NAME", "filter_letterbox"),
         camera_1=_camera_dict(values, 1),
         camera_2=_camera_dict(values, 2),
         camera_3=_camera_dict(values, 3),
@@ -226,7 +226,13 @@ def _expand_mapping_variables(value: str, values: Mapping[str, str]) -> str:
         name = braced_name or plain_name
         return values.get(name, match.group(0))
 
-    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, value)
+    expanded = value
+    for _ in range(10):
+        next_value = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, expanded)
+        if next_value == expanded:
+            return expanded
+        expanded = next_value
+    return expanded
 
 
 def _redact_rtsp(rtsp_url: str) -> str:

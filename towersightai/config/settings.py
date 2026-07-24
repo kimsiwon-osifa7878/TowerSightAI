@@ -72,21 +72,32 @@ class Settings:
     plc_endpoint: str
     app_env: str = "development"
     log_level: str = "INFO"
-    hailo_model_dir: Path = Path("models/hailo")
-    hailo_vehicle_detection_hef_path: Path = Path("models/hailo/vehicle_detection/yolov5m_vehicles.hef")
-    hailo_vehicle_detection_config_path: Path = Path("models/hailo/vehicle_detection/configs/yolov5_vehicle_detection.json")
-    hailo_vehicle_detection_postprocess_so: Path = Path("models/hailo/postprocess/libyolo_hailortpp_post.so")
-    hailo_person_presence_hef_path: Path = Path("models/hailo/person_presence/yolov5s_personface_reid.hef")
-    hailo_person_presence_config_path: Path = Path("models/hailo/person_presence/configs/yolov5_personface.json")
-    hailo_person_presence_postprocess_so: Path = Path("models/hailo/postprocess/libyolo_post.so")
-    hailo_person_presence_crop_so: Path = Path("models/hailo/postprocess/cropping_algorithms/libwhole_buffer.so")
+    hailo_apps_workspace: Path = Path("~/hailo-apps")
+    hailo_apps_resources: Path = Path("~/hailo-apps/resources")
+    hailo_apps_python: Path = Path("~/hailo-apps/venv_hailo_apps/bin/python")
+    hailo_arch: str = "hailo8"
+    hailo_model_dir: Path = Path("~/hailo-apps/resources/models/hailo8")
+    hailo_vehicle_detection_hef_path: Path = Path("~/hailo-apps/resources/models/hailo8/yolov8m.hef")
+    hailo_vehicle_detection_config_path: Path = Path("")
+    hailo_vehicle_detection_postprocess_so: Path = Path(
+        "~/hailo-apps/resources/so/libyolo_hailortpp_postprocess.so"
+    )
+    hailo_person_presence_hef_path: Path = Path("~/hailo-apps/resources/models/hailo8/yolov8m.hef")
+    hailo_person_presence_config_path: Path = Path("")
+    hailo_person_presence_postprocess_so: Path = Path(
+        "~/hailo-apps/resources/so/libyolo_hailortpp_postprocess.so"
+    )
+    hailo_person_presence_crop_so: Path = Path("")
     fast_alpr_detector_model: str = "yolo-v9-t-384-license-plate-end2end"
     fast_alpr_ocr_model: str = "cct-xs-v2-global-model"
-    hailo_network_name: str = "yolov5"
+    hailo_network_name: str = "filter_letterbox"
     ui_fullscreen: bool = True
     ui_camera_resolution: CameraResolution | tuple[int, int] | str = CameraResolution()
 
     def __post_init__(self) -> None:
+        self.hailo_apps_workspace = self.hailo_apps_workspace.expanduser()
+        self.hailo_apps_resources = self.hailo_apps_resources.expanduser()
+        self.hailo_apps_python = self.hailo_apps_python.expanduser()
         self.camera_1 = self._as_camera(self.camera_1)
         self.camera_2 = self._as_camera(self.camera_2)
         self.camera_3 = self._as_camera(self.camera_3)
@@ -114,6 +125,8 @@ class Settings:
         return [self.camera_1, self.camera_2, self.camera_3, self.camera_4]
 
     def _validate_safety_constraints(self) -> None:
+        if self.hailo_arch not in {"hailo8", "hailo8l"}:
+            raise ValueError("HAILO_ARCH must be hailo8 or hailo8l.")
         ids = [cam.id for cam in self.cameras]
         if len(set(ids)) != 4:
             raise ValueError("Camera IDs must be unique.")

@@ -31,12 +31,14 @@ def main(argv: list[str] | None = None) -> int:
         show_fps=args.show_fps,
         min_confidence=args.min_confidence,
         gst_launch=args.gst_launch,
+        event_path=event_path,
+        camera_id=args.camera_id,
     )
     print("[HAILO IMAGE SMOKE]")
     print(f"IMAGE: {args.image}")
     print(f"EVENTS: {event_path}")
     print(f"OUTPUT_IMAGE: {output_image if output_image is not None else 'disabled'}")
-    print(f"GST_COMMAND: {redacted_command(command)}")
+    print(f"HAILO_APPS_COMMAND: {redacted_command(command)}")
     print("Runtime OK signal: BLOCKED")
     print("Reason: this command is hardware validation only and never authorizes PLC OK.")
 
@@ -96,15 +98,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", type=Path, required=True, help="Sample image path to run through Hailo.")
     parser.add_argument("--camera-id", default="sample_image", help="Camera/event ID to attach to sample detections.")
     parser.add_argument("--event-path", type=Path, default=Path("artifacts/hailo/sample-detections.jsonl"))
-    parser.add_argument("--output-image", type=Path, default=DEFAULT_OUTPUT_IMAGE, help="Annotated PNG written by hailooverlay.")
-    parser.add_argument("--no-output-image", action="store_true", help="Use fakesink instead of writing an annotated image.")
-    parser.add_argument("--display", action="store_true", help="Display the overlaid frame instead of writing a PNG.")
-    parser.add_argument("--show-fps", action="store_true", help="Show fpsdisplaysink text in display mode.")
+    parser.add_argument("--output-image", type=Path, default=DEFAULT_OUTPUT_IMAGE, help="Legacy option; current adapter is headless.")
+    parser.add_argument("--no-output-image", action="store_true", help="Retained for command compatibility.")
+    parser.add_argument("--display", action="store_true", help="Legacy option; current adapter is headless.")
+    parser.add_argument("--show-fps", action="store_true", help="Legacy option; current adapter is headless.")
     parser.add_argument("--min-confidence", type=float, default=0.3, help="Minimum confidence for normalized events.")
     parser.add_argument("--timeout", type=int, default=30, help="Pipeline timeout in seconds.")
-    parser.add_argument("--gst-launch", default="gst-launch-1.0", help="GStreamer launcher executable.")
+    parser.add_argument("--gst-launch", default="gst-launch-1.0", help="Legacy option; Hailo Apps Python is used.")
     parser.add_argument("--check-installation", action="store_true", help="Run Hailo installation checks before smoke execution.")
-    parser.add_argument("--run", action="store_true", help="Actually run gst-launch. Otherwise only print the command.")
+    parser.add_argument("--run", action="store_true", help="Actually run the Hailo Apps adapter. Otherwise only print the command.")
     parser.add_argument(
         "--allow-without-opt-in",
         action="store_true",

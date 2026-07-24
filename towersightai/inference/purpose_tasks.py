@@ -19,6 +19,12 @@ from typing import Any, Callable, Iterable
 from towersightai.camera.pipeline import display_orientation_element
 from towersightai.config.settings import CameraConfig, Settings
 from towersightai.inference.events import DetectionEvent
+from towersightai.inference.hailo_apps_runtime import (
+    PERSON_LABELS,
+    VEHICLE_LABELS,
+    hailo_apps_detection_command,
+    hailo_apps_runtime_env,
+)
 from towersightai.inference.image_smoke import NETWORK_FORMAT, NETWORK_HEIGHT, NETWORK_WIDTH, _gst_runtime_env
 from towersightai.inference.live_detection import _read_log_tail, latest_events, parse_detection_json
 from towersightai.runtime_logging import (
@@ -40,6 +46,8 @@ FATAL_GSTREAMER_PATTERNS = (
     "Caught SIGSEGV",
     "CHECK_SUCCESS failed",
     "CHECK_EXPECTED failed",
+    "HAILO_HEF_NOT_SUPPORTED",
+    'no element "hailo',
     "파이프라인이 재생을 원하지 않음",
     "파이프라인이 PREROLL하기를 원하지 않음",
     "Internal data stream error",
@@ -93,7 +101,7 @@ PURPOSE_TASK_SPECS = {
     PURPOSE_VEHICLE_DETECTION: PurposeTaskSpec(
         PURPOSE_VEHICLE_DETECTION,
         "차량 전용 검출",
-        "front 카메라에서 Hailo LPR 예제의 yolov5m_vehicles 모델을 사용합니다.",
+        "front 카메라에서 Hailo Apps 검출 모델을 실행하고 차량 라벨만 사용합니다.",
     ),
     PURPOSE_LPR_IMAGE: PurposeTaskSpec(
         PURPOSE_LPR_IMAGE,
@@ -103,7 +111,7 @@ PURPOSE_TASK_SPECS = {
     PURPOSE_PERSON_PRESENCE: PurposeTaskSpec(
         PURPOSE_PERSON_PRESENCE,
         "사람 존재 감지",
-        "정상 수신 중인 카메라에서 TAPPAS person detector로 사람 존재 여부를 판단합니다.",
+        "정상 수신 중인 카메라에서 Hailo Apps 검출 모델의 person 라벨을 판단합니다.",
     ),
 }
 
@@ -430,51 +438,31 @@ def vehicle_detection_process(
     gst_launch: str = "gst-launch-1.0",
 ) -> PurposeInferenceProcess:
     hef_path = settings.hailo_vehicle_detection_hef_path
-    config_path = settings.hailo_vehicle_detection_config_path
     postprocess_so = settings.hailo_vehicle_detection_postprocess_so
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "vehicle.jsonl"
     log_path = event_dir / "vehicle.gst.log"
-    callback_module = _write_vehicle_callback_module(
-        event_dir=event_dir,
-        camera_id=camera.id,
+    command = hailo_apps_detection_command(
+        settings,
+        (camera,),
         event_path=event_path,
+        hef_path=hef_path,
+        postprocess_so=postprocess_so,
         min_confidence=min_confidence,
+        allowed_labels=VEHICLE_LABELS,
+        camera_rotations={
+            camera.id: camera.rotation_degrees if rotation_degrees is None else rotation_degrees,
+        },
     )
-    rotation = camera.rotation_degrees if rotation_degrees is None else rotation_degrees
-    orientation = display_orientation_element(rotation)
-    pipeline = " ".join(
-        (
-            f"rtspsrc location={camera.rtsp_url} latency={latency_ms} protocols=tcp drop-on-latency=true",
-            "! rtph264depay",
-            "! h264parse",
-            "! decodebin",
-            "! queue name=vehicle_decode_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! {orientation}" if orientation else "",
-            "! videoscale n-threads=2",
-            "! video/x-raw,pixel-aspect-ratio=1/1",
-            "! videoconvert n-threads=3",
-            "! queue name=vehicle_hailonet_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={hef_path.as_posix()} batch-size=1 nms-score-threshold={min_confidence} "
-            "nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32",
-            "! queue name=vehicle_hailofilter_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={postprocess_so.as_posix()} "
-            f"config-path={config_path.as_posix()} function-name=yolov5m_vehicles qos=false",
-            "! queue name=vehicle_callback_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailopython module={callback_module} qos=false",
-            "! queue name=vehicle_sink_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            "! fakesink sync=false",
-        )
-    )
-    env = _gst_runtime_env(settings)
+    env = hailo_apps_runtime_env(settings)
     return PurposeInferenceProcess(
         task_id=PURPOSE_VEHICLE_DETECTION,
         label=PURPOSE_TASK_SPECS[PURPOSE_VEHICLE_DETECTION].label,
-        command=(gst_launch, "-q", *shlex.split(pipeline)),
+        command=command,
         env=env,
         log_path=log_path,
         event_path=event_path,
-        model_paths=(hef_path, config_path, postprocess_so),
+        model_paths=(hef_path, postprocess_so),
         camera_ids=(camera.id,),
         run_id=new_run_id(PURPOSE_VEHICLE_DETECTION),
         status_path=event_dir / "run-status.json",
@@ -551,69 +539,29 @@ def person_presence_process(
     if not cameras:
         raise ValueError("At least one camera is required for person presence detection.")
     hef_path = settings.hailo_person_presence_hef_path
-    config_path = settings.hailo_person_presence_config_path
     postprocess_so = settings.hailo_person_presence_postprocess_so
-    crop_so = settings.hailo_person_presence_crop_so
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "person_presence.jsonl"
     log_path = event_dir / "person_presence.gst.log"
-    callback_modules = {
-        camera.id: _write_person_presence_callback_module(
-            event_dir=event_dir,
-            camera_id=camera.id,
-            event_path=event_path,
-            min_confidence=min_confidence,
-        )
-        for camera in cameras
-    }
-    source_branches = " ".join(
-        _person_presence_source_branch(
-            camera,
-            index=index,
-            callback_module=callback_modules[camera.id],
-            latency_ms=latency_ms,
-            rotation_degrees=(camera_rotations or {}).get(camera.id, camera.rotation_degrees),
-        )
-        for index, camera in enumerate(cameras)
+    command = hailo_apps_detection_command(
+        settings,
+        cameras,
+        event_path=event_path,
+        hef_path=hef_path,
+        postprocess_so=postprocess_so,
+        min_confidence=min_confidence,
+        allowed_labels=PERSON_LABELS,
+        camera_rotations=camera_rotations,
     )
-    streamrouter_inputs = " ".join(f'src_{index}::input-streams="<sink_{index}>"' for index, _camera in enumerate(cameras))
-    pipeline = " ".join(
-        (
-            "hailoroundrobin mode=0 name=fun",
-            "! queue name=person_pre_convert_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            "! videoconvert n-threads=1 qos=false",
-            f"! {PERSON_PRESENCE_NETWORK_CAPS}",
-            "! queue name=person_pre_cropper_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailocropper so-path={crop_so.as_posix()} "
-            "function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true name=cropper1",
-            "hailoaggregator name=agg1",
-            "cropper1.",
-            "! queue name=person_detector_bypass_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            "! agg1.",
-            "cropper1.",
-            "! queue name=person_detector_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={hef_path.as_posix()} scheduling-algorithm=1 "
-            "vdevice-group-id=1 force-writable=true",
-            "! queue name=person_detector_post_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={postprocess_so.as_posix()} "
-            f"config-path={config_path.as_posix()} function-name=yolov5_personface_letterbox qos=false",
-            "! queue name=person_detector_to_agg_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            "! agg1.",
-            "agg1.",
-            "! queue name=person_router_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailostreamrouter name=sid {streamrouter_inputs}",
-            source_branches,
-        )
-    )
-    env = _gst_runtime_env(settings)
+    env = hailo_apps_runtime_env(settings)
     return PurposeInferenceProcess(
         task_id=PURPOSE_PERSON_PRESENCE,
         label=PURPOSE_TASK_SPECS[PURPOSE_PERSON_PRESENCE].label,
-        command=(gst_launch, "-q", *shlex.split(pipeline)),
+        command=command,
         env=env,
         log_path=log_path,
         event_path=event_path,
-        model_paths=(hef_path, config_path, postprocess_so, crop_so),
+        model_paths=(hef_path, postprocess_so),
         camera_ids=tuple(camera.id for camera in cameras),
         run_id=new_run_id(PURPOSE_PERSON_PRESENCE),
         status_path=event_dir / "run-status.json",

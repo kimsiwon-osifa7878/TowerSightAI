@@ -18,6 +18,7 @@ from typing import Callable, Iterable
 from towersightai.camera.pipeline import display_orientation_element
 from towersightai.config.settings import CameraConfig, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
+from towersightai.inference.hailo_apps_runtime import hailo_apps_detection_command, hailo_apps_runtime_env
 from towersightai.inference.image_smoke import HAILO_CALLBACK_MODULE, NETWORK_FORMAT, NETWORK_HEIGHT, NETWORK_WIDTH, _gst_runtime_env
 from towersightai.runtime_logging import (
     missing_resource_paths,
@@ -35,6 +36,8 @@ FATAL_GSTREAMER_PATTERNS = (
     "Caught SIGSEGV",
     "CHECK_SUCCESS failed",
     "CHECK_EXPECTED failed",
+    "HAILO_HEF_NOT_SUPPORTED",
+    'no element "hailo',
     "파이프라인이 재생을 원하지 않음",
     "파이프라인이 PREROLL하기를 원하지 않음",
     "Internal data stream error",
@@ -175,24 +178,20 @@ def live_detection_process(
 ) -> LiveDetectionProcess:
     event_path = event_dir / f"{camera.id}.jsonl"
     effective_hef_path = Path(hef_path or settings.hailo_hef_path)
-    pipeline = build_live_detection_pipeline(
+    command = hailo_apps_detection_command(
         settings,
-        camera,
-        latency_ms=latency_ms,
-        min_confidence=min_confidence,
-        rotation_degrees=rotation_degrees,
+        (camera,),
+        event_path=event_path,
         hef_path=effective_hef_path,
+        postprocess_so=settings.hailo_postprocess_so,
+        min_confidence=min_confidence,
+        camera_rotations={
+            camera.id: camera.rotation_degrees if rotation_degrees is None else rotation_degrees,
+        },
     )
-    env = _gst_runtime_env(settings)
-    env.update(
-        {
-            "TOWERSIGHTAI_HAILO_CAMERA_ID": camera.id,
-            "TOWERSIGHTAI_HAILO_EVENT_PATH": str(event_path),
-            "TOWERSIGHTAI_HAILO_MIN_CONFIDENCE": str(min_confidence),
-        }
-    )
+    env = hailo_apps_runtime_env(settings)
     return LiveDetectionProcess(
-        command=(gst_launch, "-q", *shlex.split(pipeline)),
+        command=command,
         event_path=event_path,
         env=env,
         hef_path=effective_hef_path,
@@ -220,33 +219,18 @@ def live_multistream_detection_process(
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "multistream.jsonl"
     effective_hef_path = Path(hef_path or settings.hailo_hef_path)
-    callback_modules = {
-        camera.id: _write_multistream_callback_module(
-            event_dir=event_dir,
-            camera_id=camera.id,
-            event_path=event_path,
-            min_confidence=min_confidence,
-        )
-        for camera in cameras
-    }
-    pipeline = build_live_multistream_detection_pipeline(
+    command = hailo_apps_detection_command(
         settings,
         cameras,
-        callback_modules=callback_modules,
-        latency_ms=latency_ms,
+        event_path=event_path,
+        hef_path=effective_hef_path,
+        postprocess_so=settings.hailo_postprocess_so,
         min_confidence=min_confidence,
         camera_rotations=camera_rotations,
-        hef_path=effective_hef_path,
     )
-    env = _gst_runtime_env(settings)
-    env.update(
-        {
-            "TOWERSIGHTAI_HAILO_EVENT_PATH": str(event_path),
-            "TOWERSIGHTAI_HAILO_MIN_CONFIDENCE": str(min_confidence),
-        }
-    )
+    env = hailo_apps_runtime_env(settings)
     return LiveDetectionProcess(
-        command=(gst_launch, "-q", *shlex.split(pipeline)),
+        command=command,
         event_path=event_path,
         env=env,
         hef_path=effective_hef_path,
@@ -420,7 +404,7 @@ class LiveDetectionRunner:
             try:
                 self._process = subprocess.Popen(
                     self.process.command,
-                    stdout=subprocess.DEVNULL,
+                    stdout=stderr_target,
                     stderr=stderr_target,
                     text=True,
                     env=self.process.env,
