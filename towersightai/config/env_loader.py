@@ -84,6 +84,7 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
         app_env=values.get("APP_ENV", "development"),
         log_level=values.get("LOG_LEVEL", "INFO"),
         tappas_workspace=_expand_config_path(values["TAPPAS_WORKSPACE"], values),
+        hailo_model_dir=_expand_config_path(values.get("HAILO_MODEL_DIR", "models/hailo"), values),
         hailo_hef_path=_expand_config_path(values["HAILO_HEF_PATH"], values),
         hailo_postprocess_so=_expand_config_path(values["HAILO_POSTPROCESS_SO"], values),
         hailo_network_name=values.get("HAILO_NETWORK_NAME", "yolov5"),

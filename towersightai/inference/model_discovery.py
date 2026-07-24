@@ -20,6 +20,6 @@ def discover_hailo_hef_models(settings: Settings) -> tuple[Path, ...]:
 
 def _hef_search_dirs(settings: Settings) -> tuple[Path, ...]:
     return (
+        Path(settings.hailo_model_dir),
         Path(settings.hailo_hef_path).parent,
-        Path(settings.tappas_workspace) / "apps" / "h8" / "gstreamer" / "resources" / "hef",
     )

@@ -203,6 +203,7 @@ def vehicle_detection_process(
     gst_launch: str = "gst-launch-1.0",
 ) -> PurposeInferenceProcess:
     resources = _lpr_resources(settings)
+    postprocess = settings.hailo_model_dir / "postprocess"
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "vehicle.jsonl"
     log_path = event_dir / "vehicle.gst.log"
@@ -226,11 +227,11 @@ def vehicle_detection_process(
             "! video/x-raw,pixel-aspect-ratio=1/1",
             "! videoconvert n-threads=3",
             "! queue name=vehicle_hailonet_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={resources / 'yolov5m_vehicles.hef'} batch-size=1 nms-score-threshold={min_confidence} "
+            f"! hailonet hef-path={(resources / 'yolov5m_vehicles.hef').as_posix()} batch-size=1 nms-score-threshold={min_confidence} "
             "nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32",
             "! queue name=vehicle_hailofilter_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/libyolo_hailortpp_post.so'} "
-            f"config-path={resources / 'configs/yolov5_vehicle_detection.json'} function-name=yolov5m_vehicles qos=false",
+            f"! hailofilter so-path={(postprocess / 'libyolo_hailortpp_post.so').as_posix()} "
+            f"config-path={(resources / 'configs/yolov5_vehicle_detection.json').as_posix()} function-name=yolov5m_vehicles qos=false",
             "! queue name=vehicle_callback_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
             f"! hailopython module={callback_module} qos=false",
             "! queue name=vehicle_sink_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
@@ -369,6 +370,7 @@ def person_presence_process(
     if not cameras:
         raise ValueError("At least one camera is required for person presence detection.")
     resources = _person_presence_resources(settings)
+    postprocess = settings.hailo_model_dir / "postprocess"
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "person_presence.jsonl"
     log_path = event_dir / "person_presence.gst.log"
@@ -399,7 +401,7 @@ def person_presence_process(
             "! videoconvert n-threads=1 qos=false",
             f"! {PERSON_PRESENCE_NETWORK_CAPS}",
             "! queue name=person_pre_cropper_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailocropper so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/cropping_algorithms/libwhole_buffer.so'} "
+            f"! hailocropper so-path={(postprocess / 'cropping_algorithms/libwhole_buffer.so').as_posix()} "
             "function-name=create_crops use-letterbox=true resize-method=inter-area internal-offset=true name=cropper1",
             "hailoaggregator name=agg1",
             "cropper1.",
@@ -407,11 +409,11 @@ def person_presence_process(
             "! agg1.",
             "cropper1.",
             "! queue name=person_detector_q leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0",
-            f"! hailonet hef-path={resources / 'yolov5s_personface_reid.hef'} scheduling-algorithm=1 "
+            f"! hailonet hef-path={(resources / 'yolov5s_personface_reid.hef').as_posix()} scheduling-algorithm=1 "
             "vdevice-group-id=1 force-writable=true",
             "! queue name=person_detector_post_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
-            f"! hailofilter so-path={settings.tappas_workspace / 'apps/h8/gstreamer/libs/post_processes/libyolo_post.so'} "
-            f"config-path={resources / 'configs/yolov5_personface.json'} function-name=yolov5_personface_letterbox qos=false",
+            f"! hailofilter so-path={(postprocess / 'libyolo_post.so').as_posix()} "
+            f"config-path={(resources / 'configs/yolov5_personface.json').as_posix()} function-name=yolov5_personface_letterbox qos=false",
             "! queue name=person_detector_to_agg_q leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0",
             "! agg1.",
             "agg1.",
@@ -505,11 +507,11 @@ def _person_presence_source_branch(
 
 
 def _lpr_resources(settings: Settings) -> Path:
-    return settings.tappas_workspace / "apps/h8/gstreamer/general/license_plate_recognition/resources"
+    return settings.hailo_model_dir / "vehicle_detection"
 
 
 def _person_presence_resources(settings: Settings) -> Path:
-    return settings.tappas_workspace / "apps/h8/gstreamer/general/multi_person_multi_camera_tracking/resources"
+    return settings.hailo_model_dir / "person_presence"
 
 
 def _write_person_presence_callback_module(
