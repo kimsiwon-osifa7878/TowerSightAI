@@ -67,76 +67,13 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[ui]" pytest
 ```
 
-On the Ubuntu/Hailo target, install HailoRT, TAPPAS Core, and the Hailo GStreamer plugins through the official Hailo Apps installer. TowerSightAI uses `hailonet`, `hailofilter`, `hailoroundrobin`, and `hailostreamrouter`; it does not require the legacy `hailopython` element.
+On the Ubuntu/Hailo target, do not install the Developer Zone's unconditional `Latest` runtime. TowerSightAI targets Hailo-8 and uses the officially compatible **HailoRT 4.23.0 + TAPPAS Core 5.1.0** stack. HailoRT 5.x combinations are for Hailo-10H.
 
-## Hailo Models And Resources
+For a fresh Ubuntu 24.04 installation, follow the guide below from Developer Zone account setup and package selection through selective `yolov8m` download, postprocess compilation, FastALPR preparation, and real Hailo inference verification:
 
-### Supported Hailo Stack And Resource Layout
+- [Hailo-8 Ubuntu 설치 가이드](docs/hailo8-ubuntu-installation.md)
 
-TowerSightAI follows the current [official Hailo Apps repository](https://github.com/hailo-ai/hailo-apps). The default checkout is `~/hailo-apps`. Its post-install step normally creates `~/hailo-apps/resources` as a link to the canonical `/usr/local/hailo/resources` tree and creates `~/hailo-apps/venv_hailo_apps`.
-
-For Hailo-8, Hailo Apps currently selects `yolov8m` as its default detection model. TowerSightAI uses that compatible detector for all Hailo buttons:
-
-| Function | Model and result selection |
-|---|---|
-| Previous/general AI | `yolov8m.hef`, all detected COCO classes |
-| Vehicle detection | configured Hailo Apps detection HEF, filtered to `car`, `truck`, `bus`, and `motorcycle` |
-| Person presence | configured Hailo Apps detection HEF, filtered to `person` |
-
-The old TAPPAS example files `yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`, their JSON files, `libyolo_post.so`, and `libwhole_buffer.so` are no longer required. They must not be mixed with a newer HailoRT installation.
-
-The default required files are:
-
-| Resource | Default path |
-|---|---|
-| Hailo Apps Python | `${HAILO_APPS_WORKSPACE}/venv_hailo_apps/bin/python` |
-| Hailo-8 detector | `${HAILO_APPS_RESOURCES}/models/hailo8/yolov8m.hef` |
-| YOLO postprocess | `${HAILO_APPS_RESOURCES}/so/libyolo_hailortpp_postprocess.so` |
-| Stream-ID helper | `libstream_id_tool.so` from `TAPPAS_POSTPROC_PATH` or below `${HAILO_APPS_RESOURCES}` |
-
-The adapter uses the current Hailo Apps buffer callback API and writes TowerSightAI JSONL events itself. It does not launch a `gst-launch-1.0 ... hailopython` pipeline.
-
-### Install Or Download The Resources
-
-Preferred installation on the Hailo computer:
-
-1. Install the Hailo PCIe driver and a HailoRT/TAPPAS Core combination supported by the checked-out Hailo Apps version.
-2. Clone Hailo Apps into the deployment user's home and run its installer.
-3. Run the official post-install/resource downloader. The detection group downloads the matching HEF and shared objects instead of mixing files from an older TAPPAS release.
-
-```bash
-cd ~
-git clone https://github.com/hailo-ai/hailo-apps.git
-cd ~/hailo-apps
-./install.sh
-source setup_env.sh
-sudo hailo-post-install
-hailo-download-resources --group detection
-```
-
-Command names can change between Hailo Apps releases; use that checkout's installation guide if an installer reports a different command. If the target is offline, install/download on another computer with the same Hailo architecture and software versions, then transfer the complete Hailo Apps resource tree. Do not copy only one HEF or mix an old postprocess `.so` with a new HailoRT.
-
-Configure `.env` with the actual paths:
-
-```dotenv
-HAILO_APPS_WORKSPACE=~/hailo-apps
-HAILO_APPS_RESOURCES=${HAILO_APPS_WORKSPACE}/resources
-HAILO_APPS_PYTHON=${HAILO_APPS_WORKSPACE}/venv_hailo_apps/bin/python
-HAILO_ARCH=hailo8
-TAPPAS_WORKSPACE=${HAILO_APPS_WORKSPACE}
-HAILO_MODEL_DIR=${HAILO_APPS_RESOURCES}/models/${HAILO_ARCH}
-HAILO_HEF_PATH=${HAILO_MODEL_DIR}/yolov8m.hef
-HAILO_POSTPROCESS_SO=${HAILO_APPS_RESOURCES}/so/libyolo_hailortpp_postprocess.so
-HAILO_NETWORK_NAME=filter_letterbox
-HAILO_VEHICLE_DETECTION_HEF_PATH=${HAILO_HEF_PATH}
-HAILO_VEHICLE_DETECTION_POSTPROCESS_SO=${HAILO_POSTPROCESS_SO}
-HAILO_PERSON_PRESENCE_HEF_PATH=${HAILO_HEF_PATH}
-HAILO_PERSON_PRESENCE_POSTPROCESS_SO=${HAILO_POSTPROCESS_SO}
-FAST_ALPR_DETECTOR_MODEL=yolo-v9-t-384-license-plate-end2end
-FAST_ALPR_OCR_MODEL=cct-xs-v2-global-model
-```
-
-The vehicle and person HEF variables remain separate so a compatible alternative detector can be selected later. With the current official resource bundle, they intentionally point to the same `yolov8m.hef`; TowerSightAI applies different allowed-label filters.
+Runtime defaults are `~/hailo-apps`, Hailo-8 `yolov8m.hef`, and `libyolo_hailortpp_postprocess.so`. Vehicle detection filters the compatible COCO detector to vehicle labels, while person presence filters it to `person`. The legacy `hailopython`, purpose-specific YOLOv5 HEFs, JSON configs, and crop libraries are not active.
 
 ### FastALPR Models
 
@@ -145,55 +82,9 @@ The vehicle and person HEF variables remain separate so a compatible alternative
 - Detector: `yolo-v9-t-384-license-plate-end2end`
 - OCR: `cct-xs-v2-global-model`
 
-Installing this project with `python -m pip install -e ".[ui]"` installs `fast-alpr[onnx]`. `FAST_ALPR_DETECTOR_MODEL` and `FAST_ALPR_OCR_MODEL` select the two active FastALPR models. FastALPR prepares its ONNX models when it is first initialized, so the first `번호판 이미지 LPR` run may require internet access. On an offline deployment, initialize FastALPR once while online under the same deployment user and Python environment, then preserve that user's resulting model cache. This path is independent of Hailo Apps.
+Installing this project with `python -m pip install -e ".[ui]"` installs `fast-alpr[onnx]`. `FAST_ALPR_DETECTOR_MODEL` and `FAST_ALPR_OCR_MODEL` select the two active FastALPR models. The installation guide initializes FastALPR once while online so both ONNX models are downloaded to the deployment user's cache before the UI is used. This path is independent of Hailo Apps.
 
-### Verify The Installation
-
-Run these commands inside the TowerSightAI virtual environment on the Ubuntu/Hailo target:
-
-```bash
-source .venv/bin/activate
-export HAILO_APPS_WORKSPACE="$HOME/hailo-apps"
-export HAILO_APPS_RESOURCES="$HAILO_APPS_WORKSPACE/resources"
-
-hailortcli fw-control identify
-
-for element in hailonet hailofilter hailoroundrobin hailostreamrouter; do
-  gst-inspect-1.0 "$element" >/dev/null || {
-    echo "Missing GStreamer element: $element" >&2
-    exit 1
-  }
-done
-
-required_files=(
-  "$HAILO_APPS_WORKSPACE/venv_hailo_apps/bin/python"
-  "$HAILO_APPS_RESOURCES/models/hailo8/yolov8m.hef"
-  "$HAILO_APPS_RESOURCES/so/libyolo_hailortpp_postprocess.so"
-)
-
-for file in "${required_files[@]}"; do
-  test -f "$file" || {
-    echo "Missing Hailo resource: $file" >&2
-    exit 1
-  }
-done
-
-towersightai-check-settings --env .env --check-hailo
-```
-
-`towersightai-check-settings --check-hailo` checks the Hailo device, current required GStreamer elements, the Hailo Apps workspace/Python, and every active general, vehicle, and person HEF/postprocess path. It no longer treats `hailopython` or the legacy JSON/crop files as requirements.
-
-After the checks pass, run the hardware image smoke test:
-
-```bash
-RUN_HARDWARE_TESTS=1 towersightai-hailo-image-smoke \
-  --env .env \
-  --image data/samples/test-car.png \
-  --check-installation \
-  --run
-```
-
-These checks validate installation and inference wiring only. They never authorize PLC OK. If an AI button still fails, inspect:
+Installation and inference checks never authorize PLC OK. If an AI button fails after following the installation guide, inspect:
 
 - `artifacts/runtime/detections/` for previous/general AI detection.
 - `artifacts/runtime/purpose-ai/vehicle_detection/vehicle.gst.log` for vehicle-only detection.
