@@ -83,7 +83,9 @@ def _check_path(name: str, path: Path) -> HailoCheckItem:
 
 def _check_stream_id_helper(settings: Settings) -> HailoCheckItem:
     candidates = []
-    configured_dir = os.environ.get("TAPPAS_POSTPROC_PATH")
+    configured_dir = str(settings.tappas_postproc_path) if settings.tappas_postproc_path is not None else None
+    if not configured_dir:
+        configured_dir = os.environ.get("TAPPAS_POSTPROC_PATH")
     if not configured_dir:
         configured_dir = _dotenv_value(settings.hailo_apps_resources / ".env", "TAPPAS_POSTPROC_PATH")
     if configured_dir:

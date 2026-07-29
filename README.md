@@ -150,9 +150,17 @@ The UI displays the actual received frame size in each camera tile, so you can v
 
 ## Run The Operator UI
 
+Start the fullscreen operator console. The script uses the repository `.venv`
+and `.env` automatically:
+
 ```bash
-source .venv/bin/activate
-towersightai-operator-ui --env .env --windowed
+./run.sh
+```
+
+For a normal desktop window:
+
+```bash
+./run-window.sh
 ```
 
 The default entry screen is the operator dashboard.

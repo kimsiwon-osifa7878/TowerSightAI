@@ -58,7 +58,7 @@ def hailo_apps_runtime_env(settings: Settings) -> dict[str, str]:
     workspace = settings.hailo_apps_workspace.resolve(strict=False)
     resources = settings.hailo_apps_resources.resolve(strict=False)
     venv = settings.hailo_apps_python.parent.parent.resolve(strict=False)
-    project_root = Path.cwd().resolve(strict=False)
+    project_root = Path(__file__).resolve(strict=False).parents[2]
 
     python_path = [str(project_root), str(workspace)]
     if env.get("PYTHONPATH"):
@@ -67,6 +67,10 @@ def hailo_apps_runtime_env(settings: Settings) -> dict[str, str]:
     env["PATH"] = os.pathsep.join((str(settings.hailo_apps_python.parent), env.get("PATH", "")))
     env["VIRTUAL_ENV"] = str(venv)
     env["HAILO_ARCH"] = settings.hailo_arch
+    if settings.tappas_postproc_path is not None:
+        postproc_path = str(settings.tappas_postproc_path.resolve(strict=False))
+        env["TAPPAS_POSTPROC_PATH"] = postproc_path
+        env["tappas_postproc_path"] = postproc_path
 
     hailo_env = resources / ".env"
     if hailo_env.is_file():

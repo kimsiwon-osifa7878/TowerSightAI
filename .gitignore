@@ -3,9 +3,10 @@ __pycache__/
 .pytest_cache/
 .env
 .venv/
+.venv*/
 *.egg-info/
 tmp/
 gstshark_*/
 artifacts/
-hailort.log
+hailort*.log
 models/

@@ -93,6 +93,11 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
             values.get("HAILO_APPS_PYTHON", f"{hailo_apps_workspace}/venv_hailo_apps/bin/python"),
             values,
         ),
+        tappas_postproc_path=(
+            _expand_config_path(values["TAPPAS_POSTPROC_PATH"], values)
+            if values.get("TAPPAS_POSTPROC_PATH")
+            else None
+        ),
         hailo_arch=hailo_arch,
         hailo_model_dir=_expand_config_path(hailo_model_dir, values),
         hailo_hef_path=_expand_config_path(values["HAILO_HEF_PATH"], values),

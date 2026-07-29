@@ -23,7 +23,7 @@ def main() -> int:
 
     sys.path.insert(0, str(workspace))
     stream_id_so = _find_stream_id_so(resources)
-    os.environ["TAPPAS_POSTPROC_PATH"] = str(stream_id_so.parent)
+    _configure_tappas_postprocess(stream_id_so)
     os.environ["HAILO_ARCH"] = args.arch
 
     import hailo  # type: ignore[import-not-found]
@@ -96,8 +96,21 @@ def main() -> int:
     )
     user_data = app_callback_class()
     app = multisource_pipeline.GStreamerMultisourceApp(callback, user_data)
+    if _all_sources_are_files(cameras):
+        app.on_eos = app.shutdown
     app.run()
     return 0
+
+
+def _all_sources_are_files(cameras: tuple[tuple[str, str], ...]) -> bool:
+    return bool(cameras) and all(Path(url).expanduser().is_file() for _camera_id, url in cameras)
+
+
+def _configure_tappas_postprocess(stream_id_so: Path) -> None:
+    postprocess_dir = str(stream_id_so.parent)
+    os.environ["TAPPAS_POSTPROC_PATH"] = postprocess_dir
+    # Hailo Apps 26.03.1 reads the lower-case key from its defines module.
+    os.environ["tappas_postproc_path"] = postprocess_dir
 
 
 def _parse_args() -> argparse.Namespace:

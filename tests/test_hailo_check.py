@@ -5,6 +5,12 @@ from towersightai.inference.hailo_check import check_hailo_installation
 
 
 def _settings(tmp_path: Path) -> Settings:
+    workspace = tmp_path / "hailo-apps"
+    resources = tmp_path / "resources"
+    python = workspace / "venv_hailo_apps" / "bin" / "python"
+    resources.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
     hef = tmp_path / "model.hef"
     so = tmp_path / "post.so"
     vehicle_hef = tmp_path / "vehicle.hef"
@@ -13,10 +19,17 @@ def _settings(tmp_path: Path) -> Settings:
     person_config = tmp_path / "person.json"
     person_so = tmp_path / "person.so"
     crop_so = tmp_path / "crop.so"
+    postproc_dir = tmp_path / "post_processes"
+    postproc_dir.mkdir()
+    (postproc_dir / "libstream_id_tool.so").write_text("resource", encoding="utf-8")
     for path in (hef, so, vehicle_hef, vehicle_config, person_hef, person_config, person_so, crop_so):
         path.write_text("resource", encoding="utf-8")
     return Settings(
         tappas_workspace=tmp_path,
+        tappas_postproc_path=postproc_dir,
+        hailo_apps_workspace=workspace,
+        hailo_apps_resources=resources,
+        hailo_apps_python=python,
         hailo_hef_path=hef,
         hailo_postprocess_so=so,
         hailo_vehicle_detection_hef_path=vehicle_hef,

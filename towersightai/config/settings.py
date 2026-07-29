@@ -75,6 +75,7 @@ class Settings:
     hailo_apps_workspace: Path = Path("~/hailo-apps")
     hailo_apps_resources: Path = Path("~/hailo-apps/resources")
     hailo_apps_python: Path = Path("~/hailo-apps/venv_hailo_apps/bin/python")
+    tappas_postproc_path: Path | None = None
     hailo_arch: str = "hailo8"
     hailo_model_dir: Path = Path("~/hailo-apps/resources/models/hailo8")
     hailo_vehicle_detection_hef_path: Path = Path("~/hailo-apps/resources/models/hailo8/yolov8m.hef")
@@ -98,6 +99,8 @@ class Settings:
         self.hailo_apps_workspace = self.hailo_apps_workspace.expanduser()
         self.hailo_apps_resources = self.hailo_apps_resources.expanduser()
         self.hailo_apps_python = self.hailo_apps_python.expanduser()
+        if self.tappas_postproc_path is not None:
+            self.tappas_postproc_path = self.tappas_postproc_path.expanduser()
         self.camera_1 = self._as_camera(self.camera_1)
         self.camera_2 = self._as_camera(self.camera_2)
         self.camera_3 = self._as_camera(self.camera_3)

@@ -20,6 +20,7 @@ CAMERA_4_ROTATION_DEGREES=0
 APP_ENV=development
 LOG_LEVEL=DEBUG
 TAPPAS_WORKSPACE=/opt/hailo/tappas
+TAPPAS_POSTPROC_PATH=/usr/lib/hailo/tappas/post_processes
 HAILO_MODEL_DIR=models/hailo
 HAILO_HEF_PATH=${{HAILO_MODEL_DIR}}/general/model.hef
 HAILO_POSTPROCESS_SO=${{HAILO_MODEL_DIR}}/postprocess/post.so
@@ -73,6 +74,7 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
     assert settings.ui_camera_resolution.width == 1024
     assert settings.ui_camera_resolution.height == 576
     assert settings.hailo_model_dir == Path("models/hailo")
+    assert settings.tappas_postproc_path == Path("/usr/lib/hailo/tappas/post_processes")
     assert settings.hailo_hef_path == Path("models/hailo/general/model.hef")
     assert settings.hailo_postprocess_so == Path("models/hailo/postprocess/post.so")
     assert settings.hailo_vehicle_detection_hef_path == Path("models/hailo/vehicle_detection/vehicle.hef")
