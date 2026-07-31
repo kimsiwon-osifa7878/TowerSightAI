@@ -203,6 +203,26 @@ def test_required_driver_camera_loss_forces_stop_and_danger():
     assert display.can_show_final_ok is False
 
 
+def test_runtime_camera_recovery_replaces_stale_startup_warning():
+    settings = _settings()
+    source = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+
+    display = build_driver_display(source, blocked_roles=())
+
+    assert display.blocking_reason == "PLC 상태 미확인: 최종 OK 차단"
+    assert "카메라 입력 차단" not in display.blocking_reason
+
+
+def test_runtime_side_camera_failure_restores_camera_warning():
+    settings = _settings()
+    source = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+
+    display = build_driver_display(source, blocked_roles=[CameraRole.rear_side])
+
+    assert display.blocking_reason == "카메라 입력 차단: 좌측면"
+    assert display.can_show_final_ok is False
+
+
 def test_hidden_side_camera_still_blocks_safety_display():
     settings = _settings()
     source = build_operator_display(state=ParkingState.SAFETY_CHECK, cameras=settings.cameras)
@@ -216,3 +236,21 @@ def test_hidden_side_camera_still_blocks_safety_display():
     assert display.tone is DriverTone.DANGER
     assert display.headline == "정지"
     assert display.can_show_final_ok is False
+
+
+def test_idle_person_alert_keeps_front_only_layout():
+    settings = _settings()
+    source = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+
+    display = build_driver_display(
+        source,
+        state_override=ParkingState.HUMAN_DETECTED,
+        layout_state_override=ParkingState.IDLE,
+        blocked_roles=(),
+    )
+
+    assert display.state is ParkingState.HUMAN_DETECTED
+    assert display.layout is DriverLayout.FRONT
+    assert display.visible_roles == (CameraRole.front,)
+    assert display.headline == "즉시 밖으로 이동"
+    assert display.tone is DriverTone.DANGER

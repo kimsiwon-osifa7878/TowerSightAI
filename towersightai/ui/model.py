@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable
 
@@ -216,6 +216,7 @@ def build_driver_display(
     source: OperatorDisplayModel,
     *,
     state_override: ParkingState | None = None,
+    layout_state_override: ParkingState | None = None,
     alignment_override: AlignmentResult | None = None,
     blocked_roles: Iterable[CameraRole] | None = None,
     primary_alert_role: CameraRole | None = None,
@@ -225,9 +226,10 @@ def build_driver_display(
     state = state_override or source.state
     alignment = alignment_override or source.alignment
     layout, visible_roles, primary_role = _driver_layout_for_state(
-        state,
+        layout_state_override or state,
         primary_alert_role=primary_alert_role,
     )
+    runtime_health_supplied = blocked_roles is not None
     if blocked_roles is None:
         blocked = {tile.role for tile in source.camera_tiles if tile.blocked}
     else:
@@ -237,7 +239,11 @@ def build_driver_display(
 
     stage_label, headline, detail, symbol = _driver_copy_for_state(state, alignment)
     tone = DriverTone.WAIT
-    blocking_reason = source.warning
+    blocking_reason = (
+        _warning_for_runtime_camera_health(source, state=state, blocked_roles=blocked)
+        if runtime_health_supplied
+        else source.warning
+    )
     can_show_final_ok = source.can_show_final_ok and not simulated
 
     if simulated:
@@ -453,6 +459,33 @@ def _warning_for_state(
     if safety_status is GlobalSafetyStatus.READY:
         return "모든 안전 조건 통과"
     return "안전 조건 확인 중"
+
+
+def _warning_for_runtime_camera_health(
+    source: OperatorDisplayModel,
+    *,
+    state: ParkingState,
+    blocked_roles: set[CameraRole],
+) -> str:
+    runtime_tiles = tuple(
+        replace(
+            tile,
+            healthy=tile.role not in blocked_roles,
+            stale=tile.role in blocked_roles,
+        )
+        for tile in source.camera_tiles
+    )
+    return _warning_for_state(
+        state=state,
+        safety_status=source.safety_status,
+        plc_state=source.plc_state,
+        camera_tiles=runtime_tiles,
+        hailo_healthy=source.hailo_healthy,
+        calibration_valid=source.calibration_valid,
+        human_possible=source.human_possible,
+        occupant_possible=source.occupant_possible,
+        obstacle_possible=source.obstacle_possible,
+    )
 
 
 def _camera_title(role: CameraRole) -> str:

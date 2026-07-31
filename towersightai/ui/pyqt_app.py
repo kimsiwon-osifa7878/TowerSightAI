@@ -907,9 +907,14 @@ class OperatorWindow(QMainWindow):
             tile = next((item for item in self.model.camera_tiles if item.camera_id == camera_id), None)
             if tile is not None:
                 primary_alert_role = tile.role
+        effective_state = self._driver_state_override or self.model.state
+        layout_state_override = None
+        if self._user_mode_state == "idle" and effective_state is ParkingState.HUMAN_DETECTED:
+            layout_state_override = ParkingState.IDLE
         display = build_driver_display(
             self.model,
             state_override=self._driver_state_override,
+            layout_state_override=layout_state_override,
             alignment_override=self._driver_alignment_override,
             blocked_roles=blocked_roles,
             primary_alert_role=primary_alert_role,
@@ -1218,10 +1223,12 @@ class OperatorWindow(QMainWindow):
 
     def _show_operator_dashboard(self) -> None:
         self._operator_unlocked = True
+        self._set_driver_test_preview(False)
         self._activate_operator_layout("dashboard")
 
     def _show_all_cameras(self) -> None:
         self._operator_unlocked = True
+        self._set_driver_test_preview(False)
         self._activate_operator_layout("all")
 
     def _activate_operator_layout(self, mode: str) -> None:
@@ -1249,13 +1256,17 @@ class OperatorWindow(QMainWindow):
         self.operator_sidebar.setVisible(not self.operator_sidebar.isVisible())
 
     def _toggle_driver_test_panel(self, checked: bool = False) -> None:
-        self.driver_test_panel.setVisible(checked)
-        self.operator_workspace_stack.setCurrentWidget(
-            self.driver_preview_host if checked else self.operator_camera_area
-        )
+        self._set_driver_test_preview(checked)
         if checked:
             self._refresh_driver_display(apply_layout=False)
             self.driver_preview.restore_presentation()
+
+    def _set_driver_test_preview(self, enabled: bool) -> None:
+        self.driver_test_toggle.setChecked(enabled)
+        self.driver_test_panel.setVisible(enabled)
+        self.operator_workspace_stack.setCurrentWidget(
+            self.driver_preview_host if enabled else self.operator_camera_area
+        )
 
     def _clear_user_test_state(self) -> None:
         self._driver_state_override = None

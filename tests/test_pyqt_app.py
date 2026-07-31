@@ -14,7 +14,7 @@ from towersightai.config.settings import CameraRole, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.inference.purpose_tasks import PlateOcrEvent, PURPOSE_LPR_IMAGE
 from towersightai.state_machine.core import ParkingState
-from towersightai.ui.model import AlignmentResult, build_operator_display
+from towersightai.ui.model import AlignmentResult, DriverTone, build_operator_display
 from towersightai.ui.driver_view import (
     DRIVER_STYLESHEET,
     OPERATOR_HOLD_MS,
@@ -338,6 +338,33 @@ def test_user_mode_restores_camera_and_overlays_after_all_camera_inspection():
     window.close()
 
 
+def test_all_cameras_closes_driver_preview_and_shows_four_operator_cameras():
+    app = _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    window._unlock_operator()
+    window.driver_test_toggle.click()
+    assert window.operator_workspace_stack.currentWidget() is window.driver_preview_host
+
+    window.sidebar_buttons["전체 카메라"].click()
+    app.processEvents()
+
+    assert window.driver_test_toggle.isChecked() is False
+    assert window.driver_test_panel.isHidden() is True
+    assert window.operator_workspace_stack.currentWidget() is window.operator_camera_area
+    assert window.grid.count() == 4
+    assert {
+        window.grid.itemAtPosition(row, column).widget()
+        for row in range(2)
+        for column in range(2)
+    } == set(window.camera_widgets.values())
+    window.close()
+
+
 def test_user_mode_restores_after_person_inference_operator_flow(monkeypatch):
     app = _qt_app()
     settings = _settings()
@@ -519,6 +546,28 @@ def test_repeated_camera_health_does_not_rebuild_driver_camera_layout(monkeypatc
     assert refresh_calls == 1
     assert first_revision == initial_revision
     assert window.driver_view.layout_revision == initial_revision
+    window.close()
+
+
+def test_driver_warning_follows_runtime_camera_recovery_and_failure():
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+
+    for camera_id in ("ceiling", "front", "rear_side", "opposite_side"):
+        window._set_camera_status(camera_id, "정상 수신")
+
+    assert window.camera_summary_label.text() == "카메라 4/4 정상"
+    assert window.driver_view.blocking_label.text() == "PLC 상태 미확인: 최종 OK 차단"
+
+    window._set_camera_status("rear_side", "NG: 프레임 지연")
+    assert window.driver_view.blocking_label.text() == "카메라 입력 차단: 좌측면"
+    assert window.driver_view.display.can_show_final_ok is False
+
+    window._set_camera_status("rear_side", "정상 수신")
+    window._set_camera_status("front", "NG: 카메라 연결 이상")
+    assert window.driver_view.blocking_label.text() == "필수 카메라 입력 없음 · 주차기 동작 금지"
+    assert window.driver_view.display.tone is DriverTone.DANGER
     window.close()
 
 
@@ -720,6 +769,8 @@ def test_user_person_alert_requires_consecutive_person_detections(monkeypatch):
         window._set_camera_detections("front", (event,))
 
     assert window.driver_view.headline_label.text() == "즉시 밖으로 이동"
+    assert window.user_grid.count() == 1
+    assert window.user_grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
     assert "최종 OK" in window.driver_view.status_label.text()
     window.close()
 
