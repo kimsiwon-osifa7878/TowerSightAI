@@ -19,10 +19,10 @@ vehicle approach
 
 The installed display has two distinct modes:
 
-- **User mode** is the driver-facing guidance surface. It prioritizes live camera context, ceiling birdview alignment, one current instruction, and an unmistakable stop/blocked state.
+- **User mode** is the default driver-facing guidance surface. It prioritizes edge-to-edge live camera context, ceiling birdview alignment, one large current instruction, and an unmistakable stop/blocked state.
 - **Operator mode** retains camera inspection, AI diagnostics, settings, and test controls. Development telemetry and model details belong here rather than on the driver-facing screen.
 
-The visual direction for user mode is based on the provided ParkIO concept guide: a bright white/navy/cyan guidance surface with camera imagery, lane and stop overlays, and prominent red blocking states. The guide is a product and visual reference, not proof that any safety function is implemented or validated.
+The visual direction for user mode is a near-black automotive surround-view display with a 50%-transparent top instruction overlay, compact bottom status, and prominent red blocking states. The references are a product and visual guide, not proof that any safety function is implemented or validated.
 
 The current implementation covers entry-side camera and Hailo integration only in part. Driver approach, vehicle movement, and exit-complete confirmation during the outbound flow remain future product work and must not be inferred from the current UI.
 
@@ -32,7 +32,7 @@ Implemented:
 
 - Typed `.env` loading and validation for four camera roles: `ceiling`, `front`, `rear_side`, `opposite_side`.
 - RTSP preview pipeline generation with redacted source handling.
-- PyQt6 operator console that starts on an operator dashboard.
+- PyQt6 application that starts in driver-facing user mode and enters the operator dashboard through a hidden two-second hold in the top-right corner.
 - Dashboard layout with ceiling birdview and front camera as primary views.
 - Ceiling birdview displayed as a vertical tile with CCW 90-degree frame rotation.
 - Collapsible sidebar with connected actions and `EMPTY` feature slots.
@@ -185,10 +185,12 @@ For a normal desktop window:
 ./run-window.sh
 ```
 
-The default entry screen is the operator dashboard.
+The default entry screen is user mode. Hold the invisible `72 x 72 px` area in the top-right corner for two seconds with a mouse or touch input to enter the operator dashboard. Releasing early or moving outside the area cancels the transition. `Ctrl+Shift+O` remains a service-keyboard fallback.
 
 Dashboard behavior:
 
+- User mode fills the display with state-priority cameras and overlays one large driver action at the top.
+- Driver development controls are available only in the operator sidebar under `사용자 화면 테스트`.
 - Ceiling birdview and front camera are shown first.
 - The ceiling birdview tile is vertical and the frame is displayed CCW 90 degrees.
 - The sidebar opens from the `메뉴` button.

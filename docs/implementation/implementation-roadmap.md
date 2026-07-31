@@ -44,14 +44,16 @@ Done when OK/NG flows can be represented by tests without live PLC hardware.
 
 ## Phase 5: Operator UI Shell and In-UI Test Harness
 
-- Use one operator-centered HMI instead of separate driver/operator modes.
-- Start on the operator dashboard.
+- Use separate driver-facing user mode and operator mode in one PyQt6 application.
+- Start in the dark, camera-first user mode.
+- Enter operator mode through the hidden two-second top-right mouse/touch hold.
 - Show ceiling birdview and front camera as the primary first screen.
 - Provide a collapsible sidebar for navigation and feature slots.
+- Keep development state controls in the operator-only user-screen test panel.
 - Label unimplemented feature slots as `EMPTY`.
 - Keep the in-UI test screen as the first field-verification hub.
 
-Done when the operator can open the app, switch dashboard/all-camera/test views, press EMPTY buttons safely, and see that final OK remains blocked.
+Done when user mode has no development controls, mode switching is non-accidental, and the operator can switch dashboard/all-camera/test views, press EMPTY buttons safely, and see that final OK remains blocked.
 
 ## Phase 6: Camera and AI Visualization Panels
 

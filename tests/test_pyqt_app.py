@@ -5,21 +5,28 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QRect, QSize, QThread
+from PyQt6.QtCore import QRect, QSize, QThread, Qt
 from PyQt6.QtGui import QColor, QImage
+from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
 from towersightai.config.settings import CameraRole, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.inference.purpose_tasks import PlateOcrEvent, PURPOSE_LPR_IMAGE
 from towersightai.state_machine.core import ParkingState
-from towersightai.ui.model import build_operator_display
+from towersightai.ui.model import AlignmentResult, build_operator_display
+from towersightai.ui.driver_view import (
+    DRIVER_STYLESHEET,
+    OPERATOR_HOLD_MS,
+    OperatorEntryHotspot,
+)
 from towersightai.ui.pyqt_app import (
     OPERATOR_PANEL_WIDTH,
     SIDEBAR_ACTION_LABELS,
     PERSON_ALERT_STREAK_THRESHOLD,
     WINDOWED_DEFAULT_HEIGHT,
     WINDOWED_DEFAULT_WIDTH,
+    WINDOWED_MAX_HEIGHT,
     WINDOWED_MAX_WIDTH,
     LiveDetectionWorker,
     OperatorWindow,
@@ -61,28 +68,36 @@ def _qt_app() -> QApplication:
     return _APP
 
 
-def test_windowed_operator_window_width_is_capped_at_1920():
+def test_windowed_operator_window_is_capped_to_reference_and_screen():
     _qt_app()
     model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
     window = OperatorWindow(model)
 
     _prepare_operator_window(window, fullscreen=False)
 
-    assert window.maximumWidth() == WINDOWED_MAX_WIDTH
-    assert window.width() == min(WINDOWED_DEFAULT_WIDTH, WINDOWED_MAX_WIDTH)
-    assert window.height() == WINDOWED_DEFAULT_HEIGHT
+    available = window.screen().availableGeometry()
+    assert window.maximumWidth() == min(WINDOWED_MAX_WIDTH, available.width())
+    assert window.maximumHeight() == min(WINDOWED_MAX_HEIGHT, available.height())
+    assert window.width() == min(WINDOWED_DEFAULT_WIDTH, window.maximumWidth())
+    assert window.height() == min(WINDOWED_DEFAULT_HEIGHT, window.maximumHeight())
     window.close()
 
 
-def test_fullscreen_operator_window_does_not_keep_windowed_width_cap():
-    _qt_app()
+def test_fullscreen_window_is_real_fullscreen_with_bounded_content_canvas():
+    app = _qt_app()
     model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
     window = OperatorWindow(model)
 
-    _prepare_operator_window(window, fullscreen=False)
     _prepare_operator_window(window, fullscreen=True)
+    window.showFullScreen()
+    app.processEvents()
 
+    assert window.isFullScreen() is True
     assert window.maximumWidth() > WINDOWED_MAX_WIDTH
+    assert window.maximumHeight() > WINDOWED_MAX_HEIGHT
+    assert window.stack.width() <= WINDOWED_MAX_WIDTH
+    assert window.stack.height() <= WINDOWED_MAX_HEIGHT
+    assert window.stack.geometry().center() == window.content_viewport.rect().center()
     window.close()
 
 
@@ -251,15 +266,19 @@ def test_operator_ui_starts_on_user_mode_with_sidebar_closed():
     assert window.stack.currentWidget() is window.user_view
     assert window.stack.count() == 3
     assert window._camera_layout_mode == "dashboard"
-    assert set(window.user_mode_buttons) == {"IDLE", "진입", "진입완료", "번호판인식", "주차시작", "운영모드"}
-    assert window.user_grid.count() == 2
+    assert not hasattr(window, "user_mode_buttons")
+    assert set(window.driver_test_buttons) == {"실제 상태", "IDLE", "진입", "진입완료", "번호판인식", "주차시작"}
+    assert window.driver_test_panel.isHidden() is True
+    assert window.user_grid.count() == 1
+    assert window.driver_view.headline_label.text() == "정지"
+    assert window.driver_view.operator_hotspot.objectName() == "operatorEntryHotspot"
     assert window.camera_widgets[CameraRole.ceiling].display_mode == "cover"
     assert window.camera_widgets[CameraRole.front].display_mode == "cover"
     assert window._purpose_task_enabled is False
     assert window._purpose_workers == []
-    assert window.user_progress_label.text().startswith("IDLE / AI OFF")
 
-    window.user_mode_buttons["운영모드"].click()
+    window.driver_view.operator_hotspot.begin_hold()
+    window.driver_view.operator_hotspot._complete_hold()
     assert window.stack.currentWidget() is window.operator_view
     assert window.camera_widgets[CameraRole.ceiling].display_mode == "contain"
     assert window.camera_widgets[CameraRole.front].display_mode == "contain"
@@ -288,6 +307,254 @@ def test_operator_ui_starts_on_user_mode_with_sidebar_closed():
     window.close()
 
 
+def test_user_mode_restores_camera_and_overlays_after_all_camera_inspection():
+    app = _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    window._show_all_cameras()
+    app.processEvents()
+    assert window.grid.count() == 4
+
+    revision_before_return = window.driver_view.layout_revision
+    window._show_user_mode()
+    app.processEvents()
+
+    front = window.camera_widgets[CameraRole.front]
+    assert window.stack.currentWidget() is window.user_view
+    assert window.grid.count() == 0
+    assert window.user_grid.count() == 1
+    assert window.user_grid.itemAtPosition(0, 0).widget() is front
+    assert front.parentWidget() is window.driver_view.camera_area
+    assert front.isVisible() is True
+    assert front.geometry().width() > 0
+    assert front.geometry().height() > 0
+    assert window.driver_view.instruction_panel.isVisible() is True
+    assert window.driver_view.bottom_strip.isVisible() is True
+    assert window.driver_view.layout_revision == revision_before_return + 1
+    window.close()
+
+
+def test_user_mode_restores_after_person_inference_operator_flow(monkeypatch):
+    app = _qt_app()
+    settings = _settings()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(model, settings=settings)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+    window._runtime_camera_status = {
+        "ceiling": "정상 수신",
+        "front": "정상 수신",
+        "rear_side": "정상 수신",
+        "opposite_side": "정상 수신",
+    }
+
+    window._show_operator_dashboard()
+    window.sidebar_buttons["사람 존재 감지"].click()
+    app.processEvents()
+    assert window._purpose_task_enabled is True
+    assert window._purpose_task_id == "person_presence"
+
+    window._show_user_mode()
+    app.processEvents()
+
+    front = window.camera_widgets[CameraRole.front]
+    assert window.stack.currentWidget() is window.user_view
+    assert window.user_grid.count() == 1
+    assert front.parentWidget() is window.driver_view.camera_area
+    assert front.isVisible() is True
+    assert window.driver_view.instruction_panel.isVisible() is True
+    assert window.driver_view.display.can_show_final_ok is False
+    window.close()
+
+
+def test_long_inference_status_does_not_expand_user_mode_after_return():
+    app = _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    window._show_operator_dashboard()
+    window.ai_detection_label.setText(
+        "사람 존재 감지 ON: ceiling(146), front(266), rear_side(123), "
+        "opposite_side(1) / first inference 13.9s"
+    )
+    app.processEvents()
+    window._show_user_mode()
+    app.processEvents()
+
+    assert window.width() == 1440
+    assert window.minimumSizeHint().width() <= 1440
+    assert window.driver_view.blocking_label.isVisible() is True
+    assert window.driver_view.status_label.isVisible() is True
+    window.close()
+
+
+def test_operator_hotspot_requires_completed_hold_and_accepts_touch():
+    _qt_app()
+    hotspot = OperatorEntryHotspot()
+    hotspot.show()
+    hotspot._timer.setInterval(20)
+    activated = QSignalSpy(hotspot.activated)
+
+    QTest.mousePress(hotspot, Qt.MouseButton.LeftButton, pos=hotspot.rect().center())
+    QTest.mouseRelease(hotspot, Qt.MouseButton.LeftButton, pos=hotspot.rect().center())
+    QTest.qWait(30)
+    assert len(activated) == 0
+
+    QTest.mousePress(hotspot, Qt.MouseButton.LeftButton, pos=hotspot.rect().center())
+    QTest.qWait(30)
+    assert len(activated) == 1
+    QTest.mouseRelease(hotspot, Qt.MouseButton.LeftButton, pos=hotspot.rect().center())
+
+    assert OPERATOR_HOLD_MS == 2000
+    assert hotspot.testAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents) is True
+    hotspot.close()
+
+
+def test_driver_view_uses_full_camera_canvas_translucent_overlay_and_scaled_copy():
+    app = _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    window.resize(1920, 1080)
+    window.show()
+    app.processEvents()
+
+    panel = window.driver_view.instruction_panel.geometry()
+    assert (panel.x(), panel.y(), panel.width()) == (24, 22, 1872)
+    assert window.driver_view.headline_label.font().pixelSize() == 86
+    assert "rgba(2, 8, 12, 128)" in DRIVER_STYLESHEET
+    assert "#driverHeadlineLabel {\n        background: transparent;" in DRIVER_STYLESHEET
+    assert "#driverDetailLabel {\n        background: transparent;" in DRIVER_STYLESHEET
+    assert window.driver_view.bottom_strip.height() == 42
+
+    window.resize(1440, 900)
+    app.processEvents()
+    assert window.driver_view.headline_label.font().pixelSize() == 68
+    window.close()
+
+
+def test_large_driver_text_uses_font_metrics_without_clipping_detail():
+    app = _qt_app()
+    model = build_operator_display(state=ParkingState.VEHICLE_ENTERING, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    window.resize(1920, 1024)
+    window.show()
+    app.processEvents()
+
+    view = window.driver_view
+    panel = view.instruction_panel
+    required_copy_height = (
+        view.headline_label.fontMetrics().height()
+        + view.detail_label.fontMetrics().height()
+        + 4
+        + 28
+    )
+
+    assert panel.height() >= required_copy_height
+    assert view.headline_label.geometry().bottom() < view.detail_label.geometry().top()
+    assert view.detail_label.geometry().bottom() <= panel.contentsRect().bottom()
+    window.close()
+
+
+def test_operator_driver_test_buttons_show_same_ratio_driver_preview(monkeypatch):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    window._unlock_operator()
+    window.driver_test_toggle.click()
+
+    preview = window.driver_preview
+    assert window.operator_workspace_stack.currentWidget() is window.driver_preview_host
+    assert preview.operator_hotspot.isHidden() is True
+    assert abs(preview.width() / preview.height() - 1920 / 1024) < 0.01
+
+    frame = QImage(96, 54, QImage.Format.Format_RGB32)
+    frame.fill(QColor("#123456"))
+    window._set_camera_frame("front", frame)
+    assert preview.camera_widgets[CameraRole.front].current_frame().size() == frame.size()
+
+    for label in ("IDLE", "진입", "진입완료", "번호판인식", "주차시작", "실제 상태"):
+        window.driver_test_buttons[label].click()
+        app.processEvents()
+        assert preview.display == window.driver_view.display
+        assert preview.headline_label.text() == window.driver_view.headline_label.text()
+        assert preview.display.can_show_final_ok is False
+    window.close()
+
+
+def test_repeated_camera_health_does_not_rebuild_driver_camera_layout(monkeypatch):
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    initial_revision = window.driver_view.layout_revision
+    refresh_calls = 0
+    original_refresh = window._refresh_driver_display
+
+    def counted_refresh(*args, **kwargs):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return original_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(window, "_refresh_driver_display", counted_refresh)
+
+    window._set_camera_status("front", "정상 수신")
+    first_revision = window.driver_view.layout_revision
+    for _ in range(20):
+        window._set_camera_status("front", "정상 수신")
+
+    assert refresh_calls == 1
+    assert first_revision == initial_revision
+    assert window.driver_view.layout_revision == initial_revision
+    window.close()
+
+
+def test_driver_view_reflows_cameras_for_entry_alignment_and_safety_states():
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model)
+    window._runtime_camera_status = {
+        "ceiling": "정상 수신",
+        "front": "정상 수신",
+        "rear_side": "정상 수신",
+        "opposite_side": "정상 수신",
+    }
+
+    window._driver_state_override = ParkingState.VEHICLE_ENTERING
+    window._driver_simulated = True
+    window._refresh_driver_display(apply_layout=True)
+    assert window.user_grid.count() == 2
+    assert window.user_grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
+    assert window.user_grid.itemAtPosition(0, 1).widget() is window.camera_widgets[CameraRole.ceiling]
+
+    window._driver_state_override = ParkingState.ALIGNMENT_GUIDE
+    window._driver_alignment_override = AlignmentResult.MOVE_RIGHT
+    window._refresh_driver_display(apply_layout=True)
+    assert window.user_grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.ceiling]
+    assert window.driver_view.headline_label.text() == "오른쪽 이동"
+
+    window._driver_state_override = ParkingState.SAFETY_CHECK
+    window._refresh_driver_display(apply_layout=True)
+    assert window.user_grid.count() == 2
+    assert window.user_grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
+    assert window.user_grid.itemAtPosition(0, 1).widget() is window.camera_widgets[CameraRole.ceiling]
+    assert window.driver_view.display.can_show_final_ok is False
+    window.close()
+
+
 def test_user_idle_button_starts_person_presence_for_streaming_cameras(monkeypatch):
     _qt_app()
     settings = _settings()
@@ -302,12 +569,15 @@ def test_user_idle_button_starts_person_presence_for_streaming_cameras(monkeypat
         "opposite_side": "정상 수신",
     }
 
-    window.user_mode_buttons["IDLE"].click()
+    window.driver_test_buttons["IDLE"].click()
 
     assert window._user_mode_state == "idle"
     assert window._purpose_task_id == "person_presence"
     assert window._purpose_workers[0].camera_ids == ("ceiling", "front", "rear_side", "opposite_side")
-    assert "사람 감지" in window.user_instruction_label.text()
+    assert window.driver_view.headline_label.text() == "진입 준비"
+    assert window.user_grid.count() == 1
+    assert window.user_grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
+    assert window.driver_view.display.simulated is True
     assert window.model.can_show_final_ok is False
     window.close()
 
@@ -321,7 +591,7 @@ def test_user_idle_button_allows_partial_streaming_cameras(monkeypatch):
     window = OperatorWindow(model, settings=settings)
     window._runtime_camera_status = {"ceiling": "정상 수신", "front": "NG: 카메라 연결 이상"}
 
-    window.user_mode_buttons["IDLE"].click()
+    window.driver_test_buttons["IDLE"].click()
 
     assert window._user_mode_state == "idle"
     assert window._purpose_task_id == "person_presence"
@@ -339,12 +609,15 @@ def test_user_entry_button_starts_front_vehicle_detection(monkeypatch):
     window = OperatorWindow(model, settings=settings)
     window._runtime_camera_status = {"front": "정상 수신"}
 
-    window.user_mode_buttons["진입"].click()
+    window.driver_test_buttons["진입"].click()
 
     assert window._user_mode_state == "entry"
     assert window._purpose_task_id == "vehicle_detection"
     assert window._purpose_workers[0].camera_ids == ("front",)
-    assert "진입 차량" in window.user_instruction_label.text()
+    assert window.driver_view.headline_label.text() == "천천히 진입"
+    assert window.user_grid.count() == 2
+    assert window.user_grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
+    assert window.user_grid.itemAtPosition(0, 1).widget() is window.camera_widgets[CameraRole.ceiling]
     window.close()
 
 
@@ -361,14 +634,14 @@ def test_user_entry_complete_switches_from_vehicle_to_pending_person_presence(mo
         "rear_side": "정상 수신",
         "opposite_side": "정상 수신",
     }
-    window.user_mode_buttons["진입"].click()
+    window.driver_test_buttons["진입"].click()
 
-    window.user_mode_buttons["진입완료"].click()
+    window.driver_test_buttons["진입완료"].click()
 
     assert window._user_mode_state == "entry_complete"
     assert window._pending_user_purpose_task_id == "person_presence"
     assert window._purpose_workers[0]._stop_requested is True
-    assert "기존 AI 추론 종료" in window.user_warning_label.text()
+    assert "기존 AI 추론 종료" in window.warning_label.text()
     window.close()
 
 
@@ -383,9 +656,9 @@ def test_user_plate_recognition_uses_front_lpr_without_stopping_purpose_worker(m
     frame.fill(QColor("#ffffff"))
     window.camera_widgets[CameraRole.front].set_frame(frame)
     window._runtime_camera_status = {"front": "정상 수신"}
-    window.user_mode_buttons["진입"].click()
+    window.driver_test_buttons["진입"].click()
 
-    window.user_mode_buttons["번호판인식"].click()
+    window.driver_test_buttons["번호판인식"].click()
 
     assert window._user_mode_state == "plate_recognition"
     assert window._purpose_task_id == "vehicle_detection"
@@ -405,13 +678,13 @@ def test_user_parking_started_stops_all_ai_and_keeps_ok_blocked(monkeypatch):
     monkeypatch.setattr(QThread, "start", lambda self: None)
     window = OperatorWindow(model, settings=settings)
     window._runtime_camera_status = {"front": "정상 수신"}
-    window.user_mode_buttons["진입"].click()
+    window.driver_test_buttons["진입"].click()
     frame = QImage(64, 32, QImage.Format.Format_RGB32)
     frame.fill(QColor("#ffffff"))
     window.camera_widgets[CameraRole.front].set_frame(frame)
-    window.user_mode_buttons["번호판인식"].click()
+    window.driver_test_buttons["번호판인식"].click()
 
-    window.user_mode_buttons["주차시작"].click()
+    window.driver_test_buttons["주차시작"].click()
 
     assert window._user_mode_state == "parking_started"
     assert window._purpose_task_enabled is False
@@ -429,7 +702,12 @@ def test_user_person_alert_requires_consecutive_person_detections(monkeypatch):
     monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
     window = OperatorWindow(model, settings=settings)
     window._purpose_task_id = "person_presence"
-    window._runtime_camera_status = {"front": "정상 수신"}
+    window._runtime_camera_status = {
+        "ceiling": "정상 수신",
+        "front": "정상 수신",
+        "rear_side": "정상 수신",
+        "opposite_side": "정상 수신",
+    }
     event = DetectionEvent(
         camera_id="front",
         label="person",
@@ -441,8 +719,8 @@ def test_user_person_alert_requires_consecutive_person_detections(monkeypatch):
     for _ in range(PERSON_ALERT_STREAK_THRESHOLD):
         window._set_camera_detections("front", (event,))
 
-    assert "사람이 감지되었습니다." in window.user_warning_label.text()
-    assert "최종 OK는 차단" in window.user_warning_label.text()
+    assert window.driver_view.headline_label.text() == "즉시 밖으로 이동"
+    assert "최종 OK" in window.driver_view.status_label.text()
     window.close()
 
 
@@ -452,6 +730,7 @@ def test_camera_settings_rotation_button_updates_runtime_rotation_state():
     model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
     window = OperatorWindow(model)
 
+    window._unlock_operator()
     window.sidebar_buttons["카메라 설정"].click()
     assert window.stack.currentWidget() is window.settings_view
     assert window._camera_rotations.get("ceiling", 0) == 0
@@ -820,5 +1099,21 @@ def test_vehicle_entry_simulation_is_ui_only_and_keeps_final_ok_blocked():
     assert window._vehicle_entry_simulation is True
     assert "진입 차량 감지" in window.instruction_label.text()
     assert "PLC OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_empty_action_notice_survives_camera_health_refresh_and_keeps_ok_blocked():
+    _qt_app()
+    settings = _settings()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    window = OperatorWindow(model)
+    window._unlock_operator()
+
+    window.sidebar_buttons["EMPTY_1"].click()
+    window._set_camera_status("front", "정상 수신")
+
+    assert "EMPTY 1" in window.warning_label.text()
+    assert "최종 OK 차단" in window.warning_label.text()
     assert window.model.can_show_final_ok is False
     window.close()

@@ -23,11 +23,18 @@ from towersightai.inference.purpose_tasks import (
 )
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.runtime_logging import new_run_id
-from towersightai.ui.model import GlobalSafetyStatus, OperatorDisplayModel
+from towersightai.state_machine.core import ParkingState
+from towersightai.ui.model import (
+    AlignmentResult,
+    GlobalSafetyStatus,
+    OperatorDisplayModel,
+    build_driver_display,
+)
 
 OPERATOR_PANEL_WIDTH = 400
 OPERATOR_SIDEBAR_WIDTH = 300
 WINDOWED_MAX_WIDTH = 1920
+WINDOWED_MAX_HEIGHT = 1024
 WINDOWED_DEFAULT_WIDTH = 1440
 WINDOWED_DEFAULT_HEIGHT = 900
 DETECTION_TTL_SECONDS = 1.0
@@ -66,6 +73,14 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - exercised only on GUI runtimes.
     raise RuntimeError("PyQt6 is required to launch the TowerSightAI operator UI.") from exc
+
+from towersightai.ui.driver_view import (
+    DRIVER_REFERENCE_HEIGHT,
+    DRIVER_REFERENCE_WIDTH,
+    DRIVER_STYLESHEET,
+    DriverPreviewHost,
+    DriverView,
+)
 
 
 class CameraSurface(QFrame):
@@ -184,6 +199,12 @@ class CameraSurface(QFrame):
             painter.fillRect(label_rect, QColor(3, 7, 12, 210))
             painter.setPen(color)
             painter.drawText(label_rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter, text)
+
+        if self.status.startswith("NG"):
+            painter.fillRect(image_rect, QColor(91, 8, 18, 132))
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            fault_text = "영상 수신 불가" if self._frame is None or self._frame.isNull() else "카메라 입력 확인 필요"
+            painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, fault_text)
 
         painter.setPen(QColor("#e5e7eb"))
         painter.drawText(content.adjusted(12, 10, -12, -10), Qt.AlignmentFlag.AlignTop, self.title)
@@ -568,12 +589,33 @@ class FrontCameraLprWorker(QObject):
         self.finished.emit()
 
 
+class BoundedContentViewport(QWidget):
+    """Center the UI canvas while allowing the top-level window to be fullscreen."""
+
+    def __init__(self, content: QWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.content = content
+        self.content.setParent(self)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
+        super().resizeEvent(event)
+        width = min(self.width(), DRIVER_REFERENCE_WIDTH)
+        height = min(self.height(), DRIVER_REFERENCE_HEIGHT)
+        self.content.setGeometry(
+            (self.width() - width) // 2,
+            (self.height() - height) // 2,
+            max(1, width),
+            max(1, height),
+        )
+
+
 class OperatorWindow(QMainWindow):
     def __init__(self, model: OperatorDisplayModel, settings: Settings | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.model = model
         self.settings = settings
         self.camera_widgets: dict[CameraRole, CameraSurface] = {}
+        self.driver_preview_camera_widgets: dict[CameraRole, CameraSurface] = {}
         self._runtime_camera_status: dict[str, str] = {}
         self._threads: list[QThread] = []
         self._workers: list[CameraCaptureWorker] = []
@@ -602,11 +644,16 @@ class OperatorWindow(QMainWindow):
         self._purpose_lpr_results: tuple[PlateOcrEvent, ...] = ()
         self._front_lpr_enabled = False
         self._user_mode_state = "idle"
+        self._driver_state_override: ParkingState | None = None
+        self._driver_alignment_override: AlignmentResult | None = None
+        self._driver_simulated = False
+        self._driver_masked_plate = ""
+        self._operator_notice_until = 0.0
         self._pending_user_purpose_task_id = ""
         self._person_detection_streak = 0
         self._last_person_detection_at: float | None = None
         self._person_detected_camera_ids: set[str] = set()
-        self._operator_unlocked = True
+        self._operator_unlocked = False
         self._vehicle_entry_simulation = False
         self._camera_layout_mode = "dashboard"
         self._camera_rotations: dict[str, int] = {
@@ -633,10 +680,6 @@ class OperatorWindow(QMainWindow):
         self.state_label.setText(model.state.value)
         self.instruction_label.setText(model.instruction)
         self.warning_label.setText(model.warning)
-        if hasattr(self, "user_instruction_label"):
-            self.user_instruction_label.setText(model.instruction)
-        if hasattr(self, "user_warning_label"):
-            self.user_warning_label.setText(model.warning)
         self.plc_label.setText(f"PLC {model.plc_state.value}")
         self.camera_summary_label.setText(model.camera_health_summary)
         self.safety_label.setText("OK" if model.can_show_final_ok else model.safety_status.value)
@@ -645,10 +688,10 @@ class OperatorWindow(QMainWindow):
         self.safety_label.style().polish(self.safety_label)
         for tile in model.camera_tiles:
             self._runtime_camera_status[tile.camera_id] = tile.status_text
-            widget = self.camera_widgets.get(tile.role)
-            if widget:
+            for widget in self._camera_surfaces(tile.role):
                 widget.set_status(tile.status_text)
         self._refresh_runtime_health_labels()
+        self._refresh_driver_display()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
         for worker in self._workers:
@@ -697,29 +740,34 @@ class OperatorWindow(QMainWindow):
         tile = next((tile for tile in self.model.camera_tiles if tile.camera_id == camera_id), None)
         if tile is None:
             return
-        widget = self.camera_widgets.get(tile.role)
-        if widget:
+        for widget in self._camera_surfaces(tile.role):
             widget.set_frame(frame)
 
     def _set_camera_status(self, camera_id: str, status: str) -> None:
         tile = next((tile for tile in self.model.camera_tiles if tile.camera_id == camera_id), None)
         if tile is None:
             return
-        widget = self.camera_widgets.get(tile.role)
-        if widget:
-            widget.set_status(status)
+        widgets = self._camera_surfaces(tile.role)
+        previous_status = self._runtime_camera_status.get(camera_id)
+        for widget in widgets:
+            if widget.status != status:
+                widget.set_status(status)
+        if previous_status == status:
+            return
         self._runtime_camera_status[camera_id] = status
         self._refresh_runtime_health_labels()
+        self._refresh_driver_display()
 
     def _set_camera_detections(self, camera_id: str, detections: tuple[DetectionEvent, ...]) -> None:
         tile = next((tile for tile in self.model.camera_tiles if tile.camera_id == camera_id), None)
         if tile is None:
             return
-        widget = self.camera_widgets.get(tile.role)
-        if widget is None:
+        widgets = self._camera_surfaces(tile.role)
+        if not widgets:
             return
         if self._runtime_camera_status.get(camera_id, tile.status_text).startswith("NG"):
-            widget.clear_detections()
+            for widget in widgets:
+                widget.clear_detections()
             return
         self._detection_event_counts[camera_id] = self._detection_event_counts.get(camera_id, 0) + len(detections)
         if self._detection_enabled:
@@ -744,7 +792,18 @@ class OperatorWindow(QMainWindow):
             )
         self._update_user_person_alert(camera_id, detections)
         self._refresh_user_mode_labels()
-        widget.set_detections(detections)
+        for widget in widgets:
+            widget.set_detections(detections)
+
+    def _camera_surfaces(self, role: CameraRole) -> tuple[CameraSurface, ...]:
+        surfaces = (
+            self.camera_widgets.get(role),
+            self.driver_preview_camera_widgets.get(role),
+        )
+        return tuple(surface for surface in surfaces if surface is not None)
+
+    def _all_camera_surfaces(self) -> tuple[CameraSurface, ...]:
+        return tuple(self.camera_widgets.values()) + tuple(self.driver_preview_camera_widgets.values())
 
     def _update_user_person_alert(self, camera_id: str, detections: tuple[DetectionEvent, ...]) -> None:
         if self._purpose_task_id != PURPOSE_PERSON_PRESENCE:
@@ -757,8 +816,10 @@ class OperatorWindow(QMainWindow):
         if self._person_detection_streak >= PERSON_ALERT_STREAK_THRESHOLD:
             cameras = ", ".join(sorted(self._person_detected_camera_ids))
             message = f"사람이 감지되었습니다. ({cameras})"
-            self.user_warning_label.setText(f"{message} 최종 OK는 차단됩니다.")
             self.warning_label.setText(f"{message} 최종 OK는 차단됩니다.")
+            self._driver_state_override = ParkingState.HUMAN_DETECTED
+            self._driver_simulated = False
+            self._refresh_driver_display()
 
     def _set_detection_status(self, camera_id: str, message: str) -> None:
         if "실행 중" in message or "재시도 중" in message or "재시작 대기" in message:
@@ -805,6 +866,7 @@ class OperatorWindow(QMainWindow):
     def _refresh_runtime_health_labels(self) -> None:
         if self._detection_failed:
             return
+        preserve_notice = time.monotonic() < self._operator_notice_until
         blocked_tiles = tuple(
             tile
             for tile in self.model.camera_tiles
@@ -813,18 +875,56 @@ class OperatorWindow(QMainWindow):
         blocked_count = len(blocked_tiles)
         if blocked_count:
             self.camera_summary_label.setText(f"카메라 {blocked_count}/4 차단")
-            if self._detection_enabled:
+            if self._detection_enabled or preserve_notice:
                 return
             self.warning_label.setText("카메라 입력 차단: " + ", ".join(tile.title for tile in blocked_tiles))
             return
 
         self.camera_summary_label.setText("카메라 4/4 정상")
-        if self._detection_enabled:
+        if self._detection_enabled or preserve_notice:
             return
         if self.model.plc_state.value != "CONNECTED":
             self.warning_label.setText("PLC 상태 미확인: 최종 OK 차단")
         else:
             self.warning_label.setText(self.model.warning)
+
+    def _refresh_driver_display(
+        self,
+        *,
+        apply_layout: bool | None = None,
+        force_layout: bool = False,
+    ) -> None:
+        if not hasattr(self, "driver_view"):
+            return
+        blocked_roles: set[CameraRole] = set()
+        for tile in self.model.camera_tiles:
+            status = self._runtime_camera_status.get(tile.camera_id, tile.status_text)
+            if not status.startswith("정상 수신"):
+                blocked_roles.add(tile.role)
+        primary_alert_role = None
+        if self._person_detected_camera_ids:
+            camera_id = sorted(self._person_detected_camera_ids)[0]
+            tile = next((item for item in self.model.camera_tiles if item.camera_id == camera_id), None)
+            if tile is not None:
+                primary_alert_role = tile.role
+        display = build_driver_display(
+            self.model,
+            state_override=self._driver_state_override,
+            alignment_override=self._driver_alignment_override,
+            blocked_roles=blocked_roles,
+            primary_alert_role=primary_alert_role,
+            masked_plate_text=self._driver_masked_plate,
+            simulated=self._driver_simulated,
+        )
+        if apply_layout is None:
+            apply_layout = hasattr(self, "user_view") and self.stack.currentWidget() is self.user_view
+        self.driver_view.apply_display(
+            display,
+            apply_layout=apply_layout,
+            force_layout=force_layout,
+        )
+        if hasattr(self, "driver_preview"):
+            self.driver_preview.apply_display(display, apply_layout=True)
 
     def _build(self) -> None:
         self.stack = QStackedWidget()
@@ -834,67 +934,19 @@ class OperatorWindow(QMainWindow):
         self.stack.addWidget(self.operator_view)
         self.stack.addWidget(self.user_view)
         self.stack.addWidget(self.settings_view)
-        self.setCentralWidget(self.stack)
+        self.content_viewport = BoundedContentViewport(self.stack)
+        self.setCentralWidget(self.content_viewport)
         self._show_user_mode()
 
     def _build_user_view(self) -> QWidget:
-        root = QWidget()
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(8)
-
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        outer.addLayout(top)
-
-        status = QVBoxLayout()
-        status.setSpacing(6)
-        top.addLayout(status, 1)
-
-        self.user_instruction_label = QLabel()
-        self.user_instruction_label.setObjectName("userInstructionLabel")
-        self.user_instruction_label.setWordWrap(True)
-        status.addWidget(self.user_instruction_label)
-
-        self.user_warning_label = QLabel()
-        self.user_warning_label.setObjectName("userWarningLabel")
-        self.user_warning_label.setWordWrap(True)
-        status.addWidget(self.user_warning_label)
-
+        self.driver_view = DriverView(self.camera_widgets)
+        self.driver_view.operator_requested.connect(self._unlock_operator)
+        self.user_grid = self.driver_view.camera_grid
+        self.user_instruction_label = self.driver_view.headline_label
+        self.user_warning_label = self.driver_view.blocking_label
         self.user_plate_label = QLabel("번호판: -")
-        self.user_plate_label.setObjectName("userPlateLabel")
-        self.user_plate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        top.addWidget(self.user_plate_label)
-
-        controls = QHBoxLayout()
-        controls.setSpacing(6)
-        top.addLayout(controls)
-        self.user_mode_buttons: dict[str, QPushButton] = {}
-        for label, handler in (
-            ("IDLE", self._user_idle),
-            ("진입", self._user_entry),
-            ("진입완료", self._user_entry_complete),
-            ("번호판인식", self._user_plate_recognition),
-            ("주차시작", self._user_parking_started),
-            ("운영모드", self._show_operator_dashboard),
-        ):
-            button = QPushButton(label)
-            button.setObjectName("smallModeButton")
-            button.setFixedHeight(34)
-            button.clicked.connect(handler)
-            self.user_mode_buttons[label] = button
-            controls.addWidget(button)
-
-        self.user_grid = QGridLayout()
-        self.user_grid.setSpacing(8)
-        camera_area = QWidget()
-        camera_area.setLayout(self.user_grid)
-        outer.addWidget(camera_area, 1)
-
-        self.user_progress_label = QLabel("IDLE")
-        self.user_progress_label.setObjectName("telemetryLabel")
-        outer.addWidget(self.user_progress_label)
-        return root
+        self.user_progress_label = self.driver_view.status_label
+        return self.driver_view
 
     def _build_operator_view(self) -> QWidget:
         root = QWidget()
@@ -913,6 +965,33 @@ class OperatorWindow(QMainWindow):
         title.setObjectName("testTitleLabel")
         sidebar_layout.addWidget(title)
         self._add_sidebar_buttons(sidebar_layout)
+        self.driver_test_toggle = QPushButton("사용자 화면 테스트")
+        self.driver_test_toggle.setCheckable(True)
+        self.driver_test_toggle.clicked.connect(self._toggle_driver_test_panel)
+        sidebar_layout.addWidget(self.driver_test_toggle)
+        self.driver_test_panel = QFrame()
+        self.driver_test_panel.setObjectName("driverTestPanel")
+        driver_test_layout = QGridLayout(self.driver_test_panel)
+        driver_test_layout.setContentsMargins(6, 6, 6, 6)
+        driver_test_layout.setSpacing(5)
+        self.driver_test_buttons: dict[str, QPushButton] = {}
+        for index, (label, handler) in enumerate(
+            (
+                ("실제 상태", self._clear_user_test_state),
+                ("IDLE", self._user_idle),
+                ("진입", self._user_entry),
+                ("진입완료", self._user_entry_complete),
+                ("번호판인식", self._user_plate_recognition),
+                ("주차시작", self._user_parking_started),
+            )
+        ):
+            button = QPushButton(label)
+            button.setObjectName("smallModeButton")
+            button.clicked.connect(handler)
+            self.driver_test_buttons[label] = button
+            driver_test_layout.addWidget(button, index // 2, index % 2)
+        self.driver_test_panel.setVisible(False)
+        sidebar_layout.addWidget(self.driver_test_panel)
         sidebar_layout.addStretch(1)
         self.operator_sidebar.setVisible(False)
         outer.addWidget(self.operator_sidebar)
@@ -955,15 +1034,26 @@ class OperatorWindow(QMainWindow):
 
         self.grid = QGridLayout()
         self.grid.setSpacing(8)
-        camera_area = QWidget()
-        camera_area.setLayout(self.grid)
-        main_layout.addWidget(camera_area, 1)
+        self.operator_camera_area = QWidget()
+        self.operator_camera_area.setLayout(self.grid)
 
         roles = [CameraRole.ceiling, CameraRole.front, CameraRole.rear_side, CameraRole.opposite_side]
         for role in roles:
             title = next((tile.title for tile in self.model.camera_tiles if tile.role is role), role.value)
             surface = CameraSurface(title)
             self.camera_widgets[role] = surface
+            self.driver_preview_camera_widgets[role] = CameraSurface(title)
+
+        self.driver_preview = DriverView(
+            self.driver_preview_camera_widgets,
+            preview_mode=True,
+        )
+        self.driver_preview_host = DriverPreviewHost(self.driver_preview)
+        self.operator_workspace_stack = QStackedWidget()
+        self.operator_workspace_stack.addWidget(self.operator_camera_area)
+        self.operator_workspace_stack.addWidget(self.driver_preview_host)
+        self.operator_workspace_stack.setCurrentWidget(self.operator_camera_area)
+        main_layout.addWidget(self.operator_workspace_stack, 1)
 
         status_bar = QWidget()
         status_bar.setObjectName("statusStrip")
@@ -977,7 +1067,11 @@ class OperatorWindow(QMainWindow):
         self.ai_detection_label = QLabel("AI 추론 OFF")
         for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.clock_label):
             label.setObjectName("telemetryLabel")
-            label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            # Runtime inference text can become very long. Ignore its natural
+            # width so the hidden operator page cannot enlarge the shared
+            # stacked window after returning to the driver display.
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             status_layout.addWidget(label)
         main_layout.addWidget(status_bar)
 
@@ -1075,8 +1169,9 @@ class OperatorWindow(QMainWindow):
         self.clock_label.setText(text)
         if self._last_person_detection_at is not None and time.monotonic() - self._last_person_detection_at >= PERSON_ALERT_STALE_SECONDS:
             self._reset_person_alert()
-            if self._purpose_task_id == PURPOSE_PERSON_PRESENCE and hasattr(self, "user_warning_label"):
-                self.user_warning_label.setText("사람 감지 중입니다. 최종 OK는 차단됩니다.")
+            if self._driver_state_override is ParkingState.HUMAN_DETECTED and not self._driver_simulated:
+                self._driver_state_override = None
+                self._refresh_driver_display()
         self._refresh_user_mode_labels()
         if (
             self._detection_enabled
@@ -1104,23 +1199,41 @@ class OperatorWindow(QMainWindow):
     def _show_operator(self) -> None:
         if not self._operator_unlocked:
             return
-        self._set_camera_layout(self._camera_layout_mode)
-        self.stack.setCurrentWidget(self.operator_view)
+        self._activate_operator_layout(self._camera_layout_mode)
 
     def _show_user_mode(self) -> None:
-        self._set_user_camera_layout()
-        self.stack.setCurrentWidget(self.user_view)
+        self._operator_unlocked = False
+        if hasattr(self, "driver_view"):
+            self.driver_view.operator_hotspot.cancel_hold()
+        self.setUpdatesEnabled(False)
+        try:
+            self._set_user_camera_layout()
+            self.stack.setCurrentWidget(self.user_view)
+            self._refresh_driver_display(apply_layout=True, force_layout=True)
+            self.driver_view.restore_presentation()
+        finally:
+            self.setUpdatesEnabled(True)
+        self.update()
         self._refresh_user_mode_labels()
 
     def _show_operator_dashboard(self) -> None:
         self._operator_unlocked = True
-        self._set_camera_layout("dashboard")
-        self.stack.setCurrentWidget(self.operator_view)
+        self._activate_operator_layout("dashboard")
 
     def _show_all_cameras(self) -> None:
         self._operator_unlocked = True
-        self._set_camera_layout("all")
-        self.stack.setCurrentWidget(self.operator_view)
+        self._activate_operator_layout("all")
+
+    def _activate_operator_layout(self, mode: str) -> None:
+        self.setUpdatesEnabled(False)
+        try:
+            self.stack.setCurrentWidget(self.operator_view)
+            self._set_camera_layout(mode)
+            self.grid.invalidate()
+            self.grid.activate()
+        finally:
+            self.setUpdatesEnabled(True)
+        self.update()
 
     def _show_camera_settings(self) -> None:
         if not self._operator_unlocked:
@@ -1135,44 +1248,85 @@ class OperatorWindow(QMainWindow):
     def _toggle_sidebar(self) -> None:
         self.operator_sidebar.setVisible(not self.operator_sidebar.isVisible())
 
+    def _toggle_driver_test_panel(self, checked: bool = False) -> None:
+        self.driver_test_panel.setVisible(checked)
+        self.operator_workspace_stack.setCurrentWidget(
+            self.driver_preview_host if checked else self.operator_camera_area
+        )
+        if checked:
+            self._refresh_driver_display(apply_layout=False)
+            self.driver_preview.restore_presentation()
+
+    def _clear_user_test_state(self) -> None:
+        self._driver_state_override = None
+        self._driver_alignment_override = None
+        self._driver_simulated = False
+        self._driver_masked_plate = ""
+        self._user_mode_state = "idle"
+        self._refresh_driver_display()
+        self.warning_label.setText("실제 표시 모델로 복귀했습니다. 안전 조건 확인 전 최종 OK는 차단됩니다.")
+        self._refresh_user_mode_labels()
+
     def _empty_action(self, name: str) -> None:
+        self._operator_notice_until = time.monotonic() + 3.0
         self.warning_label.setText(f"{name}: 아직 기능이 연결되지 않았습니다. 최종 OK 차단 상태를 유지합니다.")
 
     def _simulate_vehicle_entry(self) -> None:
+        self._operator_notice_until = time.monotonic() + 3.0
         self._vehicle_entry_simulation = True
+        self._driver_state_override = ParkingState.VEHICLE_ENTERING
+        self._driver_alignment_override = AlignmentResult.UNKNOWN
+        self._driver_simulated = True
+        self._user_mode_state = "entry"
         for role in (CameraRole.ceiling, CameraRole.front):
-            widget = self.camera_widgets.get(role)
-            if widget is not None:
+            for widget in self._camera_surfaces(role):
                 widget.set_vehicle_simulation(True)
         self._show_operator_dashboard()
         self.instruction_label.setText("진입 차량 감지: 버드뷰와 정면 영상을 확인 중입니다.")
         self.warning_label.setText("차량 진입 시뮬레이션: UI 확인 전용이며 PLC OK는 차단됩니다.")
+        self._refresh_driver_display(apply_layout=False)
+        self._refresh_user_mode_labels()
 
     def _user_idle(self) -> None:
         self._user_mode_state = "idle"
+        self._driver_state_override = ParkingState.IDLE
+        self._driver_alignment_override = None
+        self._driver_simulated = True
         self._reset_person_alert()
         self._set_user_status("대기 중: 주차기 내부 사람 감지 중", "사람 감지 AI 실행 준비 중입니다.")
         self._switch_user_purpose_task(PURPOSE_PERSON_PRESENCE)
 
     def _user_entry(self) -> None:
         self._user_mode_state = "entry"
+        self._driver_state_override = ParkingState.VEHICLE_ENTERING
+        self._driver_alignment_override = AlignmentResult.UNKNOWN
+        self._driver_simulated = True
         self._reset_person_alert()
         self._set_user_status("진입 차량 감지 중", "정면 카메라 차량 감지 AI로 전환합니다.")
         self._switch_user_purpose_task(PURPOSE_VEHICLE_DETECTION)
 
     def _user_entry_complete(self) -> None:
         self._user_mode_state = "entry_complete"
+        self._driver_state_override = ParkingState.SAFETY_CHECK
+        self._driver_alignment_override = None
+        self._driver_simulated = True
         self._reset_person_alert()
         self._set_user_status("진입 완료: 사람 감지 중", "차량 감지 AI를 종료하고 사람 감지를 다시 시작합니다.")
         self._switch_user_purpose_task(PURPOSE_PERSON_PRESENCE)
 
     def _user_plate_recognition(self) -> None:
         self._user_mode_state = "plate_recognition"
+        self._driver_state_override = ParkingState.PLATE_RECOGNITION
+        self._driver_alignment_override = None
+        self._driver_simulated = True
         self._set_user_status("번호판 인식 중", "정면 카메라 스냅샷으로 번호판을 인식합니다.")
         self._start_front_camera_lpr()
 
     def _user_parking_started(self) -> None:
         self._user_mode_state = "parking_started"
+        self._driver_state_override = ParkingState.AI_STOP
+        self._driver_alignment_override = None
+        self._driver_simulated = True
         self._pending_user_purpose_task_id = ""
         self._stop_purpose_inference()
         self._stop_ai_detection()
@@ -1204,9 +1358,10 @@ class OperatorWindow(QMainWindow):
         self._start_purpose_inference(task_id)
 
     def _set_user_status(self, instruction: str, warning: str) -> None:
-        self.user_instruction_label.setText(instruction)
-        self.user_warning_label.setText(f"{warning} 최종 OK는 차단됩니다.")
-        self.user_progress_label.setText(self._user_progress_text())
+        self.instruction_label.setText(instruction)
+        self.warning_label.setText(f"{warning} 최종 OK는 차단됩니다.")
+        self._refresh_driver_display()
+        self._refresh_user_mode_labels()
 
     def _all_user_person_cameras_ready(self) -> bool:
         if self.settings is None:
@@ -1223,16 +1378,16 @@ class OperatorWindow(QMainWindow):
         return self._all_user_person_cameras_ready()
 
     def _refresh_user_mode_labels(self) -> None:
-        if not hasattr(self, "user_progress_label"):
+        if not hasattr(self, "driver_test_buttons"):
             return
-        self.user_progress_label.setText(self._user_progress_text())
-        for label, button in self.user_mode_buttons.items():
+        for label, button in self.driver_test_buttons.items():
             active = (
                 (label == "IDLE" and self._user_mode_state == "idle")
                 or (label == "진입" and self._user_mode_state == "entry")
                 or (label == "진입완료" and self._user_mode_state == "entry_complete")
                 or (label == "번호판인식" and self._user_mode_state == "plate_recognition")
                 or (label == "주차시작" and self._user_mode_state == "parking_started")
+                or (label == "실제 상태" and not self._driver_simulated and self._driver_state_override is None)
             )
             button.setProperty("active", active)
             button.style().unpolish(button)
@@ -1249,24 +1404,8 @@ class OperatorWindow(QMainWindow):
             item = self.grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                widget.setParent(None)
-        while self.user_grid.count():
-            item = self.user_grid.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-        for role, col, stretch in ((CameraRole.ceiling, 0, 4), (CameraRole.front, 1, 5)):
-            widget = self.camera_widgets[role]
-            widget.set_display_mode("cover")
-            if role is CameraRole.ceiling:
-                widget.setMinimumSize(320, 520)
-                widget.setMaximumWidth(560)
-            else:
-                widget.setMinimumSize(520, 360)
-                widget.setMaximumWidth(16777215)
-            self.user_grid.addWidget(widget, 0, col)
-            self.user_grid.setColumnStretch(col, stretch)
-        self.user_grid.setRowStretch(0, 1)
+                widget.hide()
+        self.driver_view.detach_cameras()
 
     def _reset_person_alert(self) -> None:
         self._person_detection_streak = 0
@@ -1316,17 +1455,13 @@ class OperatorWindow(QMainWindow):
         self._camera_layout_mode = mode
         for widget in self.camera_widgets.values():
             widget.set_display_mode("contain")
-        if hasattr(self, "user_grid"):
-            while self.user_grid.count():
-                item = self.user_grid.takeAt(0)
-                widget = item.widget()
-                if widget is not None:
-                    widget.setParent(None)
+        if hasattr(self, "driver_view"):
+            self.driver_view.detach_cameras()
         while self.grid.count():
             item = self.grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                widget.setParent(None)
+                widget.hide()
         if mode == "all":
             layout = (
                 (CameraRole.ceiling, 0, 0),
@@ -1348,6 +1483,7 @@ class OperatorWindow(QMainWindow):
                 widget.setMinimumSize(360, 220)
                 widget.setMaximumWidth(16777215)
             self.grid.addWidget(widget, row, col)
+            widget.show()
         self.grid.setColumnStretch(0, 2 if mode == "dashboard" else 1)
         self.grid.setColumnStretch(1, 5 if mode == "dashboard" else 1)
         for row in range(2):
@@ -1447,7 +1583,7 @@ class OperatorWindow(QMainWindow):
             self.model_status_label.setText(f"모델 선택: {selected_text}")
         for worker in tuple(self._detection_workers):
             worker.stop()
-        for widget in self.camera_widgets.values():
+        for widget in self._all_camera_surfaces():
             widget.clear_detections()
 
     def _toggle_purpose_inference(self, task_id: str) -> None:
@@ -1474,8 +1610,7 @@ class OperatorWindow(QMainWindow):
             self._set_front_lpr_button_text()
             self.instruction_label.setText("정면카메라LPR 실패: 정면 프레임 없음")
             self.warning_label.setText("정면카메라LPR을 실행할 최신 정면 카메라 프레임이 없습니다. 최종 OK는 차단됩니다.")
-            if hasattr(self, "user_warning_label"):
-                self.user_warning_label.setText("번호판 인식 실패: 정면 프레임 없음. 최종 OK는 차단됩니다.")
+            self._refresh_driver_display()
             return
 
         self._front_lpr_enabled = True
@@ -1495,24 +1630,20 @@ class OperatorWindow(QMainWindow):
 
     def _set_front_lpr_status(self, message: str) -> None:
         self.warning_label.setText(f"{message}. 최종 OK는 차단됩니다.")
-        if hasattr(self, "user_warning_label"):
-            self.user_warning_label.setText(f"{message}. 최종 OK는 차단됩니다.")
 
     def _set_front_lpr_result(self, payload: dict[str, object]) -> None:
         if payload.get("ok"):
             last4 = str(payload.get("last4") or "")
             self.instruction_label.setText(f"정면카메라LPR: {last4}")
             self.warning_label.setText(f"정면카메라LPR 완료. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
-            if hasattr(self, "user_plate_label"):
-                self.user_plate_label.setText(f"번호판: {last4}")
-                self.user_instruction_label.setText(f"번호판 인식: {last4}")
-                self.user_warning_label.setText("번호판 인식 완료. 최종 OK는 차단됩니다.")
+            self._driver_masked_plate = f"•••• {last4}" if last4 else ""
+            self.user_plate_label.setText(f"번호판: {last4}")
+            self._refresh_driver_display()
             return
         message = str(payload.get("message") or "정면카메라LPR 실패: 결과 없음")
         self.instruction_label.setText(message)
         self.warning_label.setText(f"{message}. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
-        if hasattr(self, "user_warning_label"):
-            self.user_warning_label.setText(f"{message}. 최종 OK는 차단됩니다.")
+        self._refresh_driver_display()
 
     def _stop_front_camera_lpr(self) -> None:
         self._front_lpr_enabled = False
@@ -1678,7 +1809,7 @@ class OperatorWindow(QMainWindow):
         self._set_purpose_button_texts()
         for worker in tuple(self._purpose_workers):
             worker.stop()
-        for widget in self.camera_widgets.values():
+        for widget in self._all_camera_surfaces():
             widget.clear_detections()
 
     def _cleanup_purpose_worker(self, thread: QThread, worker: PurposeInferenceWorker) -> None:
@@ -2006,11 +2137,22 @@ def _purpose_detection_label(
 
 
 def _prepare_operator_window(window: OperatorWindow, *, fullscreen: bool) -> None:
+    screen = window.screen() or QApplication.primaryScreen()
+    available = screen.availableGeometry() if screen is not None else QRect(0, 0, WINDOWED_MAX_WIDTH, WINDOWED_MAX_HEIGHT)
+    window.setMinimumSize(0, 0)
+    window.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)
     if fullscreen:
-        window.setMaximumWidth(16777215)
+        window.setMaximumSize(16777215, 16777215)
         return
-    window.setMaximumWidth(WINDOWED_MAX_WIDTH)
-    window.resize(min(WINDOWED_DEFAULT_WIDTH, WINDOWED_MAX_WIDTH), WINDOWED_DEFAULT_HEIGHT)
+
+    maximum_width = min(WINDOWED_MAX_WIDTH, available.width())
+    maximum_height = min(WINDOWED_MAX_HEIGHT, available.height())
+    window.setMaximumSize(maximum_width, maximum_height)
+
+    window.resize(
+        min(WINDOWED_DEFAULT_WIDTH, maximum_width),
+        min(WINDOWED_DEFAULT_HEIGHT, maximum_height),
+    )
 
 
 def launch_operator_ui(model: OperatorDisplayModel, settings: Settings | None = None) -> int:
@@ -2157,4 +2299,4 @@ def _stylesheet() -> str:
         background: transparent;
         border: 0;
     }
-    """
+    """ + DRIVER_STYLESHEET

@@ -25,7 +25,9 @@ Run on any developer machine:
 
 Run without real hardware:
 
-- App starts on the operator dashboard.
+- App starts in driver-facing user mode with no development buttons.
+- The hidden top-right hotspot requires a completed two-second hold and cancels on early release or pointer exit.
+- User and operator surfaces switch within the stack instead of appearing together.
 - Sidebar opens and closes.
 - Dashboard and all-camera layouts switch correctly.
 - Ceiling birdview uses the vertical dashboard tile and CCW 90-degree display policy.
@@ -73,7 +75,8 @@ WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-veri
 
 Manual or semi-automated checklist:
 
-- Confirm the app starts on the operator dashboard.
+- Confirm the app starts in the dark, camera-first user mode.
+- Hold the top-right hotspot for two seconds and confirm the operator dashboard replaces user mode.
 - Confirm ceiling birdview and front camera are visible on the first screen.
 - Confirm ceiling birdview uses the vertical tile and CCW 90-degree display policy.
 - Confirm `메뉴` opens the sidebar.

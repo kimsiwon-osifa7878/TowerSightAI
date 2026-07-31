@@ -1,6 +1,6 @@
 # UI and Calibration Guide
 
-The UI is an operator-centered HMI for validating camera, AI, calibration, and PLC readiness from one console. It must still behave as a safety display: unknown, stale, missing, simulated, or low-confidence inputs never look safe and never authorize PLC OK.
+The UI contains separate driver-facing user mode and operator mode in one PyQt6 application. It must behave as a safety display: unknown, stale, missing, simulated, or low-confidence inputs never look safe and never authorize PLC OK.
 
 ## UI-First Development Rule
 
@@ -12,11 +12,23 @@ New features should be added in this order:
 4. Connect real camera, Hailo, calibration, AI-stage, or PLC logic.
 5. Keep the UI result auditable through the test screen or diagnostics log.
 
+## User Mode
+
+The app starts in user mode on the installed parking-machine display.
+
+- Use an edge-to-edge, near-black camera canvas sized for a 50-inch 16:9 display viewed from about 6 m.
+- Put one short action in a top overlay with a 50%-transparent background.
+- Keep branding, stage, and blocking status small in a bottom strip.
+- Do not expose development state buttons, model details, paths, or inference counters.
+- A visually hidden `72 x 72 px` top-right hotspot enters operator mode only after a continuous two-second mouse or touch hold.
+- User-visible camera priority is front only while idle, then front plus ceiling birdview after vehicle detection and throughout entry, alignment, and safety guidance.
+- Rear-side and opposite-side cameras continue running for person/obstacle safety checks but are shown only in the operator `전체 카메라` inspection view. Hidden safety cameras remain required inputs and can still block the user display and final OK.
+
 ## Operator Dashboard
 
-The app starts on the operator dashboard. There is no separate driver screen in the current UI direction.
+Operator mode is reached through the hidden user-mode hold or the service keyboard fallback.
 
-Default layout:
+Default operator layout:
 
 - Ceiling birdview and front camera are the primary first-screen views.
 - Ceiling birdview is shown as a vertical tile and the frame is displayed CCW 90 degrees.
@@ -58,6 +70,7 @@ Unimplemented feature slots must be labeled `EMPTY`. Pressing an `EMPTY` button 
 UI test and simulation actions are for implementation verification only.
 
 - Vehicle-entry simulation may draw test overlays and update instruction text.
+- Driver-stage controls live in the operator-only `사용자 화면 테스트` panel.
 - Fake camera, fake detection, fake PLC, and fake AI-stage actions must be visually marked or described as test-only.
 - Test actions must not send real PLC events.
 - Test actions must not make `can_show_final_ok` true.

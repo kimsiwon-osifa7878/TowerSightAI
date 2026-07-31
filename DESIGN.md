@@ -181,12 +181,18 @@ Render overlays in this order:
 
 - Starts as the installed driver-facing display.
 - Contains no development state buttons, model selection, file paths, or inference counters.
-- Provides a guarded route to operator mode.
+- Uses a near-black, full-camera canvas modeled after modern surround-view parking displays. Camera content reaches every screen edge and all driver guidance is rendered as an overlay.
+- Targets a 50-inch 16:9 display viewed from approximately 6 m. The current action uses a `52-86 px` responsive headline; camera names, health, and prototype diagnostics stay intentionally small.
+- Keeps the driver action in a shallow top overlay with a 50%-transparent background so the camera remains visible. Branding, current stage, and diagnostic status share a compact strip at the bottom.
+- Shows one short driver action at a time (`진입`, `정지`, `오른쪽 이동`, or `주차기 밖으로 이동`) with supporting text reduced to one line.
+- Provides a visually hidden `72 x 72 px` hotspot in the top-right corner. Holding it for two seconds enters operator mode; a short press, pointer cancellation, or moving outside the hotspot does nothing.
 - Uses state-machine and normalized AI-stage output, not raw detections, to select the instruction.
 
 ### Operator mode
 
 - Retains all-camera inspection, camera settings, purpose-specific inference controls, diagnostics, simulations, and `EMPTY` slots.
+- Follows the current PyQt dark industrial HMI direction: collapsible sidebar, persistent NG status, dashboard/all-camera layouts, camera settings, and a telemetry strip.
+- Provides a visible `사용자모드` sidebar action for returning to the driver-facing surface.
 - Owns manual state playback used for UI testing.
 - Never lets fake or simulated input authorize PLC OK.
 
@@ -215,11 +221,13 @@ This is an internal UI contract, not a new PLC or external API.
 - It is a standalone HTML/CSS/JavaScript file with no network dependency.
 - It uses only sanitized repository assets and abstract mock camera surfaces.
 - It switches between representative states without starting cameras, Hailo, or PLC communication.
+- It demonstrates the two-second operator entry gesture and a non-authoritative operator-mode mock without invoking product services.
+- Operator actions only change local prototype presentation. AI controls, simulation, camera settings, and `EMPTY` actions remain explicitly marked as mock/not connected and keep final OK blocked.
 - The state selector is clearly separated from the simulated product screen.
-- Every state carries the prototype/PLC-blocked notice.
+- Every state carries one persistent prototype/PLC-blocked notice without repeating it on every camera tile.
 - Approval covers layout, hierarchy, colors, wording, camera priority, and overlay direction.
 
-No production PyQt user-mode redesign starts until this prototype is reviewed.
+The reviewed prototype is the visual contract for the production PyQt6 user-mode implementation.
 
 ## 11. Acceptance Criteria
 
@@ -229,5 +237,7 @@ No production PyQt user-mode redesign starts until this prototype is reviewed.
 - Person detection and fault states cannot be mistaken for safe operation.
 - At 1920x1080 and 1440x900, text does not overlap cameras or controls.
 - No real RTSP URL, password, PLC secret, local Hailo path, or real plate is present.
+- A short press or aborted hold on the hidden operator hotspot cannot change mode; a completed two-second hold enters operator mode.
+- Operator mode exposes the PyQt-equivalent menu set, can return visibly to user mode, and never implies that AI, camera settings, or PLC output actually ran.
 - The prototype and every simulation remain visibly blocked from final PLC OK.
 - Later PyQt work preserves all existing conservative safety gates and passes the repository UI verification checklist.

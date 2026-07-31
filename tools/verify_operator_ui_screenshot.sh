@@ -4,17 +4,28 @@ set -euo pipefail
 ENV_FILE="${1:-.env}"
 OUT_DIR="${2:-tmp/operator-ui-verification}"
 WAIT_SECONDS="${WAIT_SECONDS:-8}"
+USER_WAIT_SECONDS="${USER_WAIT_SECONDS:-5}"
 WINDOW_TITLE="${WINDOW_TITLE:-TowerSightAI Operator Console}"
+UI_MODE="${3:-${UI_MODE:-windowed}}"
+
+if [[ "$UI_MODE" != "windowed" && "$UI_MODE" != "fullscreen" ]]; then
+  echo "UI_MODE must be either windowed or fullscreen." >&2
+  exit 2
+fi
 
 mkdir -p "$OUT_DIR"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-SCREENSHOT="$OUT_DIR/operator-ui-$STAMP.png"
+SCREENSHOT="$OUT_DIR/user-ui-$STAMP.png"
+OPERATOR_SCREENSHOT="$OUT_DIR/operator-ui-$STAMP.png"
 SIDEBAR_SCREENSHOT="$OUT_DIR/operator-ui-sidebar-$STAMP.png"
 ALL_CAMERAS_SCREENSHOT="$OUT_DIR/operator-ui-all-cameras-$STAMP.png"
+USER_AFTER_ALL_CAMERAS_SCREENSHOT="$OUT_DIR/user-ui-after-all-cameras-$STAMP.png"
 PERSON_SCREENSHOT="$OUT_DIR/operator-ui-person-presence-$STAMP.png"
+USER_AFTER_PERSON_SCREENSHOT="$OUT_DIR/user-ui-after-person-presence-$STAMP.png"
 SIMULATION_SCREENSHOT="$OUT_DIR/operator-ui-simulation-$STAMP.png"
 EMPTY_SCREENSHOT="$OUT_DIR/operator-ui-empty-$STAMP.png"
+DRIVER_TEST_SCREENSHOT="$OUT_DIR/operator-ui-driver-test-$STAMP.png"
 LOG_FILE="$OUT_DIR/operator-ui-$STAMP.log"
 
 PYTHON=""
@@ -51,7 +62,7 @@ cleanup() {
 trap cleanup EXIT
 
 QT_QPA_PLATFORM="$QT_QPA_PLATFORM" \
-  "$PYTHON" -m towersightai.cli.operator_ui --env "$ENV_FILE" --windowed >"$LOG_FILE" 2>&1 &
+  "$PYTHON" -m towersightai.cli.operator_ui --env "$ENV_FILE" "--$UI_MODE" >"$LOG_FILE" 2>&1 &
 APP_PID="$!"
 
 for _ in $(seq 1 "$WAIT_SECONDS"); do
@@ -70,7 +81,7 @@ WINDOW_ID="$(xdotool search --name "$WINDOW_TITLE" 2>/dev/null | head -n 1 || tr
 if [[ -n "$WINDOW_ID" ]]; then
   xdotool windowactivate "$WINDOW_ID" 2>/dev/null || true
 fi
-sleep 1
+sleep "$USER_WAIT_SECONDS"
 
 gnome-screenshot -f "$SCREENSHOT"
 identify "$SCREENSHOT"
@@ -83,6 +94,16 @@ if [[ -n "$WINDOW_ID" ]]; then
     $1 == "HEIGHT" {h=$2}
     END {print x, y, w, h}
   ')
+  echo "Window geometry: ${_WINDOW_W}x${_WINDOW_H}+${WINDOW_X}+${WINDOW_Y}"
+  WINDOW_STATE="$(xprop -id "$WINDOW_ID" _NET_WM_STATE 2>/dev/null || true)"
+  if [[ "$UI_MODE" == "fullscreen" && "$WINDOW_STATE" != *"_NET_WM_STATE_FULLSCREEN"* ]]; then
+    echo "UI window did not enter true fullscreen mode: $WINDOW_STATE" >&2
+    exit 2
+  fi
+  if [[ "$UI_MODE" == "windowed" ]] && ((_WINDOW_W > 1920 || _WINDOW_H > 1024)); then
+    echo "UI window exceeds the 1920x1024 safety bound." >&2
+    exit 2
+  fi
 
   click_at() {
     local rel_x="$1"
@@ -92,25 +113,54 @@ if [[ -n "$WINDOW_ID" ]]; then
     sleep 1
   }
 
-  click_at 45 35
+  HOTSPOT_X=$((_WINDOW_W - 36))
+  enter_operator() {
+    xdotool windowactivate "$WINDOW_ID" 2>/dev/null || true
+    xdotool mousemove --window "$WINDOW_ID" "$HOTSPOT_X" 36
+    xdotool mousedown 1
+    sleep 3
+    xdotool mouseup 1
+    sleep 1
+  }
+
+  enter_operator
+  gnome-screenshot -f "$OPERATOR_SCREENSHOT"
+  identify "$OPERATOR_SCREENSHOT"
+
+  # xdotool --window coordinates are relative to the Qt client area.
+  click_at 50 65
   gnome-screenshot -f "$SIDEBAR_SCREENSHOT"
   identify "$SIDEBAR_SCREENSHOT"
 
-  click_at 150 105
+  click_at 150 162
   gnome-screenshot -f "$ALL_CAMERAS_SCREENSHOT"
   identify "$ALL_CAMERAS_SCREENSHOT"
 
-  click_at 150 295
+  click_at 150 98
+  gnome-screenshot -f "$USER_AFTER_ALL_CAMERAS_SCREENSHOT"
+  identify "$USER_AFTER_ALL_CAMERAS_SCREENSHOT"
+
+  enter_operator
+  click_at 150 542
   gnome-screenshot -f "$PERSON_SCREENSHOT"
   identify "$PERSON_SCREENSHOT"
 
-  click_at 150 333
+  click_at 150 98
+  gnome-screenshot -f "$USER_AFTER_PERSON_SCREENSHOT"
+  identify "$USER_AFTER_PERSON_SCREENSHOT"
+
+  enter_operator
+  click_at 150 606
   gnome-screenshot -f "$SIMULATION_SCREENSHOT"
   identify "$SIMULATION_SCREENSHOT"
 
-  click_at 150 371
+  click_at 150 670
   gnome-screenshot -f "$EMPTY_SCREENSHOT"
   identify "$EMPTY_SCREENSHOT"
+
+  click_at 150 798
+  gnome-screenshot -f "$DRIVER_TEST_SCREENSHOT"
+  identify "$DRIVER_TEST_SCREENSHOT"
 fi
 
 echo "$SCREENSHOT"

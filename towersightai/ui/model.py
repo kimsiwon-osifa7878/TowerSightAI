@@ -44,6 +44,22 @@ class OperatorAccessState(str, Enum):
     UNLOCKED = "UNLOCKED"
 
 
+class DriverTone(str, Enum):
+    WAIT = "WAIT"
+    DANGER = "DANGER"
+    READY = "READY"
+    STOPPED = "STOPPED"
+    TEST = "TEST"
+
+
+class DriverLayout(str, Enum):
+    FRONT = "front"
+    ENTRY = "entry"
+    ALIGNMENT = "alignment"
+    SAFETY = "safety"
+    HUMAN = "human"
+
+
 @dataclass(frozen=True)
 class CameraTileState:
     camera_id: str
@@ -79,6 +95,7 @@ class OperatorDisplayModel:
     warning: str
     plc_state: PlcConnectionState
     camera_tiles: tuple[CameraTileState, ...]
+    alignment: AlignmentResult = AlignmentResult.UNKNOWN
     fullscreen: bool = True
     hailo_healthy: bool = False
     calibration_valid: bool = False
@@ -106,6 +123,23 @@ class OperatorDisplayModel:
         if blocked:
             return f"카메라 {blocked}/4 차단"
         return "카메라 4/4 정상"
+
+
+@dataclass(frozen=True)
+class DriverDisplayModel:
+    state: ParkingState
+    stage_label: str
+    headline: str
+    detail: str
+    blocking_reason: str
+    tone: DriverTone
+    symbol: str
+    layout: DriverLayout
+    visible_roles: tuple[CameraRole, ...]
+    primary_role: CameraRole | None
+    masked_plate_text: str = ""
+    simulated: bool = False
+    can_show_final_ok: bool = False
 
 
 def build_operator_display(
@@ -168,12 +202,76 @@ def build_operator_display(
         warning=warning,
         plc_state=plc_state,
         camera_tiles=tiles,
+        alignment=alignment,
         fullscreen=fullscreen,
         hailo_healthy=hailo_healthy,
         calibration_valid=calibration_valid,
         human_possible=human_possible,
         occupant_possible=occupant_possible,
         obstacle_possible=obstacle_possible,
+    )
+
+
+def build_driver_display(
+    source: OperatorDisplayModel,
+    *,
+    state_override: ParkingState | None = None,
+    alignment_override: AlignmentResult | None = None,
+    blocked_roles: Iterable[CameraRole] | None = None,
+    primary_alert_role: CameraRole | None = None,
+    masked_plate_text: str = "",
+    simulated: bool = False,
+) -> DriverDisplayModel:
+    state = state_override or source.state
+    alignment = alignment_override or source.alignment
+    layout, visible_roles, primary_role = _driver_layout_for_state(
+        state,
+        primary_alert_role=primary_alert_role,
+    )
+    if blocked_roles is None:
+        blocked = {tile.role for tile in source.camera_tiles if tile.blocked}
+    else:
+        blocked = set(blocked_roles)
+    required_roles = _driver_required_roles_for_state(state, visible_roles)
+    required_blocked = any(role in blocked for role in required_roles)
+
+    stage_label, headline, detail, symbol = _driver_copy_for_state(state, alignment)
+    tone = DriverTone.WAIT
+    blocking_reason = source.warning
+    can_show_final_ok = source.can_show_final_ok and not simulated
+
+    if simulated:
+        tone = DriverTone.TEST
+        blocking_reason = "TEST · 시뮬레이션 입력 · PLC OK 차단"
+        can_show_final_ok = False
+    elif required_blocked:
+        tone = DriverTone.DANGER
+        headline = "정지"
+        detail = "필수 카메라 영상을 확인할 수 없습니다."
+        symbol = "!"
+        blocking_reason = "필수 카메라 입력 없음 · 주차기 동작 금지"
+        can_show_final_ok = False
+    elif state is ParkingState.HUMAN_DETECTED:
+        tone = DriverTone.DANGER
+    elif state is ParkingState.AI_STOP:
+        tone = DriverTone.STOPPED
+    elif can_show_final_ok:
+        tone = DriverTone.READY
+
+    return DriverDisplayModel(
+        state=state,
+        stage_label=stage_label,
+        headline=headline,
+        detail=detail,
+        blocking_reason=blocking_reason,
+        tone=tone,
+        symbol=symbol,
+        layout=layout,
+        visible_roles=visible_roles,
+        primary_role=primary_role,
+        masked_plate_text=masked_plate_text,
+        simulated=simulated,
+        can_show_final_ok=can_show_final_ok,
     )
 
 
@@ -200,6 +298,77 @@ def guidance_message_for_alignment(alignment: AlignmentResult) -> str:
         AlignmentResult.ALIGNMENT_NG: "정렬 상태를 확인할 수 없습니다. 잠시 정지해 주세요.",
         AlignmentResult.UNKNOWN: "차량 위치를 확인 중입니다. 천천히 진입해 주세요.",
     }[alignment]
+
+
+def _driver_layout_for_state(
+    state: ParkingState,
+    *,
+    primary_alert_role: CameraRole | None,
+) -> tuple[DriverLayout, tuple[CameraRole, ...], CameraRole | None]:
+    del primary_alert_role
+    if state is ParkingState.IDLE:
+        return DriverLayout.FRONT, (CameraRole.front,), CameraRole.front
+    if state in {
+        ParkingState.VEHICLE_DETECTED,
+        ParkingState.PLATE_RECOGNITION,
+        ParkingState.VEHICLE_ENTERING,
+    }:
+        return DriverLayout.ENTRY, (CameraRole.front, CameraRole.ceiling), CameraRole.front
+    if state in {ParkingState.ALIGNMENT_GUIDE, ParkingState.PARKED}:
+        return DriverLayout.ALIGNMENT, (CameraRole.ceiling, CameraRole.front), CameraRole.ceiling
+    return DriverLayout.ENTRY, (CameraRole.front, CameraRole.ceiling), CameraRole.front
+
+
+def _driver_required_roles_for_state(
+    state: ParkingState,
+    visible_roles: tuple[CameraRole, ...],
+) -> tuple[CameraRole, ...]:
+    if state in {
+        ParkingState.SAFETY_CHECK,
+        ParkingState.HUMAN_DETECTED,
+        ParkingState.READY_FOR_OPERATION,
+    }:
+        return (
+            CameraRole.ceiling,
+            CameraRole.front,
+            CameraRole.rear_side,
+            CameraRole.opposite_side,
+        )
+    return visible_roles
+
+
+def _driver_copy_for_state(
+    state: ParkingState,
+    alignment: AlignmentResult,
+) -> tuple[str, str, str, str]:
+    if state is ParkingState.IDLE:
+        return "입차 대기", "진입 준비", "안내가 표시되면 천천히 진입하세요.", "P"
+    if state is ParkingState.VEHICLE_DETECTED:
+        return "차량 감지", "천천히 진입", "정면 가이드 안쪽으로 직진하세요.", "↑"
+    if state is ParkingState.PLATE_RECOGNITION:
+        return "번호판 인식", "천천히 진입", "차량번호 확인 중", "▣"
+    if state is ParkingState.VEHICLE_ENTERING:
+        return "차량 진입", "천천히 진입", "정면 가이드 안쪽으로 직진하세요.", "↑"
+    if state is ParkingState.ALIGNMENT_GUIDE:
+        headline, symbol = {
+            AlignmentResult.MOVE_RIGHT: ("오른쪽 이동", "→"),
+            AlignmentResult.MOVE_LEFT: ("왼쪽 이동", "←"),
+            AlignmentResult.MOVE_FORWARD: ("전진", "↑"),
+            AlignmentResult.MOVE_BACKWARD: ("후진", "↓"),
+            AlignmentResult.PARKED_OK: ("정지", "■"),
+            AlignmentResult.ALIGNMENT_NG: ("정지", "!"),
+            AlignmentResult.UNKNOWN: ("천천히 진입", "…"),
+        }[alignment]
+        return "버드뷰 정렬", headline, "차량 중심을 중앙선에 맞추세요.", symbol
+    if state is ParkingState.PARKED:
+        return "주차 위치 도달", "정지", "시동을 끄고 사이드미러를 접으세요.", "■"
+    if state is ParkingState.SAFETY_CHECK:
+        return "내부 안전 확인", "주차기 밖으로 이동", "안전 확인이 끝날 때까지 밖에서 기다리세요.", "…"
+    if state is ParkingState.HUMAN_DETECTED:
+        return "사람 감지", "즉시 밖으로 이동", "사람 감지 · 주차기에서 멀리 떨어지세요.", "!"
+    if state is ParkingState.READY_FOR_OPERATION:
+        return "안전 확인 완료", "밖에서 기다리세요", "주차기 동작 준비 중입니다.", "✓"
+    return "AI 감시 중지", "밖에서 기다리세요", "주차기가 동작 중입니다.", "■"
 
 
 def _safety_status_for_state(
