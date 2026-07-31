@@ -455,7 +455,17 @@ class PurposeInferenceWorker(QObject):
             failed = True
             self.status_changed.emit(process.task_id, message)
 
-        self._runner = PurposeInferenceRunner(process, on_events=on_events, on_lpr_results=on_lpr_results, on_error=on_error)
+        def on_status(message: str) -> None:
+            for camera_id in process.camera_ids or (process.task_id,):
+                self.status_changed.emit(camera_id, message)
+
+        self._runner = PurposeInferenceRunner(
+            process,
+            on_events=on_events,
+            on_lpr_results=on_lpr_results,
+            on_error=on_error,
+            on_status=on_status,
+        )
         try:
             self._runner.run()
         except Exception as exc:  # noqa: BLE001 - worker boundary must expose unexpected runtime failures.

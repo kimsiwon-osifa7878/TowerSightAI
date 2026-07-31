@@ -19,10 +19,14 @@ from towersightai.inference.live_detection import (
 def _settings(tmp_path: Path) -> Settings:
     hef = tmp_path / "model.hef"
     so = tmp_path / "post.so"
+    hailo_apps_python = tmp_path / "hailo_apps_venv" / "bin" / "python"
     hef.write_text("hef", encoding="utf-8")
     so.write_text("so", encoding="utf-8")
     return Settings(
         tappas_workspace=tmp_path,
+        hailo_apps_workspace=tmp_path / "hailo-apps",
+        hailo_apps_resources=tmp_path / "hailo-apps" / "resources",
+        hailo_apps_python=hailo_apps_python,
         hailo_hef_path=hef,
         hailo_postprocess_so=so,
         camera_1={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://user:secret@192.0.2.10/stream1"},
@@ -93,21 +97,23 @@ def test_live_detection_pipeline_uses_camera_config_default_rotation(tmp_path: P
     assert "videoflip method=counterclockwise ! videoscale add-borders=true" in pipeline
 
 
-def test_live_detection_process_sets_camera_event_sink_and_tappas_env(tmp_path: Path, monkeypatch):
+def test_live_detection_process_sets_camera_event_sink_and_hailo_apps_env(tmp_path: Path, monkeypatch):
     settings = _settings(tmp_path)
-    tappas_bin = tmp_path / "hailo_tappas_venv" / "bin"
-    tappas_bin.mkdir(parents=True)
+    hailo_apps_bin = settings.hailo_apps_python.parent
+    hailo_apps_bin.mkdir(parents=True)
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
 
     process = live_detection_process(settings, settings.camera_1, event_dir=tmp_path / "events")
+    command = " ".join(process.command)
 
     assert process.event_path == tmp_path / "events" / "ceiling.jsonl"
     assert process.hef_path == settings.hailo_hef_path
-    assert process.env["TOWERSIGHTAI_HAILO_CAMERA_ID"] == "ceiling"
-    assert process.env["TOWERSIGHTAI_HAILO_EVENT_PATH"] == str(process.event_path)
-    assert process.env["VIRTUAL_ENV"] == str(tmp_path / "hailo_tappas_venv")
-    assert process.env["PATH"].startswith(str(tappas_bin))
+    assert "towersightai.cli.hailo_apps_detection" in command
+    assert f"--event-path {process.event_path}" in command
+    assert f"--camera ceiling={settings.camera_1.rtsp_url}" in command
+    assert process.env["VIRTUAL_ENV"] == str(hailo_apps_bin.parent)
+    assert process.env["PATH"].startswith(str(hailo_apps_bin))
 
 
 def test_live_multistream_detection_pipeline_routes_each_camera_to_callback(tmp_path: Path):
@@ -158,10 +164,10 @@ def test_live_multistream_detection_pipeline_uses_selected_hef_override(tmp_path
     assert f"hailonet hef-path={settings.hailo_hef_path}" not in pipeline
 
 
-def test_live_multistream_detection_process_writes_camera_specific_callbacks(tmp_path: Path, monkeypatch):
+def test_live_multistream_detection_process_builds_hailo_apps_sources(tmp_path: Path, monkeypatch):
     settings = _settings(tmp_path)
-    tappas_bin = tmp_path / "hailo_tappas_venv" / "bin"
-    tappas_bin.mkdir(parents=True)
+    hailo_apps_bin = settings.hailo_apps_python.parent
+    hailo_apps_bin.mkdir(parents=True)
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
 
@@ -172,19 +178,15 @@ def test_live_multistream_detection_process_writes_camera_specific_callbacks(tmp
         hef_path=tmp_path / "selected.hef",
     )
 
+    command = " ".join(process.command)
     assert process.event_path == tmp_path / "events" / "multistream.jsonl"
-    assert process.env["TOWERSIGHTAI_HAILO_EVENT_PATH"] == str(process.event_path)
-    assert process.env["VIRTUAL_ENV"] == str(tmp_path / "hailo_tappas_venv")
-    ceiling_callback = tmp_path / "events" / "callback_ceiling.py"
-    front_callback = tmp_path / "events" / "callback_front.py"
-    assert "camera_id='ceiling'" in ceiling_callback.read_text(encoding="utf-8")
-    assert "camera_id='front'" in front_callback.read_text(encoding="utf-8")
-    assert f"event_path='{process.event_path}'" in ceiling_callback.read_text(encoding="utf-8")
-    assert f"hailopython module={ceiling_callback}" in " ".join(process.command)
-    assert f"hailopython module={front_callback}" in " ".join(process.command)
+    assert f"--event-path {process.event_path}" in command
+    assert f"--camera ceiling={settings.camera_1.rtsp_url}" in command
+    assert f"--camera front={settings.camera_2.rtsp_url}" in command
+    assert process.env["VIRTUAL_ENV"] == str(hailo_apps_bin.parent)
     assert process.log_path == tmp_path / "events" / "multistream.gst.log"
     assert process.hef_path == tmp_path / "selected.hef"
-    assert f"hailonet hef-path={tmp_path / 'selected.hef'}" in " ".join(process.command)
+    assert f"--hef {tmp_path / 'selected.hef'}" in command
 
 
 def test_live_detection_runner_redirects_gstreamer_output_to_log_file(tmp_path: Path, monkeypatch):
@@ -213,8 +215,9 @@ def test_live_detection_runner_redirects_gstreamer_output_to_log_file(tmp_path: 
 
     assert runner.run() is True
 
-    assert popen_kwargs["stdout"] == subprocess.DEVNULL
+    assert popen_kwargs["stdout"].name == str(tmp_path / "gst.log")
     assert popen_kwargs["stderr"].name == str(tmp_path / "gst.log")
+    assert popen_kwargs["stdout"] is popen_kwargs["stderr"]
     log_text = (tmp_path / "gst.log").read_text(encoding="utf-8")
     assert f"active-hef-path={tmp_path / 'selected.hef'}" in log_text
     assert "rtsp://***:***@192.0.2.10/stream1" in log_text

@@ -49,6 +49,22 @@ Low confidence, missing resources, no events, callback failures, or process fail
 
 ## Runtime Failure Handling
 
-The adapter writes stdout and stderr to the task's raw log. Runners watch for Hailo device failures, unsupported HEFs, missing GStreamer elements, internal stream errors, and abnormal process exits. A failed or stuck process is terminated and reported to the UI while PLC OK remains blocked.
+The adapter writes stdout and stderr to the task's raw log. Runners watch for Hailo device failures, unsupported HEFs, missing GStreamer elements, abnormal process exits, and stale pipeline heartbeats. A failed or stuck process is terminated and reported to the UI while PLC OK remains blocked.
+
+The active multisource adapter changes `hailoroundrobin` to non-blocking mode so one delayed input cannot indefinitely hold every healthy stream. This does not relax the safety gate: a required camera whose post-inference heartbeat becomes stale triggers recovery and keeps PLC OK blocked.
+
+Purpose-task heartbeats record progress at these boundaries:
+
+- RTSP packet arrival.
+- Source queue input and round-robin input.
+- Round-robin output.
+- `hailonet` input and output.
+- Postprocess output.
+- Python callback input and completion.
+- Per-element queue fill levels.
+
+These boundaries are diagnostic evidence only. Detection-event counts are not frame-health counters and must not be used to identify a stalled camera. The parent runner reads only the final heartbeat record during polling so diagnostic history size does not increase steady-state polling cost.
+
+When post-inference output for a required camera becomes stale, the parent terminates the complete inference process and starts a fresh child process. This creates new GStreamer, Hailo, and RTSP sessions without depending on an in-process pipeline teardown, which can itself block on a failed RTSP source. Recovery is limited to three consecutive attempts. The run remains `recovering` and the safety state remains NG until the new child reports fresh post-inference buffers for every required camera. After 60 seconds of continuous healthy heartbeats, the consecutive-attempt counter resets. Exhausting the attempt limit changes the run to `failed`.
 
 The diagnostic collector reads existing logs and status files only; it does not start inference or hardware checks.

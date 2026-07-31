@@ -4,6 +4,28 @@ TowerSightAI is a safety-first AI monitoring system for a parking machine. It co
 
 The current repository is still an implementation prototype, not a production safety release. The core rule is unchanged: unknown, stale, missing, low-confidence, simulated, or unhealthy inputs must block final OK and keep the system in NG/wait.
 
+## Product Workflow And Display Intent
+
+TowerSightAI is intended to support the full parking-machine journey without shifting the safety burden to the driver or operator:
+
+```text
+vehicle approach
+  -> parking position guidance
+  -> plate recognition
+  -> driver exit guidance
+  -> parking-machine and in-vehicle person checks
+  -> operation remains blocked until every required safety condition is verified
+```
+
+The installed display has two distinct modes:
+
+- **User mode** is the driver-facing guidance surface. It prioritizes live camera context, ceiling birdview alignment, one current instruction, and an unmistakable stop/blocked state.
+- **Operator mode** retains camera inspection, AI diagnostics, settings, and test controls. Development telemetry and model details belong here rather than on the driver-facing screen.
+
+The visual direction for user mode is based on the provided ParkIO concept guide: a bright white/navy/cyan guidance surface with camera imagery, lane and stop overlays, and prominent red blocking states. The guide is a product and visual reference, not proof that any safety function is implemented or validated.
+
+The current implementation covers entry-side camera and Hailo integration only in part. Driver approach, vehicle movement, and exit-complete confirmation during the outbound flow remain future product work and must not be inferred from the current UI.
+
 ## Current Status
 
 Implemented:

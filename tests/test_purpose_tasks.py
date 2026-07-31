@@ -13,6 +13,8 @@ from towersightai.inference.purpose_tasks import (
     PURPOSE_VEHICLE_DETECTION,
     PurposeInferenceProcess,
     PurposeInferenceRunner,
+    _archive_runtime_file,
+    _read_last_text_line,
     build_purpose_process,
     parse_plate_ocr_json,
 )
@@ -43,7 +45,7 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-def test_vehicle_detection_process_uses_lpr_vehicle_model_and_callback(tmp_path: Path):
+def test_vehicle_detection_process_uses_hailo_apps_adapter_and_diagnostics(tmp_path: Path):
     settings = _settings(tmp_path)
 
     process = build_purpose_process(
@@ -59,11 +61,13 @@ def test_vehicle_detection_process_uses_lpr_vehicle_model_and_callback(tmp_path:
     assert process.camera_ids == ("front",)
     assert "yolov5m_vehicles.hef" in command
     assert settings.hailo_vehicle_detection_hef_path.as_posix() in command
-    assert settings.hailo_vehicle_detection_config_path.as_posix() in command
     assert settings.hailo_vehicle_detection_postprocess_so.as_posix() in command
-    assert "function-name=yolov5m_vehicles" in command
-    assert "configs/yolov5_vehicle_detection.json" in command
-    assert "hailopython" in command
+    assert "towersightai.cli.hailo_apps_detection" in command
+    assert "--allowed-label car" in command
+    assert "--diagnostic-path" in command
+    assert process.diagnostic_path == tmp_path / "events/vehicle_detection/vehicle.heartbeat.jsonl"
+    assert process.max_consecutive_restarts == 3
+    assert "hailopython" not in command
 
 
 def test_lpr_image_process_uses_fast_alpr_batch_runner(tmp_path: Path):
@@ -252,7 +256,7 @@ def test_lpr_ocr_callback_writes_no_result_attempt(tmp_path: Path, monkeypatch):
     assert attempt["plates"] == []
 
 
-def test_person_presence_process_uses_detector_without_reid_embedding(tmp_path: Path):
+def test_person_presence_process_uses_hailo_apps_detector_without_reid_embedding(tmp_path: Path):
     settings = _settings(tmp_path)
 
     process = build_purpose_process(
@@ -268,17 +272,16 @@ def test_person_presence_process_uses_detector_without_reid_embedding(tmp_path: 
     assert process.camera_ids == ("ceiling", "front")
     assert "yolov5s_personface_reid.hef" in command
     assert settings.hailo_person_presence_hef_path.as_posix() in command
-    assert settings.hailo_person_presence_config_path.as_posix() in command
     assert settings.hailo_person_presence_postprocess_so.as_posix() in command
-    assert settings.hailo_person_presence_crop_so.as_posix() in command
-    assert command.count("video/x-raw,format=RGB,width=640,height=640,pixel-aspect-ratio=1/1") == 3
-    assert "force-writable=true" in command
-    assert "function-name=yolov5_personface_letterbox" in command
-    assert "hailopython" in command
-    assert "allowed_labels=('person', 'human')" in (tmp_path / "events/person_presence/person_presence_callback_ceiling.py").read_text(encoding="utf-8")
+    assert "towersightai.cli.hailo_apps_detection" in command
+    assert "--allowed-label person" in command
+    assert "hailopython" not in command
     assert "repvgg_a0_person_reid_2048.hef" not in command
     assert "hailogallery" not in command
     assert "libre_id" not in command
+    assert "--diagnostic-path" in process.command
+    assert process.diagnostic_path == tmp_path / "events/person_presence/person_presence.heartbeat.jsonl"
+    assert process.max_consecutive_restarts == 3
 
 
 def test_purpose_runner_stops_spinning_gstreamer_on_fatal_hailo_log(tmp_path: Path, monkeypatch):
@@ -328,3 +331,178 @@ def test_purpose_runner_stops_spinning_gstreamer_on_fatal_hailo_log(tmp_path: Pa
     assert runner.run() is True
     assert errors
     assert "Caught SIGSEGV" in errors[0]
+
+
+def test_purpose_runner_stops_alive_process_on_pipeline_heartbeat_stall(tmp_path: Path, monkeypatch):
+    errors: list[str] = []
+    diagnostic_path = tmp_path / "person_presence.heartbeat.jsonl"
+    process = PurposeInferenceProcess(
+        task_id=PURPOSE_PERSON_PRESENCE,
+        label="사람 존재 감지",
+        command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
+        env={},
+        log_path=tmp_path / "person_presence.gst.log",
+        event_path=tmp_path / "person_presence.jsonl",
+        model_paths=(),
+        camera_ids=("front",),
+        diagnostic_path=diagnostic_path,
+    )
+
+    class StalledProcess:
+        pid = 54321
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout=None):  # noqa: ANN001 - fake subprocess API.
+            raise subprocess.TimeoutExpired("gst-launch-1.0", timeout)
+
+    stalled = StalledProcess()
+
+    def fake_popen(*_args, **_kwargs):
+        diagnostic_path.write_text(
+            json.dumps(
+                {
+                    "status": "stalled",
+                    "stale_cameras": ["front"],
+                    "stages": {
+                        "rtsp_packet": {"buffers": 120, "age_seconds": 0.1},
+                        "callback": {"buffers": 90, "age_seconds": 16.0},
+                    },
+                    "queue_levels": {"shared": {"inference_hailonet_q": 3}},
+                    "cameras": {
+                        "front": {
+                            "ingress_buffers": 100,
+                            "inference_buffers": 90,
+                            "ingress_age_seconds": 0.1,
+                            "inference_age_seconds": 16.0,
+                        }
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return stalled
+
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.shutil.which", lambda _command: "/usr/bin/gst-launch-1.0")
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.os.killpg", lambda _pid, _sig: None)
+
+    runner = PurposeInferenceRunner(process, on_events=lambda _events: None, on_error=errors.append)
+
+    assert runner.run() is True
+    assert errors
+    assert "AI pipeline stalled" in errors[0]
+    assert "stale-cameras=front" in errors[0]
+    assert '"rtsp_packet"' in errors[0]
+    assert '"inference_hailonet_q": 3' in errors[0]
+
+
+def test_purpose_runner_replaces_stalled_process_and_confirms_recovery(tmp_path: Path, monkeypatch):
+    errors: list[str] = []
+    statuses: list[str] = []
+    diagnostic_path = tmp_path / "person_presence.heartbeat.jsonl"
+    process = PurposeInferenceProcess(
+        task_id=PURPOSE_PERSON_PRESENCE,
+        label="사람 존재 감지",
+        command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
+        env={},
+        log_path=tmp_path / "person_presence.gst.log",
+        event_path=tmp_path / "person_presence.jsonl",
+        model_paths=(),
+        camera_ids=("front",),
+        diagnostic_path=diagnostic_path,
+        max_consecutive_restarts=1,
+        restart_delay_seconds=0,
+    )
+
+    class FakeProcess:
+        def __init__(self, pid: int, returncode: int | None) -> None:
+            self.pid = pid
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout=None):  # noqa: ANN001 - fake subprocess API.
+            self.returncode = -15
+            return self.returncode
+
+    launches = 0
+
+    def fake_popen(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        if launches == 1:
+            payload = {
+                "status": "stalled",
+                "stale_cameras": ["front"],
+                "cameras": {"front": {"inference_age_seconds": 16.0}},
+            }
+            child = FakeProcess(1001, None)
+        else:
+            payload = {
+                "status": "running",
+                "stale_cameras": [],
+                "cameras": {"front": {"inference_age_seconds": 0.01}},
+            }
+            child = FakeProcess(1002, 0)
+        diagnostic_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        return child
+
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.shutil.which", lambda _command: "/usr/bin/gst-launch-1.0")
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.os.killpg", lambda _pid, _sig: None)
+
+    runner = PurposeInferenceRunner(
+        process,
+        on_events=lambda _events: None,
+        on_error=errors.append,
+        on_status=statuses.append,
+        poll_seconds=0,
+    )
+
+    assert runner.run() is True
+    assert launches == 2
+    assert errors == []
+    assert statuses == ["AI 입력 스트림 복구 중 (1/1)", "AI 입력 스트림 복구 완료"]
+    assert tuple(tmp_path.glob("person_presence.heartbeat.jsonl.*.restart-1.previous"))
+    assert "PROCESS_RESTART attempt=1" in process.log_path.read_text(encoding="utf-8")
+
+
+def test_runtime_log_archive_preserves_previous_run_and_redacts_credentials(tmp_path: Path):
+    log_path = tmp_path / "person_presence.gst.log"
+    log_path.write_text(
+        'rtspsrc location="rtsp://operator:secret@camera.invalid/stream1"\n',
+        encoding="utf-8",
+    )
+
+    archive = _archive_runtime_file(log_path, "next-run")
+
+    assert archive == tmp_path / "person_presence.gst.log.next-run.previous"
+    assert not log_path.exists()
+    archived_text = archive.read_text(encoding="utf-8")
+    assert "operator" not in archived_text
+    assert "secret" not in archived_text
+    assert "rtsp://***:***@camera.invalid/stream1" in archived_text
+
+
+def test_read_last_text_line_does_not_require_loading_whole_history(tmp_path: Path):
+    path = tmp_path / "heartbeat.jsonl"
+    path.write_bytes((b"x" * 300_000) + b"\n{\"status\":\"stalled\"}\n")
+
+    assert _read_last_text_line(path) == '{"status":"stalled"}'

@@ -50,7 +50,6 @@ FATAL_GSTREAMER_PATTERNS = (
     'no element "hailo',
     "파이프라인이 재생을 원하지 않음",
     "파이프라인이 PREROLL하기를 원하지 않음",
-    "Internal data stream error",
 )
 PURPOSE_VEHICLE_DETECTION = "vehicle_detection"
 PURPOSE_LPR_IMAGE = "lpr_image"
@@ -71,7 +70,11 @@ class PurposeInferenceProcess:
     metadata_paths: tuple[Path, ...] = ()
     run_id: str = ""
     status_path: Path | None = None
+    diagnostic_path: Path | None = None
     validate_resource_paths: bool = False
+    max_consecutive_restarts: int = 0
+    restart_delay_seconds: float = 1.0
+    restart_stability_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -124,12 +127,14 @@ class PurposeInferenceRunner:
         on_events: Callable[[tuple[DetectionEvent, ...]], None],
         on_lpr_results: Callable[[tuple[PlateOcrEvent, ...]], None] | None = None,
         on_error: Callable[[str], None],
+        on_status: Callable[[str], None] | None = None,
         poll_seconds: float = 0.1,
     ) -> None:
         self.process = process
         self.on_events = on_events
         self.on_lpr_results = on_lpr_results or (lambda _events: None)
         self.on_error = on_error
+        self.on_status = on_status or (lambda _message: None)
         self.poll_seconds = poll_seconds
         self._running = True
         self._process: subprocess.Popen[str] | None = None
@@ -145,6 +150,7 @@ class PurposeInferenceRunner:
         started_monotonic = time.monotonic()
         event_counts: Counter[str] = Counter()
         lpr_result_count = 0
+        terminal_error = False
         logger.info(
             "ai-launch run-id=%s task=%s cameras=%s cwd=%s python=%s event-path=%s raw-log=%s",
             run_id,
@@ -207,6 +213,9 @@ class PurposeInferenceRunner:
         if self.process.event_path.exists():
             self.process.event_path.unlink()
         self.process.log_path.parent.mkdir(parents=True, exist_ok=True)
+        _archive_runtime_file(self.process.log_path, run_id)
+        if self.process.diagnostic_path is not None:
+            _archive_runtime_file(self.process.diagnostic_path, run_id)
         tail = PurposeEventFileTail(self.process.event_path)
         with self.process.log_path.open("w", encoding="utf-8") as log_fp:
             log_fp.write(_launch_log_text(self.process))
@@ -258,6 +267,9 @@ class PurposeInferenceRunner:
                 deadline = time.monotonic() + self.process.expected_runtime_seconds
             first_event_logged = False
             next_activity_log = time.monotonic() + 30.0
+            consecutive_restarts = 0
+            recovery_pending = False
+            healthy_since: float | None = None
 
             while self._running:
                 events, lpr_results = tail.read_new_events()
@@ -279,7 +291,7 @@ class PurposeInferenceRunner:
                     )
                     self._write_status(
                         run_id=run_id,
-                        status="running",
+                        status="recovering" if recovery_pending else "running",
                         started_at=started_at,
                         returncode=None,
                         duration_seconds=time.monotonic() - started_monotonic,
@@ -296,9 +308,131 @@ class PurposeInferenceRunner:
                         safe_message,
                     )
                     self.on_error(safe_message)
+                    terminal_error = True
                     self._terminate_process(force=True)
                     break
+                stall_message = _diagnostic_stall_message(self.process.diagnostic_path)
+                if stall_message:
+                    if consecutive_restarts < self.process.max_consecutive_restarts:
+                        consecutive_restarts += 1
+                        logger.warning(
+                            "ai-process-restart-request run-id=%s task=%s attempt=%s max-attempts=%s detail=%s",
+                            run_id,
+                            self.process.task_id,
+                            consecutive_restarts,
+                            self.process.max_consecutive_restarts,
+                            stall_message,
+                        )
+                        self.on_status(
+                            f"AI 입력 스트림 복구 중 "
+                            f"({consecutive_restarts}/{self.process.max_consecutive_restarts})"
+                        )
+                        self._write_status(
+                            run_id=run_id,
+                            status="recovering",
+                            started_at=started_at,
+                            returncode=None,
+                            duration_seconds=time.monotonic() - started_monotonic,
+                            event_counts=event_counts,
+                            lpr_result_count=lpr_result_count,
+                            error=stall_message,
+                        )
+                        self._terminate_process(force=True)
+                        if self.process.diagnostic_path is not None:
+                            _archive_runtime_file(
+                                self.process.diagnostic_path,
+                                f"{run_id}.restart-{consecutive_restarts}",
+                            )
+                        if not self._wait_before_restart(self.process.restart_delay_seconds):
+                            break
+                        try:
+                            log_fp.write(
+                                f"\nPROCESS_RESTART attempt={consecutive_restarts} "
+                                f"reason=pipeline-stall\n"
+                            )
+                            log_fp.flush()
+                            self._process = subprocess.Popen(
+                                self.process.command,
+                                stdout=log_fp,
+                                stderr=log_fp,
+                                text=True,
+                                env=self.process.env,
+                                start_new_session=True,
+                            )
+                        except OSError as exc:
+                            message = f"failed to restart {self.process.command[0]}: {exc}"
+                            logger.exception(
+                                "ai-process-restart-failed run-id=%s task=%s attempt=%s",
+                                run_id,
+                                self.process.task_id,
+                                consecutive_restarts,
+                            )
+                            self.on_error(message)
+                            terminal_error = True
+                            break
+                        recovery_pending = True
+                        healthy_since = None
+                        logger.info(
+                            "ai-process-restart run-id=%s task=%s attempt=%s pid=%s",
+                            run_id,
+                            self.process.task_id,
+                            consecutive_restarts,
+                            getattr(self._process, "pid", None),
+                        )
+                        continue
+                    logger.error(
+                        "ai-stall run-id=%s task=%s restart-attempts=%s detail=%s",
+                        run_id,
+                        self.process.task_id,
+                        consecutive_restarts,
+                        stall_message,
+                    )
+                    self.on_error(stall_message)
+                    terminal_error = True
+                    self._terminate_process(force=True)
+                    break
+                diagnostic_status = _diagnostic_status(self.process.diagnostic_path)
+                if diagnostic_status == "running":
+                    now = time.monotonic()
+                    if healthy_since is None:
+                        healthy_since = now
+                    if recovery_pending:
+                        recovery_pending = False
+                        logger.info(
+                            "ai-process-recovered run-id=%s task=%s attempts=%s pid=%s",
+                            run_id,
+                            self.process.task_id,
+                            consecutive_restarts,
+                            getattr(self._process, "pid", None),
+                        )
+                        self.on_status("AI 입력 스트림 복구 완료")
+                        self._write_status(
+                            run_id=run_id,
+                            status="running",
+                            started_at=started_at,
+                            returncode=None,
+                            duration_seconds=now - started_monotonic,
+                            event_counts=event_counts,
+                            lpr_result_count=lpr_result_count,
+                        )
+                    if (
+                        consecutive_restarts
+                        and now - healthy_since >= self.process.restart_stability_seconds
+                    ):
+                        consecutive_restarts = 0
+                else:
+                    healthy_since = None
                 if self._process.poll() is not None:
+                    if recovery_pending:
+                        message = "AI recovery process exited before all required camera heartbeats became healthy"
+                        logger.error(
+                            "ai-process-recovery-incomplete run-id=%s task=%s returncode=%s",
+                            run_id,
+                            self.process.task_id,
+                            self._process.returncode,
+                        )
+                        self.on_error(message)
+                        terminal_error = True
                     break
                 if deadline is not None and time.monotonic() >= deadline:
                     break
@@ -314,7 +448,7 @@ class PurposeInferenceRunner:
                     )
                     self._write_status(
                         run_id=run_id,
-                        status="running",
+                        status="recovering" if recovery_pending else "running",
                         started_at=started_at,
                         returncode=None,
                         duration_seconds=time.monotonic() - started_monotonic,
@@ -341,14 +475,15 @@ class PurposeInferenceRunner:
                     message,
                 )
                 self.on_error(message)
+                terminal_error = True
         self._terminate_process()
         if self.process.task_id == PURPOSE_LPR_IMAGE:
             _append_lpr_image_summary(self.process)
-        returncode = self._process.returncode if self._process is not None else None
+        returncode = getattr(self._process, "returncode", None) if self._process is not None else None
         duration_seconds = time.monotonic() - started_monotonic
         if not self._running:
             status = "stopped"
-        elif returncode != 0:
+        elif terminal_error or returncode != 0:
             status = "failed"
         elif self.process.task_id == PURPOSE_LPR_IMAGE and lpr_result_count == 0:
             status = "no_result"
@@ -374,6 +509,12 @@ class PurposeInferenceRunner:
             lpr_result_count=lpr_result_count,
         )
         return True
+
+    def _wait_before_restart(self, delay_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.0, delay_seconds)
+        while self._running and time.monotonic() < deadline:
+            time.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
+        return self._running
 
     def _write_status(
         self,
@@ -425,6 +566,10 @@ class PurposeInferenceRunner:
                 os.killpg(process.pid, signal.SIGKILL)
             except OSError:
                 process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def vehicle_detection_process(
@@ -442,6 +587,7 @@ def vehicle_detection_process(
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "vehicle.jsonl"
     log_path = event_dir / "vehicle.gst.log"
+    diagnostic_path = event_dir / "vehicle.heartbeat.jsonl"
     command = hailo_apps_detection_command(
         settings,
         (camera,),
@@ -453,6 +599,7 @@ def vehicle_detection_process(
         camera_rotations={
             camera.id: camera.rotation_degrees if rotation_degrees is None else rotation_degrees,
         },
+        diagnostic_path=diagnostic_path,
     )
     env = hailo_apps_runtime_env(settings)
     return PurposeInferenceProcess(
@@ -466,7 +613,9 @@ def vehicle_detection_process(
         camera_ids=(camera.id,),
         run_id=new_run_id(PURPOSE_VEHICLE_DETECTION),
         status_path=event_dir / "run-status.json",
+        diagnostic_path=diagnostic_path,
         validate_resource_paths=True,
+        max_consecutive_restarts=3,
     )
 
 
@@ -543,6 +692,7 @@ def person_presence_process(
     event_dir.mkdir(parents=True, exist_ok=True)
     event_path = event_dir / "person_presence.jsonl"
     log_path = event_dir / "person_presence.gst.log"
+    diagnostic_path = event_dir / "person_presence.heartbeat.jsonl"
     command = hailo_apps_detection_command(
         settings,
         cameras,
@@ -552,6 +702,7 @@ def person_presence_process(
         min_confidence=min_confidence,
         allowed_labels=PERSON_LABELS,
         camera_rotations=camera_rotations,
+        diagnostic_path=diagnostic_path,
     )
     env = hailo_apps_runtime_env(settings)
     return PurposeInferenceProcess(
@@ -565,7 +716,9 @@ def person_presence_process(
         camera_ids=tuple(camera.id for camera in cameras),
         run_id=new_run_id(PURPOSE_PERSON_PRESENCE),
         status_path=event_dir / "run-status.json",
+        diagnostic_path=diagnostic_path,
         validate_resource_paths=True,
+        max_consecutive_restarts=3,
     )
 
 
@@ -943,3 +1096,72 @@ def _fatal_log_message(log_path: Path) -> str:
         if pattern in log_tail:
             return log_tail
     return ""
+
+
+def _diagnostic_stall_message(path: Path | None) -> str:
+    payload = _diagnostic_payload(path)
+    if payload.get("status") != "stalled":
+        return ""
+    stale = ",".join(str(value) for value in payload.get("stale_cameras") or ())
+    cameras = payload.get("cameras") or {}
+    stages = payload.get("stages") or {}
+    stage_summary = {
+        stage: {
+            "buffers": detail.get("buffers"),
+            "age_seconds": detail.get("age_seconds"),
+        }
+        for stage, detail in stages.items()
+        if isinstance(detail, dict)
+    }
+    queue_levels = payload.get("queue_levels") or {}
+    return (
+        f"AI pipeline stalled; stale-cameras={stale or '-'} "
+        f"heartbeat={json.dumps(cameras, sort_keys=True)} "
+        f"stages={json.dumps(stage_summary, sort_keys=True)} "
+        f"queue-levels={json.dumps(queue_levels, sort_keys=True)}"
+    )
+
+
+def _diagnostic_status(path: Path | None) -> str:
+    return str(_diagnostic_payload(path).get("status") or "")
+
+
+def _diagnostic_payload(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        last_line = _read_last_text_line(path)
+        payload = json.loads(last_line) if last_line else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_last_text_line(path: Path, *, max_bytes: int = 256 * 1024) -> str:
+    with path.open("rb") as fp:
+        fp.seek(0, os.SEEK_END)
+        size = fp.tell()
+        fp.seek(max(0, size - max_bytes))
+        chunk = fp.read()
+    lines = chunk.splitlines()
+    if not lines:
+        return ""
+    return lines[-1].decode("utf-8", errors="replace")
+
+
+def _archive_runtime_file(path: Path, run_id: str) -> Path | None:
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    archive = path.with_name(f"{path.name}.{run_id}.previous")
+    path.replace(archive)
+    try:
+        archived_text = archive.read_text(encoding="utf-8", errors="replace")
+        redacted_text = redact_sensitive_text(archived_text)
+        if redacted_text != archived_text:
+            archive.write_text(redacted_text, encoding="utf-8")
+    except OSError:
+        logging.getLogger("towersightai.ai.purpose").warning(
+            "ai-log-archive-redaction-failed path=%s",
+            archive,
+        )
+    return archive

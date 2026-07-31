@@ -21,6 +21,7 @@ def hailo_apps_detection_command(
     min_confidence: float,
     allowed_labels: tuple[str, ...] = (),
     camera_rotations: dict[str, int] | None = None,
+    diagnostic_path: Path | None = None,
 ) -> tuple[str, ...]:
     if not cameras:
         raise ValueError("At least one camera is required for Hailo Apps detection.")
@@ -39,6 +40,8 @@ def hailo_apps_detection_command(
         str(postprocess_so),
         "--event-path",
         str(event_path),
+        "--diagnostic-path",
+        str(diagnostic_path or event_path.with_suffix(".heartbeat.jsonl")),
         "--min-confidence",
         str(min_confidence),
         "--arch",

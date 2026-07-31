@@ -15,10 +15,14 @@ from towersightai.inference.image_smoke import (
 def _settings(tmp_path: Path) -> Settings:
     hef = tmp_path / "model.hef"
     so = tmp_path / "post.so"
+    hailo_apps_python = tmp_path / "hailo_apps_venv" / "bin" / "python"
     hef.write_text("hef", encoding="utf-8")
     so.write_text("so", encoding="utf-8")
     return Settings(
         tappas_workspace=tmp_path,
+        hailo_apps_workspace=tmp_path / "hailo-apps",
+        hailo_apps_resources=tmp_path / "hailo-apps" / "resources",
+        hailo_apps_python=hailo_apps_python,
         hailo_hef_path=hef,
         hailo_postprocess_so=so,
         camera_1={"id": "front", "role": "front", "rtsp_url": "rtsp://a"},
@@ -64,7 +68,14 @@ def test_image_hailo_command_is_skipped_without_hardware_opt_in(tmp_path: Path):
 
     assert result.ok is False
     assert result.reason == "RUN_HARDWARE_TESTS=1 is required"
-    assert result.command == tuple(image_smoke_command(settings, image_path=image, output_image_path=tmp_path / "out.png"))
+    assert result.command == tuple(
+        image_smoke_command(
+            settings,
+            image_path=image,
+            event_path=tmp_path / "events.jsonl",
+            output_image_path=tmp_path / "out.png",
+        )
+    )
 
 
 def test_image_hailo_command_reports_timeout(tmp_path: Path, monkeypatch):
@@ -108,10 +119,10 @@ def test_image_hailo_command_reports_timeout(tmp_path: Path, monkeypatch):
     assert terminated
 
 
-def test_image_hailo_command_adds_tappas_venv_to_gst_environment(tmp_path: Path, monkeypatch):
+def test_image_hailo_command_adds_hailo_apps_venv_to_runtime_environment(tmp_path: Path, monkeypatch):
     settings = _settings(tmp_path)
-    tappas_bin = tmp_path / "hailo_tappas_venv" / "bin"
-    tappas_bin.mkdir(parents=True)
+    hailo_apps_bin = settings.hailo_apps_python.parent
+    hailo_apps_bin.mkdir(parents=True)
     image = tmp_path / "sample.jpg"
     image.write_bytes(b"fake")
     captured_env = {}
@@ -142,5 +153,5 @@ def test_image_hailo_command_adds_tappas_venv_to_gst_environment(tmp_path: Path,
     )
 
     assert result.ok is True
-    assert captured_env["VIRTUAL_ENV"] == str(tmp_path / "hailo_tappas_venv")
-    assert captured_env["PATH"].startswith(str(tappas_bin))
+    assert captured_env["VIRTUAL_ENV"] == str(hailo_apps_bin.parent)
+    assert captured_env["PATH"].startswith(str(hailo_apps_bin))

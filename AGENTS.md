@@ -40,6 +40,18 @@ Reference hardware experiments:
 - PLC adapter owns external communication and must be mockable.
 - UI owns driver display, settings, camera preview, and calibration interaction.
 
+## Driver Display Direction
+
+- Keep user mode and operator mode as separate surfaces within the same application.
+- User mode is the parking-machine display seen by the driver. Prioritize live camera context, ceiling birdview alignment, one current instruction, and the blocking reason.
+- Operator mode owns diagnostics, model details, camera inspection, settings, calibration, and test controls. Do not expose local paths, inference counters, or development state buttons on the driver-facing surface.
+- Use the provided ParkIO concept guide for product flow and visual direction only. It is not a verified safety specification and does not prove that alignment, occupancy, obstacle, exit, or PLC behavior is implemented.
+- The user-mode visual language is bright white/navy/cyan for normal guidance. Reserve red for stop, person detection, camera/AI faults, and other blocking conditions. Never rely on color without a status word and required action.
+- Show one driver action at a time. Prefer `진입`, `정지`, `오른쪽 이동`, `왼쪽 이동`, `전진`, `후진`, or `주차기 밖으로 이동` over diagnostic prose.
+- State-specific camera priority must follow the state model: front camera for approach, front plus ceiling for entry, ceiling birdview for alignment, and all relevant cameras for safety/person checks.
+- Prototype, fake, and simulated screens must remain visibly non-authoritative and cannot present or emit final PLC OK.
+- Outbound driver approach, vehicle movement, and exit-complete confirmation are future concepts until corresponding state, AI, and PLC contracts are explicitly implemented and tested.
+
 ## Implementation Order
 
 Follow `docs/implementation/implementation-roadmap.md` as the source of truth for implementation order. In short:
