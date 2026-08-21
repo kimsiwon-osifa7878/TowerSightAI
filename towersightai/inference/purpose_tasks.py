@@ -75,6 +75,7 @@ class PurposeInferenceProcess:
     max_consecutive_restarts: int = 0
     restart_delay_seconds: float = 1.0
     restart_stability_seconds: float = 60.0
+    diagnostic_startup_timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -270,6 +271,7 @@ class PurposeInferenceRunner:
             consecutive_restarts = 0
             recovery_pending = False
             healthy_since: float | None = None
+            diagnostic_launch_monotonic = time.monotonic()
 
             while self._running:
                 events, lpr_results = tail.read_new_events()
@@ -312,6 +314,12 @@ class PurposeInferenceRunner:
                     self._terminate_process(force=True)
                     break
                 stall_message = _diagnostic_stall_message(self.process.diagnostic_path)
+                if not stall_message:
+                    stall_message = _diagnostic_startup_stall_message(
+                        self.process.diagnostic_path,
+                        elapsed_seconds=time.monotonic() - diagnostic_launch_monotonic,
+                        timeout_seconds=self.process.diagnostic_startup_timeout_seconds,
+                    )
                 if stall_message:
                     if consecutive_restarts < self.process.max_consecutive_restarts:
                         consecutive_restarts += 1
@@ -372,6 +380,7 @@ class PurposeInferenceRunner:
                             break
                         recovery_pending = True
                         healthy_since = None
+                        diagnostic_launch_monotonic = time.monotonic()
                         logger.info(
                             "ai-process-restart run-id=%s task=%s attempt=%s pid=%s",
                             run_id,
@@ -465,7 +474,7 @@ class PurposeInferenceRunner:
             if lpr_results:
                 lpr_result_count += len(lpr_results)
                 self.on_lpr_results(lpr_results)
-            if self._running and self._process.poll() not in (None, 0):
+            if self._running and not terminal_error and self._process.poll() not in (None, 0):
                 message = redact_sensitive_text(_process_error_message(self._process.returncode, self.process.log_path))
                 logger.error(
                     "ai-process-error run-id=%s task=%s returncode=%s log-tail=%s",
@@ -1120,6 +1129,17 @@ def _diagnostic_stall_message(path: Path | None) -> str:
         f"stages={json.dumps(stage_summary, sort_keys=True)} "
         f"queue-levels={json.dumps(queue_levels, sort_keys=True)}"
     )
+
+
+def _diagnostic_startup_stall_message(
+    path: Path | None,
+    *,
+    elapsed_seconds: float,
+    timeout_seconds: float,
+) -> str:
+    if path is None or elapsed_seconds < timeout_seconds or _diagnostic_payload(path):
+        return ""
+    return f"AI pipeline heartbeat did not start; timeout-seconds={timeout_seconds:.1f}"
 
 
 def _diagnostic_status(path: Path | None) -> str:

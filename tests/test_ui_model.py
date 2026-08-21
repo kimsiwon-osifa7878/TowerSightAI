@@ -114,6 +114,60 @@ def test_ready_for_operation_requires_all_prerequisites():
     assert model.warning == "모든 안전 조건 통과"
 
 
+def test_disabled_birdview_hides_ceiling_and_blocks_ready_state():
+    settings = _settings()
+    active_cameras = [camera for camera in settings.cameras if camera.role is not CameraRole.ceiling]
+    model = build_operator_display(
+        state=ParkingState.READY_FOR_OPERATION,
+        cameras=active_cameras,
+        plc_state=PlcConnectionState.CONNECTED,
+        healthy_camera_ids=["front", "rear_side", "opposite_side"],
+        stale_camera_ids=[],
+        hailo_healthy=True,
+        calibration_valid=True,
+        human_possible=False,
+        occupant_possible=False,
+        obstacle_possible=False,
+        birdview_available=False,
+    )
+
+    assert {tile.role for tile in model.camera_tiles} == {
+        CameraRole.front,
+        CameraRole.rear_side,
+        CameraRole.opposite_side,
+    }
+    assert model.safety_status is GlobalSafetyStatus.NG
+    assert model.can_show_final_ok is False
+    assert model.camera_health_summary == "카메라 3/3 정상 · 버드뷰 OFF"
+    assert model.warning == "버드뷰 OFF: 정렬 판단 불가 · 최종 OK 차단"
+
+    driver = build_driver_display(
+        model,
+        state_override=ParkingState.ALIGNMENT_GUIDE,
+        blocked_roles=(),
+    )
+    assert driver.layout is DriverLayout.FRONT
+    assert driver.visible_roles == (CameraRole.front,)
+    assert driver.headline == "정지"
+    assert driver.tone is DriverTone.DANGER
+    assert "버드뷰 비활성화" in driver.detail
+
+
+def test_disabled_birdview_remains_visible_when_an_active_camera_is_blocked():
+    settings = _settings()
+    active_cameras = [camera for camera in settings.cameras if camera.role is not CameraRole.ceiling]
+
+    model = build_operator_display(
+        state=ParkingState.IDLE,
+        cameras=active_cameras,
+        birdview_available=False,
+    )
+
+    assert "카메라 입력 차단" in model.warning
+    assert "버드뷰 OFF" in model.warning
+    assert "최종 OK 차단" in model.warning
+
+
 def test_driver_display_uses_state_specific_camera_priority_and_short_actions():
     settings = _settings()
     source = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)

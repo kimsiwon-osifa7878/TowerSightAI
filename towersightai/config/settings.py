@@ -1,8 +1,64 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from zoneinfo import ZoneInfo
+
+
+@dataclass(frozen=True)
+class RawStorageConfig:
+    enabled: bool = False
+    local_dir: Path = Path("artifacts/raw")
+    sample_interval_seconds: float = 0.5
+    person_stale_seconds: float = 1.0
+    person_clear_grace_seconds: float = 5.0
+    retention_days: int = 14
+    sync_interval_seconds: float = 300.0
+    timezone_name: str = "Asia/Seoul"
+    nas_host: str = ""
+    nas_port: int = 22
+    nas_username: str = ""
+    nas_password: str = field(default="", repr=False)
+    nas_folder: str = ""
+    known_hosts_path: Path = Path("~/.ssh/known_hosts")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "local_dir", Path(self.local_dir).expanduser())
+        object.__setattr__(self, "known_hosts_path", Path(self.known_hosts_path).expanduser())
+        if self.sample_interval_seconds <= 0:
+            raise ValueError("RAW_DATA_SAMPLE_INTERVAL_SECONDS must be positive.")
+        if self.person_stale_seconds < 0:
+            raise ValueError("RAW_DATA_PERSON_STALE_SECONDS must be non-negative.")
+        if self.person_clear_grace_seconds < 0:
+            raise ValueError("RAW_DATA_PERSON_CLEAR_GRACE_SECONDS must be non-negative.")
+        if self.retention_days < 1:
+            raise ValueError("RAW_DATA_RETENTION_DAYS must be at least 1.")
+        if self.sync_interval_seconds <= 0:
+            raise ValueError("RAW_DATA_SYNC_INTERVAL_SECONDS must be positive.")
+        try:
+            ZoneInfo(self.timezone_name)
+        except Exception as exc:
+            raise ValueError(f"Invalid RAW_DATA_TIMEZONE: {self.timezone_name}") from exc
+        if not 1 <= int(self.nas_port) <= 65535:
+            raise ValueError("SYNOLOGY_NAS_PORT must be between 1 and 65535.")
+        if self.enabled:
+            missing = [
+                name
+                for name, value in (
+                    ("SYNOLOGY_NAS_HOST", self.nas_host),
+                    ("SYNOLOGY_NAS_ID", self.nas_username),
+                    ("SYNOLOGY_NAS_PW", self.nas_password),
+                    ("SYNOLOGY_NAS_FOLDER", self.nas_folder),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError("Missing enabled raw-storage settings: " + ", ".join(missing))
+            if "://" in self.nas_host or "/" in self.nas_host:
+                raise ValueError("SYNOLOGY_NAS_HOST must be a hostname without scheme, port, or path.")
+            if ".." in PurePosixPath(self.nas_folder).parts:
+                raise ValueError("SYNOLOGY_NAS_FOLDER must not contain '..'.")
 
 
 class CameraRole(str, Enum):
@@ -10,6 +66,11 @@ class CameraRole(str, Enum):
     front = "front"
     rear_side = "rear_side"
     opposite_side = "opposite_side"
+
+
+class BirdviewMode(str, Enum):
+    disabled = "disabled"
+    ceiling = "ceiling"
 
 
 @dataclass(frozen=True)
@@ -94,6 +155,8 @@ class Settings:
     hailo_network_name: str = "filter_letterbox"
     ui_fullscreen: bool = True
     ui_camera_resolution: CameraResolution | tuple[int, int] | str = CameraResolution()
+    birdview_mode: BirdviewMode | str = BirdviewMode.ceiling
+    raw_storage: RawStorageConfig | dict | None = None
 
     def __post_init__(self) -> None:
         self.hailo_apps_workspace = self.hailo_apps_workspace.expanduser()
@@ -106,6 +169,11 @@ class Settings:
         self.camera_3 = self._as_camera(self.camera_3)
         self.camera_4 = self._as_camera(self.camera_4)
         self.ui_camera_resolution = self._as_resolution(self.ui_camera_resolution)
+        self.birdview_mode = BirdviewMode(self.birdview_mode)
+        if self.raw_storage is None:
+            self.raw_storage = RawStorageConfig()
+        elif isinstance(self.raw_storage, dict):
+            self.raw_storage = RawStorageConfig(**self.raw_storage)
         self._validate_safety_constraints()
 
     def _as_camera(self, camera: CameraConfig | dict) -> CameraConfig:
@@ -126,6 +194,16 @@ class Settings:
     @property
     def cameras(self) -> list[CameraConfig]:
         return [self.camera_1, self.camera_2, self.camera_3, self.camera_4]
+
+    @property
+    def active_cameras(self) -> list[CameraConfig]:
+        if self.birdview_mode is BirdviewMode.disabled:
+            return [camera for camera in self.cameras if camera.role is not CameraRole.ceiling]
+        return self.cameras
+
+    @property
+    def birdview_enabled(self) -> bool:
+        return self.birdview_mode is not BirdviewMode.disabled
 
     def _validate_safety_constraints(self) -> None:
         if self.hailo_arch not in {"hailo8", "hailo8l"}:

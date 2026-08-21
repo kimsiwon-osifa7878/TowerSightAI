@@ -102,6 +102,7 @@ class OperatorDisplayModel:
     human_possible: bool = True
     occupant_possible: bool = True
     obstacle_possible: bool = True
+    birdview_available: bool = True
 
     @property
     def can_show_final_ok(self) -> bool:
@@ -111,6 +112,7 @@ class OperatorDisplayModel:
             and self.plc_state is PlcConnectionState.CONNECTED
             and self.hailo_healthy
             and self.calibration_valid
+            and self.birdview_available
             and not self.human_possible
             and not self.occupant_possible
             and not self.obstacle_possible
@@ -120,9 +122,14 @@ class OperatorDisplayModel:
     @property
     def camera_health_summary(self) -> str:
         blocked = sum(1 for tile in self.camera_tiles if tile.blocked)
+        total = len(self.camera_tiles)
         if blocked:
-            return f"카메라 {blocked}/4 차단"
-        return "카메라 4/4 정상"
+            summary = f"카메라 {blocked}/{total} 차단"
+        else:
+            summary = f"카메라 {total}/{total} 정상"
+        if not self.birdview_available:
+            return f"{summary} · 버드뷰 OFF"
+        return summary
 
 
 @dataclass(frozen=True)
@@ -156,6 +163,7 @@ def build_operator_display(
     human_possible: bool = True,
     occupant_possible: bool = True,
     obstacle_possible: bool = True,
+    birdview_available: bool = True,
 ) -> OperatorDisplayModel:
     healthy = set(healthy_camera_ids)
     stale = set(stale_camera_ids or ())
@@ -179,9 +187,15 @@ def build_operator_display(
         human_possible=human_possible,
         occupant_possible=occupant_possible,
         obstacle_possible=obstacle_possible,
+        birdview_available=birdview_available,
     )
-    primary, secondary = camera_layout_for_state(state)
-    instruction = _instruction_for_state(state, alignment, safety_status)
+    primary, secondary = camera_layout_for_state(state, birdview_available=birdview_available)
+    instruction = _instruction_for_state(
+        state,
+        alignment,
+        safety_status,
+        birdview_available=birdview_available,
+    )
     warning = _warning_for_state(
         state=state,
         safety_status=safety_status,
@@ -192,6 +206,7 @@ def build_operator_display(
         human_possible=human_possible,
         occupant_possible=occupant_possible,
         obstacle_possible=obstacle_possible,
+        birdview_available=birdview_available,
     )
     return OperatorDisplayModel(
         state=state,
@@ -209,6 +224,7 @@ def build_operator_display(
         human_possible=human_possible,
         occupant_possible=occupant_possible,
         obstacle_possible=obstacle_possible,
+        birdview_available=birdview_available,
     )
 
 
@@ -228,6 +244,7 @@ def build_driver_display(
     layout, visible_roles, primary_role = _driver_layout_for_state(
         layout_state_override or state,
         primary_alert_role=primary_alert_role,
+        birdview_available=source.birdview_available,
     )
     runtime_health_supplied = blocked_roles is not None
     if blocked_roles is None:
@@ -237,7 +254,11 @@ def build_driver_display(
     required_roles = _driver_required_roles_for_state(state, visible_roles)
     required_blocked = any(role in blocked for role in required_roles)
 
-    stage_label, headline, detail, symbol = _driver_copy_for_state(state, alignment)
+    stage_label, headline, detail, symbol = _driver_copy_for_state(
+        state,
+        alignment,
+        birdview_available=source.birdview_available,
+    )
     tone = DriverTone.WAIT
     blocking_reason = (
         _warning_for_runtime_camera_health(source, state=state, blocked_roles=blocked)
@@ -256,6 +277,9 @@ def build_driver_display(
         detail = "필수 카메라 영상을 확인할 수 없습니다."
         symbol = "!"
         blocking_reason = "필수 카메라 입력 없음 · 주차기 동작 금지"
+        can_show_final_ok = False
+    elif not source.birdview_available and state is ParkingState.ALIGNMENT_GUIDE:
+        tone = DriverTone.DANGER
         can_show_final_ok = False
     elif state is ParkingState.HUMAN_DETECTED:
         tone = DriverTone.DANGER
@@ -281,7 +305,17 @@ def build_driver_display(
     )
 
 
-def camera_layout_for_state(state: ParkingState) -> tuple[tuple[CameraRole, ...], tuple[CameraRole, ...]]:
+def camera_layout_for_state(
+    state: ParkingState,
+    *,
+    birdview_available: bool = True,
+) -> tuple[tuple[CameraRole, ...], tuple[CameraRole, ...]]:
+    if not birdview_available:
+        if state in {ParkingState.IDLE, ParkingState.VEHICLE_DETECTED, ParkingState.PLATE_RECOGNITION}:
+            return (CameraRole.front,), (CameraRole.rear_side, CameraRole.opposite_side)
+        if state in {ParkingState.VEHICLE_ENTERING, ParkingState.ALIGNMENT_GUIDE}:
+            return (CameraRole.front,), (CameraRole.rear_side, CameraRole.opposite_side)
+        return (CameraRole.front, CameraRole.rear_side, CameraRole.opposite_side), ()
     if state in {ParkingState.IDLE, ParkingState.VEHICLE_DETECTED, ParkingState.PLATE_RECOGNITION}:
         return (CameraRole.front,), (CameraRole.ceiling, CameraRole.rear_side, CameraRole.opposite_side)
     if state in {ParkingState.VEHICLE_ENTERING, ParkingState.ALIGNMENT_GUIDE}:
@@ -310,8 +344,11 @@ def _driver_layout_for_state(
     state: ParkingState,
     *,
     primary_alert_role: CameraRole | None,
+    birdview_available: bool,
 ) -> tuple[DriverLayout, tuple[CameraRole, ...], CameraRole | None]:
     del primary_alert_role
+    if not birdview_available:
+        return DriverLayout.FRONT, (CameraRole.front,), CameraRole.front
     if state is ParkingState.IDLE:
         return DriverLayout.FRONT, (CameraRole.front,), CameraRole.front
     if state in {
@@ -346,6 +383,8 @@ def _driver_required_roles_for_state(
 def _driver_copy_for_state(
     state: ParkingState,
     alignment: AlignmentResult,
+    *,
+    birdview_available: bool,
 ) -> tuple[str, str, str, str]:
     if state is ParkingState.IDLE:
         return "입차 대기", "진입 준비", "안내가 표시되면 천천히 진입하세요.", "P"
@@ -356,6 +395,8 @@ def _driver_copy_for_state(
     if state is ParkingState.VEHICLE_ENTERING:
         return "차량 진입", "천천히 진입", "정면 가이드 안쪽으로 직진하세요.", "↑"
     if state is ParkingState.ALIGNMENT_GUIDE:
+        if not birdview_available:
+            return "정렬 기능 중지", "정지", "버드뷰 비활성화로 정렬 상태를 판단할 수 없습니다.", "!"
         headline, symbol = {
             AlignmentResult.MOVE_RIGHT: ("오른쪽 이동", "→"),
             AlignmentResult.MOVE_LEFT: ("왼쪽 이동", "←"),
@@ -387,10 +428,13 @@ def _safety_status_for_state(
     human_possible: bool,
     occupant_possible: bool,
     obstacle_possible: bool,
+    birdview_available: bool,
 ) -> GlobalSafetyStatus:
     if state is ParkingState.AI_STOP:
         return GlobalSafetyStatus.STOPPED
     if any(tile.blocked for tile in camera_tiles):
+        return GlobalSafetyStatus.NG
+    if not birdview_available:
         return GlobalSafetyStatus.NG
     if plc_state is not PlcConnectionState.CONNECTED:
         return GlobalSafetyStatus.NG
@@ -407,7 +451,11 @@ def _instruction_for_state(
     state: ParkingState,
     alignment: AlignmentResult,
     safety_status: GlobalSafetyStatus,
+    *,
+    birdview_available: bool,
 ) -> str:
+    if state is ParkingState.ALIGNMENT_GUIDE and not birdview_available:
+        return "정지: 버드뷰 비활성화로 정렬 상태를 판단할 수 없습니다."
     if state in {ParkingState.VEHICLE_ENTERING, ParkingState.ALIGNMENT_GUIDE}:
         return guidance_message_for_alignment(alignment)
     if state is ParkingState.PARKED:
@@ -438,12 +486,18 @@ def _warning_for_state(
     human_possible: bool,
     occupant_possible: bool,
     obstacle_possible: bool,
+    birdview_available: bool,
 ) -> str:
     if state is ParkingState.AI_STOP:
         return "AI 감시 중지: PLC OK 신호를 표시하지 않습니다."
     blocked_cameras = [tile.title for tile in camera_tiles if tile.blocked]
     if blocked_cameras:
-        return "카메라 입력 차단: " + ", ".join(blocked_cameras)
+        warning = "카메라 입력 차단: " + ", ".join(blocked_cameras)
+        if not birdview_available:
+            return f"{warning} · 버드뷰 OFF · 최종 OK 차단"
+        return warning
+    if not birdview_available:
+        return "버드뷰 OFF: 정렬 판단 불가 · 최종 OK 차단"
     if plc_state is not PlcConnectionState.CONNECTED:
         return "PLC 상태 미확인: 최종 OK 차단"
     if not hailo_healthy:
@@ -485,6 +539,7 @@ def _warning_for_runtime_camera_health(
         human_possible=source.human_possible,
         occupant_possible=source.occupant_possible,
         obstacle_possible=source.obstacle_possible,
+        birdview_available=source.birdview_available,
     )
 
 

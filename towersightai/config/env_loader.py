@@ -144,6 +144,37 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
         plc_endpoint=values["PLC_ENDPOINT"],
         ui_fullscreen=_parse_bool(values.get("UI_FULLSCREEN", "true")),
         ui_camera_resolution=values.get("UI_CAMERA_RESOLUTION", "1280x720"),
+        birdview_mode=values.get("BIRDVIEW_MODE", "ceiling"),
+        raw_storage={
+            "enabled": _parse_bool(values.get("RAW_DATA_ENABLED", "false")),
+            "local_dir": _expand_config_path(values.get("RAW_DATA_LOCAL_DIR", "artifacts/raw"), values),
+            "sample_interval_seconds": _parse_float(
+                values.get("RAW_DATA_SAMPLE_INTERVAL_SECONDS", "0.5"),
+                "RAW_DATA_SAMPLE_INTERVAL_SECONDS",
+            ),
+            "person_stale_seconds": _parse_float(
+                values.get("RAW_DATA_PERSON_STALE_SECONDS", "1.0"),
+                "RAW_DATA_PERSON_STALE_SECONDS",
+            ),
+            "person_clear_grace_seconds": _parse_float(
+                values.get("RAW_DATA_PERSON_CLEAR_GRACE_SECONDS", "5.0"),
+                "RAW_DATA_PERSON_CLEAR_GRACE_SECONDS",
+            ),
+            "retention_days": _parse_int(values.get("RAW_DATA_RETENTION_DAYS", "14"), "RAW_DATA_RETENTION_DAYS"),
+            "sync_interval_seconds": _parse_float(
+                values.get("RAW_DATA_SYNC_INTERVAL_SECONDS", "300"),
+                "RAW_DATA_SYNC_INTERVAL_SECONDS",
+            ),
+            "timezone_name": values.get("RAW_DATA_TIMEZONE", "Asia/Seoul"),
+            "nas_host": values.get("SYNOLOGY_NAS_HOST", ""),
+            "nas_port": _parse_int(values.get("SYNOLOGY_NAS_PORT", "22"), "SYNOLOGY_NAS_PORT"),
+            "nas_username": values.get("SYNOLOGY_NAS_ID", ""),
+            "nas_password": values.get("SYNOLOGY_NAS_PW", ""),
+            "nas_folder": values.get("SYNOLOGY_NAS_FOLDER", ""),
+            "known_hosts_path": _expand_config_path(
+                values.get("SYNOLOGY_NAS_KNOWN_HOSTS", "~/.ssh/known_hosts"), values
+            ),
+        },
     )
 
 
@@ -218,6 +249,20 @@ def _parse_bool(value: str) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     raise ValueError(f"Invalid boolean value: {value}")
+
+
+def _parse_float(value: str, name: str) -> float:
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid numeric value for {name}: {value}") from exc
+
+
+def _parse_int(value: str, name: str) -> int:
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer value for {name}: {value}") from exc
 
 
 def _expand_config_path(value: str, values: Mapping[str, str]) -> Path:

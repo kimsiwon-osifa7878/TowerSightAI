@@ -19,7 +19,7 @@ vehicle approach
 
 The installed display has two distinct modes:
 
-- **User mode** is the default driver-facing guidance surface. It prioritizes edge-to-edge live camera context, ceiling birdview alignment, one large current instruction, and an unmistakable stop/blocked state.
+- **User mode** is the default driver-facing guidance surface. It prioritizes edge-to-edge live camera context, one large current instruction, and an unmistakable stop/blocked state. Ceiling birdview alignment is shown only when `BIRDVIEW_MODE=ceiling`.
 - **Operator mode** retains camera inspection, AI diagnostics, settings, and test controls. Development telemetry and model details belong here rather than on the driver-facing screen.
 
 The visual direction for user mode is a near-black automotive surround-view display with a 50%-transparent top instruction overlay, compact bottom status, and prominent red blocking states. The references are a product and visual guide, not proof that any safety function is implemented or validated.
@@ -33,10 +33,9 @@ Implemented:
 - Typed `.env` loading and validation for four camera roles: `ceiling`, `front`, `rear_side`, `opposite_side`.
 - RTSP preview pipeline generation with redacted source handling.
 - PyQt6 application that starts in driver-facing user mode and enters the operator dashboard through a hidden two-second hold in the top-right corner.
-- Dashboard layout with ceiling birdview and front camera as primary views.
-- Ceiling birdview displayed as a vertical tile with CCW 90-degree frame rotation.
+- Configurable birdview mode: `disabled` hides and stops the ceiling source, while `ceiling` restores the existing ceiling/front layout.
 - Collapsible sidebar with connected actions and `EMPTY` feature slots.
-- Runtime camera capture for all configured cameras, with disconnected cameras shown as NG.
+- Runtime camera capture for active cameras, with disconnected active cameras shown as NG.
 - Hailo installation checks and sample image smoke test using `data/samples/test-car.png`.
 - Hailo callback normalization into JSONL detection events.
 - Live AI inference overlays on camera frames.
@@ -52,6 +51,8 @@ Implemented:
 - Person-presence detection uses the Hailo Apps detector's `person` class only; Re-ID embedding and gallery matching are intentionally not used.
 - Fatal Hailo/GStreamer log detection that stops stuck `gst-launch` processes instead of leaving the UI in a loading state.
 - Fake PLC adapter and state-machine core used by tests.
+- Daily JSONL raw-data capture for application/AI start, vehicle entry, plate results, raw per-camera detections, and 0.5-second person-presence samples through five seconds after clear.
+- Strict-host-key Synology SFTP synchronization for completed days, with SHA-256 verification, atomic remote publication, retry markers, and local deletion only after a verified upload is at least 14 days old.
 
 Known gaps:
 
@@ -165,10 +166,33 @@ Important values:
 - `CALIBRATION_PATH`: calibration JSON path.
 - `PLC_ENDPOINT`: PLC or simulator endpoint.
 - `UI_CAMERA_RESOLUTION`: preview/display capture resolution, for example `1920x1080` or `1280x720`.
+- `BIRDVIEW_MODE`: `disabled` for the current three-camera UI or `ceiling` for the existing ceiling-camera birdview.
+- `RAW_DATA_*`: local JSONL directory, 0.5-second sampling, five-second person-clear tail, Asia/Seoul day boundary, synchronization interval, and 14-day retention.
+- `SYNOLOGY_NAS_*`: SFTP hostname, external port, dedicated account, password, SFTP-visible destination folder, and trusted `known_hosts` file. The host value must not include `https://` or a port.
 
 Camera rotation is part of the equipment configuration. Set `CAMERA_N_ROTATION_DEGREES` to one of `0`, `90`, `180`, or `270`; `90` means CCW 90 degrees and `270` means CW 90 degrees. The default site profile uses `CAMERA_1_ROTATION_DEGREES=90` for the ceiling birdview camera and `0` for the other cameras. The Hailo Apps adapter transforms emitted bounding-box coordinates to the same orientation shown by the operator UI.
 
 The UI displays the actual received frame size in each camera tile, so you can verify whether the configured resolution is being applied.
+
+## Raw Data And NAS Archive
+
+With `RAW_DATA_ENABLED=true`, records are appended to `artifacts/raw/YYYY-MM-DD/events.jsonl`. The current day remains local and completed days are uploaded in the background to `${SYNOLOGY_NAS_FOLDER}/raw/YYYY-MM-DD/`. Each NAS day contains `events.jsonl` and a SHA-256 `manifest.json`; publication uses an SFTP `.part` file followed by atomic rename.
+
+The person window starts on the first `person` detection. It records every active camera's latest person state every 0.5 seconds, treats a detection as stale after the configured interval, and continues absence samples for five seconds. Failed or unverified uploads are never deleted locally. A successful local day is deleted when it reaches the configured 14-day age.
+
+Run a completed-day sync manually with:
+
+```bash
+towersightai-sync-raw-data --env .env
+```
+
+For an explicit test after stopping the UI writer, upload today's snapshot immediately with:
+
+```bash
+towersightai-sync-raw-data --env .env --include-current-day
+```
+
+This storage path is an operational audit/archive function only. Its success or failure does not authorize PLC OK.
 
 ## Run The Operator UI
 
@@ -191,10 +215,10 @@ Dashboard behavior:
 
 - User mode fills the display with state-priority cameras and overlays one large driver action at the top.
 - Driver development controls are available only in the operator sidebar under `사용자 화면 테스트`.
-- Ceiling birdview and front camera are shown first.
-- The ceiling birdview tile is vertical and the frame is displayed CCW 90 degrees.
+- With `BIRDVIEW_MODE=disabled`, the dashboard shows the front camera only and `전체 카메라` shows front plus both side cameras; the UI keeps final OK blocked.
+- With `BIRDVIEW_MODE=ceiling`, the ceiling birdview and front camera are shown first, and the vertical birdview tile uses its configured rotation.
 - The sidebar opens from the `메뉴` button.
-- `전체 카메라` switches to the four-camera inspection layout.
+- `전체 카메라` switches to the active-camera inspection layout.
 - `이전 AI Detection` starts the previous working multistream launch path for regression isolation.
 - `차량 전용 검출` runs the configured Hailo Apps detector on the front camera and keeps vehicle labels only.
 - `번호판 이미지 LPR` runs the Hailo LPR example models against sanitized images in `tmp/car_number-test`.
@@ -202,7 +226,7 @@ Dashboard behavior:
 - `차량 진입 시뮬레이션` is UI-only and keeps PLC OK blocked.
 - `EMPTY` buttons are safe no-op feature slots.
 
-Disconnected cameras remain visible as NG tiles and are not used as inference targets. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
+Disconnected active cameras remain visible as NG tiles and are not used as inference targets. A disabled birdview is not counted as a failed active camera, but is shown separately as `버드뷰 OFF` and always blocks final OK. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
 
 ## Purpose AI Checks
 

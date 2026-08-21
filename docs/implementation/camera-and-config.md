@@ -63,7 +63,10 @@ CALIBRATION_PATH=data/calibration/site.json
 PLC_ENDPOINT=tcp://127.0.0.1:502
 UI_FULLSCREEN=true
 UI_CAMERA_RESOLUTION=1280x720
+BIRDVIEW_MODE=disabled
 ```
+
+`BIRDVIEW_MODE` accepts `disabled` or `ceiling`. `disabled` omits the ceiling camera from automatic capture and inference, hides its UI surfaces, and blocks alignment and final PLC OK. `ceiling` restores the existing ceiling-camera path. If the variable is omitted, `ceiling` is used for backward compatibility. A future L/R compositor must be added as a new validated mode; unsupported values must fail configuration rather than imply that a synthetic birdview is available.
 
 If the RTSP URL already embeds credentials, keep separate username/password only when needed by setup tools. Product logs must redact credentials from URLs.
 
@@ -92,6 +95,10 @@ Each camera must expose:
 - Redacted source URL.
 
 Camera loss or stale frames block final OK.
+
+The front camera is the minimum source for user-mode basic operation. Front-only operation may run entry, plate, and person diagnostics, but it is a degraded evidence-collection mode: missing side or ceiling coverage remains NG and can never satisfy final OK.
+
+When birdview is disabled, health summaries cover the three active cameras separately from the explicit `버드뷰 OFF` safety block. Three healthy cameras do not satisfy the alignment or final-OK prerequisites.
 
 ## Configuration Validation
 

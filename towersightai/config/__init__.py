@@ -6,13 +6,14 @@ from towersightai.config.env_loader import (
     parse_env_file,
     settings_from_mapping,
 )
-from towersightai.config.settings import CameraConfig, CameraRole, Settings
+from towersightai.config.settings import CameraConfig, CameraRole, RawStorageConfig, Settings
 
 __all__ = [
     "CameraConfig",
     "CameraInspection",
     "CameraRole",
     "ConfigInspectionResult",
+    "RawStorageConfig",
     "Settings",
     "inspect_env",
     "load_settings_from_env",

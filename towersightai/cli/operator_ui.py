@@ -34,7 +34,7 @@ def main() -> int:
     os.environ["TOWERSIGHTAI_LOG_LEVEL"] = effective_log_level
     model = build_operator_display(
         state=ParkingState.IDLE,
-        cameras=settings.cameras,
+        cameras=settings.active_cameras,
         alignment=AlignmentResult.UNKNOWN,
         plc_state=PlcConnectionState.UNKNOWN,
         fullscreen=_resolve_fullscreen(
@@ -42,6 +42,7 @@ def main() -> int:
             force_fullscreen=args.fullscreen,
             force_windowed=args.windowed,
         ),
+        birdview_available=settings.birdview_enabled,
     )
     return launch_operator_ui(model, settings=settings)
 

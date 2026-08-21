@@ -23,6 +23,8 @@ The app starts in user mode on the installed parking-machine display.
 - A visually hidden `72 x 72 px` top-right hotspot enters operator mode only after a continuous two-second mouse or touch hold.
 - User-visible camera priority is front only while idle, then front plus ceiling birdview after vehicle detection and throughout entry, alignment, and safety guidance.
 - Rear-side and opposite-side cameras continue running for person/obstacle safety checks but are shown only in the operator `전체 카메라` inspection view. Hidden safety cameras remain required inputs and can still block the user display and final OK.
+- Front-camera health is the minimum requirement for user-mode diagnostic/basic flows. With only front healthy, vehicle, plate, and person tasks may run against front data, while missing side/ceiling safety coverage remains explicit NG and final PLC OK stays blocked.
+- When `BIRDVIEW_MODE=disabled`, all ceiling birdview surfaces are omitted, the front camera becomes the only driver-facing camera, and alignment displays a stop instruction. This temporary deployment mode never authorizes final OK.
 
 ## Operator Dashboard
 
@@ -38,6 +40,8 @@ Default operator layout:
 - Camera loss, stale frames, Hailo errors, and PLC unknown state must be visible as NG or blocked states.
 
 The all-camera layout remains available from the sidebar for inspection of ceiling, front, rear-side, and opposite-side cameras.
+
+In disabled birdview mode, the dashboard shows only front and the all-camera layout shows front, rear-side, and opposite-side. The operator status strip must show `버드뷰 OFF · 최종 OK 차단`; the ceiling tile and rotation control remain hidden.
 
 ## Sidebar and Feature Slots
 

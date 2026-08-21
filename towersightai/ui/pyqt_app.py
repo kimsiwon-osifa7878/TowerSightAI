@@ -24,6 +24,7 @@ from towersightai.inference.purpose_tasks import (
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.runtime_logging import new_run_id
 from towersightai.state_machine.core import ParkingState
+from towersightai.storage.raw_data import RawDataManager
 from towersightai.ui.model import (
     AlignmentResult,
     GlobalSafetyStatus,
@@ -286,7 +287,10 @@ class CameraCaptureWorker(QObject):
         using_gstreamer = capture.isOpened()
         if not using_gstreamer:
             capture.release()
-            capture = cv2.VideoCapture(self.camera.rtsp_url)
+            if self.camera.role is CameraRole.front:
+                capture = cv2.VideoCapture(self.camera.rtsp_url)
+            else:
+                capture = cv2.VideoCapture()
         return capture, using_gstreamer
 
 
@@ -655,6 +659,7 @@ class OperatorWindow(QMainWindow):
         self._person_detected_camera_ids: set[str] = set()
         self._operator_unlocked = False
         self._vehicle_entry_simulation = False
+        self._raw_data_manager: RawDataManager | None = None
         self._camera_layout_mode = "dashboard"
         self._camera_rotations: dict[str, int] = {
             camera.id: camera.rotation_degrees
@@ -671,6 +676,7 @@ class OperatorWindow(QMainWindow):
         self.apply_model(model)
         if self.settings is not None:
             self._start_camera_capture()
+            self._start_raw_data_collection()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(1000)
@@ -698,7 +704,7 @@ class OperatorWindow(QMainWindow):
             worker.stop()
         for thread in self._threads:
             thread.quit()
-            thread.wait(5000)
+            thread.wait(10000)
         self._stop_ai_detection()
         self._stop_purpose_inference()
         self._stop_front_camera_lpr()
@@ -711,7 +717,50 @@ class OperatorWindow(QMainWindow):
         for thread in self._front_lpr_threads:
             thread.quit()
             thread.wait(10000)
+        if self._raw_data_manager is not None:
+            self._record_raw(self._raw_data_manager.record_application_stopped)
         super().closeEvent(event)
+
+    def _start_raw_data_collection(self) -> None:
+        if self.settings is None or not self.settings.raw_storage.enabled:
+            return
+        try:
+            self._raw_data_manager = RawDataManager(
+                self.settings.raw_storage,
+                (camera.id for camera in self.settings.active_cameras),
+            )
+            self._raw_data_manager.record_application_started(
+                metadata={
+                    "app_env": self.settings.app_env,
+                    "camera_ids": [camera.id for camera in self.settings.active_cameras],
+                    "birdview_mode": self.settings.birdview_mode.value,
+                }
+            )
+            self._raw_data_manager.start_background_sync()
+        except Exception:  # noqa: BLE001 - raw logging must not crash the safety UI.
+            logging.getLogger(__name__).exception("raw-data collection startup failed")
+            self._raw_data_manager = None
+            return
+        self._raw_sample_timer = QTimer(self)
+        self._raw_sample_timer.timeout.connect(self._sample_raw_person_window)
+        self._raw_sample_timer.start(max(1, int(self.settings.raw_storage.sample_interval_seconds * 1000)))
+        self._raw_sync_timer = QTimer(self)
+        self._raw_sync_timer.timeout.connect(self._start_raw_background_sync)
+        self._raw_sync_timer.start(max(1000, int(self.settings.raw_storage.sync_interval_seconds * 1000)))
+
+    def _record_raw(self, callback, *args, **kwargs) -> None:  # noqa: ANN001 - compact failure boundary.
+        try:
+            callback(*args, **kwargs)
+        except Exception:  # noqa: BLE001 - persistence failure must be visible in logs, not crash UI.
+            logging.getLogger(__name__).exception("raw-data record failed")
+
+    def _sample_raw_person_window(self) -> None:
+        if self._raw_data_manager is not None:
+            self._record_raw(self._raw_data_manager.tick)
+
+    def _start_raw_background_sync(self) -> None:
+        if self._raw_data_manager is not None:
+            self._raw_data_manager.start_background_sync()
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
         if event.key() == Qt.Key.Key_O and event.modifiers() == (
@@ -724,7 +773,7 @@ class OperatorWindow(QMainWindow):
     def _start_camera_capture(self) -> None:
         if self.settings is None:
             return
-        for camera in self.settings.cameras:
+        for camera in self.settings.active_cameras:
             thread = QThread(self)
             worker = CameraCaptureWorker(self.settings, camera.id, self._camera_rotations.get(camera.id, 0))
             worker.moveToThread(thread)
@@ -762,6 +811,14 @@ class OperatorWindow(QMainWindow):
         tile = next((tile for tile in self.model.camera_tiles if tile.camera_id == camera_id), None)
         if tile is None:
             return
+        if self._raw_data_manager is not None and detections:
+            task_id = self._purpose_task_id or ("legacy_detection" if self._detection_legacy_mode else "general_detection")
+            self._record_raw(
+                self._raw_data_manager.record_detection_batch,
+                camera_id,
+                detections,
+                task_id=task_id,
+            )
         widgets = self._camera_surfaces(tile.role)
         if not widgets:
             return
@@ -873,14 +930,19 @@ class OperatorWindow(QMainWindow):
             if self._runtime_camera_status.get(tile.camera_id, tile.status_text).startswith("NG")
         )
         blocked_count = len(blocked_tiles)
+        camera_total = len(self.model.camera_tiles)
+        birdview_suffix = " · 버드뷰 OFF" if not self.model.birdview_available else ""
         if blocked_count:
-            self.camera_summary_label.setText(f"카메라 {blocked_count}/4 차단")
+            self.camera_summary_label.setText(f"카메라 {blocked_count}/{camera_total} 차단{birdview_suffix}")
             if self._detection_enabled or preserve_notice:
                 return
-            self.warning_label.setText("카메라 입력 차단: " + ", ".join(tile.title for tile in blocked_tiles))
+            warning = "카메라 입력 차단: " + ", ".join(tile.title for tile in blocked_tiles)
+            if not self.model.birdview_available:
+                warning = f"{warning} · 버드뷰 OFF · 최종 OK 차단"
+            self.warning_label.setText(warning)
             return
 
-        self.camera_summary_label.setText("카메라 4/4 정상")
+        self.camera_summary_label.setText(f"카메라 {camera_total}/{camera_total} 정상{birdview_suffix}")
         if self._detection_enabled or preserve_notice:
             return
         if self.model.plc_state.value != "CONNECTED":
@@ -1042,7 +1104,7 @@ class OperatorWindow(QMainWindow):
         self.operator_camera_area = QWidget()
         self.operator_camera_area.setLayout(self.grid)
 
-        roles = [CameraRole.ceiling, CameraRole.front, CameraRole.rear_side, CameraRole.opposite_side]
+        roles = [tile.role for tile in self.model.camera_tiles]
         for role in roles:
             title = next((tile.title for tile in self.model.camera_tiles if tile.role is role), role.value)
             surface = CameraSurface(title)
@@ -1274,6 +1336,8 @@ class OperatorWindow(QMainWindow):
         self._driver_simulated = False
         self._driver_masked_plate = ""
         self._user_mode_state = "idle"
+        if self._raw_data_manager is not None:
+            self._record_raw(self._raw_data_manager.end_vehicle_session, reason="test_state_cleared")
         self._refresh_driver_display()
         self.warning_label.setText("실제 표시 모델로 복귀했습니다. 안전 조건 확인 전 최종 OK는 차단됩니다.")
         self._refresh_user_mode_labels()
@@ -1289,11 +1353,23 @@ class OperatorWindow(QMainWindow):
         self._driver_alignment_override = AlignmentResult.UNKNOWN
         self._driver_simulated = True
         self._user_mode_state = "entry"
-        for role in (CameraRole.ceiling, CameraRole.front):
+        if self._raw_data_manager is not None:
+            self._record_raw(
+                self._raw_data_manager.record_vehicle_entry,
+                camera_id="front",
+                simulated=True,
+            )
+        simulation_roles = (CameraRole.front,)
+        if self.model.birdview_available:
+            simulation_roles = (CameraRole.ceiling, CameraRole.front)
+        for role in simulation_roles:
             for widget in self._camera_surfaces(role):
                 widget.set_vehicle_simulation(True)
         self._show_operator_dashboard()
-        self.instruction_label.setText("진입 차량 감지: 버드뷰와 정면 영상을 확인 중입니다.")
+        if self.model.birdview_available:
+            self.instruction_label.setText("진입 차량 감지: 버드뷰와 정면 영상을 확인 중입니다.")
+        else:
+            self.instruction_label.setText("진입 차량 감지: 정면 영상을 확인 중입니다.")
         self.warning_label.setText("차량 진입 시뮬레이션: UI 확인 전용이며 PLC OK는 차단됩니다.")
         self._refresh_driver_display(apply_layout=False)
         self._refresh_user_mode_labels()
@@ -1312,6 +1388,12 @@ class OperatorWindow(QMainWindow):
         self._driver_state_override = ParkingState.VEHICLE_ENTERING
         self._driver_alignment_override = AlignmentResult.UNKNOWN
         self._driver_simulated = True
+        if self._raw_data_manager is not None:
+            self._record_raw(
+                self._raw_data_manager.record_vehicle_entry,
+                camera_id="front",
+                simulated=True,
+            )
         self._reset_person_alert()
         self._set_user_status("진입 차량 감지 중", "정면 카메라 차량 감지 AI로 전환합니다.")
         self._switch_user_purpose_task(PURPOSE_VEHICLE_DETECTION)
@@ -1343,6 +1425,8 @@ class OperatorWindow(QMainWindow):
         self._stop_ai_detection()
         self._stop_front_camera_lpr()
         self._reset_person_alert()
+        if self._raw_data_manager is not None:
+            self._record_raw(self._raw_data_manager.end_vehicle_session, reason="parking_started")
         self._set_user_status("주차 시작: AI 감시 종료", "모든 AI 추론을 종료했습니다. 최종 OK는 차단됩니다.")
 
     def _switch_user_purpose_task(self, task_id: str) -> None:
@@ -1351,10 +1435,9 @@ class OperatorWindow(QMainWindow):
                 self._stop_purpose_inference()
             self._pending_user_purpose_task_id = ""
             self._set_purpose_buttons_checked(False)
-            requirement = "정상 수신 중인 카메라가 있을 때 시작합니다." if self._user_mode_state == "idle" else "4대 카메라가 모두 정상 수신일 때 시작합니다."
             self._set_user_status(
                 self.user_instruction_label.text(),
-                f"사람 감지는 {requirement}",
+                "사람 감지는 프론트 카메라가 정상 수신일 때 시작합니다.",
             )
             return
         if self._purpose_task_enabled and self._purpose_task_id == task_id:
@@ -1374,19 +1457,11 @@ class OperatorWindow(QMainWindow):
         self._refresh_driver_display()
         self._refresh_user_mode_labels()
 
-    def _all_user_person_cameras_ready(self) -> bool:
-        if self.settings is None:
-            return False
-        configured_ids = {camera.id for camera in self.settings.cameras}
-        streaming_ids = set(_streaming_camera_ids(self.settings, self._runtime_camera_status))
-        return bool(configured_ids) and configured_ids.issubset(streaming_ids)
-
     def _user_person_detection_can_start(self) -> bool:
         if self.settings is None:
             return False
-        if self._user_mode_state == "idle":
-            return bool(_streaming_camera_ids(self.settings, self._runtime_camera_status))
-        return self._all_user_person_cameras_ready()
+        front = next((camera for camera in self.settings.active_cameras if camera.role is CameraRole.front), None)
+        return front is not None and self._runtime_camera_status.get(front.id) == "정상 수신"
 
     def _refresh_user_mode_labels(self) -> None:
         if not hasattr(self, "driver_test_buttons"):
@@ -1473,19 +1548,27 @@ class OperatorWindow(QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.hide()
-        if mode == "all":
+        if not self.model.birdview_available and mode == "all":
             layout = (
-                (CameraRole.ceiling, 0, 0),
-                (CameraRole.front, 0, 1),
-                (CameraRole.rear_side, 1, 0),
-                (CameraRole.opposite_side, 1, 1),
+                (CameraRole.front, 0, 0, 2, 1),
+                (CameraRole.rear_side, 0, 1, 1, 1),
+                (CameraRole.opposite_side, 1, 1, 1, 1),
+            )
+        elif not self.model.birdview_available:
+            layout = ((CameraRole.front, 0, 0, 1, 1),)
+        elif mode == "all":
+            layout = (
+                (CameraRole.ceiling, 0, 0, 1, 1),
+                (CameraRole.front, 0, 1, 1, 1),
+                (CameraRole.rear_side, 1, 0, 1, 1),
+                (CameraRole.opposite_side, 1, 1, 1, 1),
             )
         else:
             layout = (
-                (CameraRole.ceiling, 0, 0),
-                (CameraRole.front, 0, 1),
+                (CameraRole.ceiling, 0, 0, 1, 1),
+                (CameraRole.front, 0, 1, 1, 1),
             )
-        for role, row, col in layout:
+        for role, row, col, row_span, col_span in layout:
             widget = self.camera_widgets[role]
             if mode == "dashboard" and role is CameraRole.ceiling:
                 widget.setMinimumSize(320, 520)
@@ -1493,10 +1576,14 @@ class OperatorWindow(QMainWindow):
             else:
                 widget.setMinimumSize(360, 220)
                 widget.setMaximumWidth(16777215)
-            self.grid.addWidget(widget, row, col)
+            self.grid.addWidget(widget, row, col, row_span, col_span)
             widget.show()
-        self.grid.setColumnStretch(0, 2 if mode == "dashboard" else 1)
-        self.grid.setColumnStretch(1, 5 if mode == "dashboard" else 1)
+        if not self.model.birdview_available:
+            self.grid.setColumnStretch(0, 3)
+            self.grid.setColumnStretch(1, 2 if mode == "all" else 0)
+        else:
+            self.grid.setColumnStretch(0, 2 if mode == "dashboard" else 1)
+            self.grid.setColumnStretch(1, 5 if mode == "dashboard" else 1)
         for row in range(2):
             self.grid.setRowStretch(row, 1 if mode == "all" or row == 0 else 0)
 
@@ -1535,6 +1622,13 @@ class OperatorWindow(QMainWindow):
         self._detection_enabled = True
         self._detection_legacy_mode = legacy_mode
         self._detection_camera_ids = streaming_camera_ids
+        if self._raw_data_manager is not None:
+            self._record_raw(
+                self._raw_data_manager.record_ai_started,
+                "legacy_detection" if legacy_mode else "general_detection",
+                streaming_camera_ids,
+                simulated=self._driver_simulated,
+            )
         self._detection_event_counts = {camera_id: 0 for camera_id in streaming_camera_ids}
         self._detection_load_started_at = time.monotonic()
         self._detection_first_inference_seconds = None
@@ -1575,6 +1669,9 @@ class OperatorWindow(QMainWindow):
         thread.start()
 
     def _stop_ai_detection(self) -> None:
+        raw_task_id = "legacy_detection" if self._detection_legacy_mode else "general_detection"
+        if self._raw_data_manager is not None:
+            self._record_raw(self._raw_data_manager.record_ai_stopped, raw_task_id)
         self._detection_enabled = False
         self._detection_legacy_mode = False
         self._detection_camera_ids = ()
@@ -1645,6 +1742,13 @@ class OperatorWindow(QMainWindow):
     def _set_front_lpr_result(self, payload: dict[str, object]) -> None:
         if payload.get("ok"):
             last4 = str(payload.get("last4") or "")
+            plate_number = str(payload.get("plate_number") or "")
+            if self._raw_data_manager is not None and plate_number:
+                self._record_raw(
+                    self._raw_data_manager.record_plate,
+                    plate_number,
+                    simulated=self._driver_simulated,
+                )
             self.instruction_label.setText(f"정면카메라LPR: {last4}")
             self.warning_label.setText(f"정면카메라LPR 완료. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
             self._driver_masked_plate = f"•••• {last4}" if last4 else ""
@@ -1698,6 +1802,13 @@ class OperatorWindow(QMainWindow):
         self._detection_enabled = False
         self._detection_failed = False
         self._detection_camera_ids = camera_ids
+        if self._raw_data_manager is not None:
+            self._record_raw(
+                self._raw_data_manager.record_ai_started,
+                task_id,
+                camera_ids,
+                simulated=self._driver_simulated,
+            )
         self._detection_event_counts = {camera_id: 0 for camera_id in camera_ids}
         self.model_status_label.setText(f"목적 모델 로드 중: {spec.label}")
         self.ai_detection_label.setText(_purpose_detection_label(spec.label, camera_ids, self._detection_event_counts, loading_seconds=0.0))
@@ -1786,6 +1897,15 @@ class OperatorWindow(QMainWindow):
         merged = self._purpose_lpr_results + tuple(events)
         self._purpose_lpr_results = tuple(sorted(merged, key=lambda event: event.timestamp, reverse=True))
         latest = self._purpose_lpr_results[0]
+        if self._raw_data_manager is not None:
+            for event in events:
+                self._record_raw(
+                    self._raw_data_manager.record_plate,
+                    event.plate_number,
+                    confidence=event.confidence,
+                    simulated=True,
+                    at=event.timestamp,
+                )
         suffix = f" 외 {len(self._purpose_lpr_results) - 1}건" if len(self._purpose_lpr_results) > 1 else ""
         self.instruction_label.setText(f"번호판 인식: {latest.plate_number}{suffix}")
         self.warning_label.setText("번호판 이미지 LPR 결과입니다. 최종 OK는 차단됩니다.")
@@ -1809,6 +1929,9 @@ class OperatorWindow(QMainWindow):
             self.user_warning_label.setText(f"{self._purpose_task_label or target_id} 문제: {message[:120]}. 최종 OK는 차단됩니다.")
 
     def _stop_purpose_inference(self) -> None:
+        raw_task_id = self._purpose_task_id
+        if self._raw_data_manager is not None and raw_task_id:
+            self._record_raw(self._raw_data_manager.record_ai_stopped, raw_task_id)
         self._purpose_task_enabled = False
         self._purpose_task_id = ""
         self._purpose_task_label = ""
@@ -1831,6 +1954,13 @@ class OperatorWindow(QMainWindow):
         if self._purpose_task_enabled and not self._purpose_workers:
             failed = self._detection_failed
             label = self._purpose_task_label
+            raw_task_id = self._purpose_task_id
+            if self._raw_data_manager is not None and raw_task_id:
+                self._record_raw(
+                    self._raw_data_manager.record_ai_stopped,
+                    raw_task_id,
+                    reason="worker_finished",
+                )
             self._purpose_task_enabled = False
             self._purpose_task_id = ""
             self._purpose_task_label = ""
@@ -1875,6 +2005,12 @@ class OperatorWindow(QMainWindow):
         if self._detection_enabled and not self._detection_workers:
             failed = self._detection_failed
             legacy_mode = self._detection_legacy_mode
+            if self._raw_data_manager is not None:
+                self._record_raw(
+                    self._raw_data_manager.record_ai_stopped,
+                    "legacy_detection" if legacy_mode else "general_detection",
+                    reason="worker_finished",
+                )
             self._detection_enabled = False
             self._detection_legacy_mode = False
             self._detection_camera_ids = ()
@@ -1915,7 +2051,7 @@ def _fresh_detections(detections: tuple[DetectionEvent, ...]) -> tuple[Detection
 def _streaming_camera_ids(settings: Settings, runtime_status: dict[str, str]) -> tuple[str, ...]:
     return tuple(
         camera.id
-        for camera in settings.cameras
+        for camera in settings.active_cameras
         if runtime_status.get(camera.id) == "정상 수신"
     )
 

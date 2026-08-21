@@ -406,6 +406,50 @@ def test_purpose_runner_stops_alive_process_on_pipeline_heartbeat_stall(tmp_path
     assert '"inference_hailonet_q": 3' in errors[0]
 
 
+def test_purpose_runner_stops_alive_process_when_heartbeat_never_starts(tmp_path: Path, monkeypatch):
+    errors: list[str] = []
+    diagnostic_path = tmp_path / "person_presence.heartbeat.jsonl"
+    process = PurposeInferenceProcess(
+        task_id=PURPOSE_PERSON_PRESENCE,
+        label="사람 존재 감지",
+        command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
+        env={},
+        log_path=tmp_path / "person_presence.gst.log",
+        event_path=tmp_path / "person_presence.jsonl",
+        model_paths=(),
+        camera_ids=("front",),
+        diagnostic_path=diagnostic_path,
+        diagnostic_startup_timeout_seconds=0.0,
+    )
+
+    class SilentProcess:
+        pid = 54322
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout=None):  # noqa: ANN001 - fake subprocess API.
+            self.returncode = -15
+            return self.returncode
+
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.shutil.which", lambda _command: "/usr/bin/gst-launch-1.0")
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.subprocess.Popen", lambda *_args, **_kwargs: SilentProcess())
+    monkeypatch.setattr("towersightai.inference.purpose_tasks.os.killpg", lambda _pid, _sig: None)
+
+    runner = PurposeInferenceRunner(process, on_events=lambda _events: None, on_error=errors.append, poll_seconds=0)
+
+    assert runner.run() is True
+    assert errors
+    assert "heartbeat did not start" in errors[0]
+
+
 def test_purpose_runner_replaces_stalled_process_and_confirms_recovery(tmp_path: Path, monkeypatch):
     errors: list[str] = []
     statuses: list[str] = []

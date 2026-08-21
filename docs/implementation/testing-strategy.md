@@ -20,6 +20,7 @@ Run on any developer machine:
 - Operator dashboard, sidebar, EMPTY action, and simulation behavior.
 - Purpose-specific Hailo pipeline builders for vehicle detection, LPR image tests, and person-presence detection.
 - Fatal Hailo/GStreamer log handling so stuck `gst-launch` processes do not leave the UI loading indefinitely.
+- Daily raw JSONL schema, 0.5-second person sampling, five-second clear tail, completed-day NAS selection, upload retry, and verified 14-day retention.
 
 ## UI-Only Tests
 
@@ -31,6 +32,7 @@ Run without real hardware:
 - Sidebar opens and closes.
 - Dashboard and all-camera layouts switch correctly.
 - Ceiling birdview uses the vertical dashboard tile and CCW 90-degree display policy.
+- Disabled birdview mode omits the ceiling tile and worker from every UI, shows stable one/three-camera layouts, and keeps final OK blocked.
 - EMPTY buttons do not change safety state.
 - Vehicle-entry simulation is visually testable but keeps final OK blocked.
 - Long status text does not resize camera tiles unexpectedly.
@@ -77,10 +79,10 @@ Manual or semi-automated checklist:
 
 - Confirm the app starts in the dark, camera-first user mode.
 - Hold the top-right hotspot for two seconds and confirm the operator dashboard replaces user mode.
-- Confirm ceiling birdview and front camera are visible on the first screen.
-- Confirm ceiling birdview uses the vertical tile and CCW 90-degree display policy.
+- With `BIRDVIEW_MODE=disabled`, confirm the front camera is the only dashboard tile and `버드뷰 OFF` is visible in the status strip.
+- Confirm `전체 카메라` shows front, rear-side, and opposite-side without a ceiling tile.
 - Confirm `메뉴` opens the sidebar.
-- Click `전체 카메라` and confirm the four-camera inspection layout is visible.
+- Click `전체 카메라` and confirm the active-camera inspection layout is visible.
 - For Hailo regression isolation, click `이전 AI Detection` and compare whether detection events resume through the previous `HAILO_HEF_PATH` launch path.
 - Click `차량 전용 검출` and confirm the status strip shows the purpose task, the front camera is the only target, and `artifacts/runtime/purpose-ai/vehicle_detection/vehicle.gst.log` contains `yolov5m_vehicles.hef`.
 - Click `번호판 이미지 LPR` and confirm `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` contains FastALPR model names, per-image inference time, and OCR result or failure status.

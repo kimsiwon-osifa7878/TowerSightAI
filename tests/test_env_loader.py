@@ -53,6 +53,21 @@ CALIBRATION_PATH=data/calibration/site.json
 PLC_ENDPOINT=tcp://127.0.0.1:502
 UI_FULLSCREEN=false
 UI_CAMERA_RESOLUTION=1024x576
+BIRDVIEW_MODE=disabled
+RAW_DATA_ENABLED=true
+RAW_DATA_LOCAL_DIR=artifacts/raw-test
+RAW_DATA_SAMPLE_INTERVAL_SECONDS=0.5
+RAW_DATA_PERSON_STALE_SECONDS=1.0
+RAW_DATA_PERSON_CLEAR_GRACE_SECONDS=5.0
+RAW_DATA_RETENTION_DAYS=14
+RAW_DATA_SYNC_INTERVAL_SECONDS=300
+RAW_DATA_TIMEZONE=Asia/Seoul
+SYNOLOGY_NAS_HOST=nas.example.com
+SYNOLOGY_NAS_PORT=45222
+SYNOLOGY_NAS_ID=uploader
+SYNOLOGY_NAS_PW=test-password
+SYNOLOGY_NAS_FOLDER=/home/site
+SYNOLOGY_NAS_KNOWN_HOSTS=~/.ssh/known_hosts
 """.strip(),
         encoding="utf-8",
     )
@@ -82,7 +97,16 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
     assert settings.fast_alpr_detector_model == "detector-test-model"
     assert settings.fast_alpr_ocr_model == "ocr-test-model"
     assert [camera.id for camera in settings.cameras] == ["ceiling", "front", "rear_side", "opposite_side"]
+    assert [camera.id for camera in settings.active_cameras] == ["front", "rear_side", "opposite_side"]
+    assert settings.birdview_enabled is False
     assert [camera.rotation_degrees for camera in settings.cameras] == [90, 0, 0, 0]
+    assert settings.raw_storage.enabled is True
+    assert settings.raw_storage.sample_interval_seconds == 0.5
+    assert settings.raw_storage.person_clear_grace_seconds == 5.0
+    assert settings.raw_storage.retention_days == 14
+    assert settings.raw_storage.nas_host == "nas.example.com"
+    assert settings.raw_storage.nas_port == 45222
+    assert settings.raw_storage.nas_folder == "/home/site"
 
 
 def test_load_settings_from_env_expands_home_and_config_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -146,4 +170,15 @@ def test_invalid_camera_rotation_raises(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="Camera rotation"):
+        load_settings_from_env(env_path)
+
+
+def test_invalid_birdview_mode_raises(tmp_path: Path):
+    env_path = _write_env(tmp_path / ".env")
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace("BIRDVIEW_MODE=disabled", "BIRDVIEW_MODE=synthetic_lr"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="synthetic_lr"):
         load_settings_from_env(env_path)

@@ -10,7 +10,7 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
-from towersightai.config.settings import CameraRole, Settings
+from towersightai.config.settings import CameraRole, RawStorageConfig, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.inference.purpose_tasks import PlateOcrEvent, PURPOSE_LPR_IMAGE
 from towersightai.state_machine.core import ParkingState
@@ -48,7 +48,7 @@ from towersightai.ui.pyqt_app import (
 _APP: QApplication | None = None
 
 
-def _settings() -> Settings:
+def _settings(*, birdview_mode: str = "ceiling") -> Settings:
     return Settings(
         tappas_workspace="/tmp/tappas",
         hailo_hef_path="/tmp/model.hef",
@@ -59,6 +59,7 @@ def _settings() -> Settings:
         camera_4={"id": "opposite_side", "role": "opposite_side", "rtsp_url": "rtsp://d"},
         calibration_path="/tmp/calibration.json",
         plc_endpoint="tcp://127.0.0.1:502",
+        birdview_mode=birdview_mode,
     )
 
 
@@ -304,6 +305,42 @@ def test_operator_ui_starts_on_user_mode_with_sidebar_closed():
     assert window.stack.currentWidget() is window.user_view
     assert window.camera_widgets[CameraRole.ceiling].display_mode == "cover"
     assert window.camera_widgets[CameraRole.front].display_mode == "cover"
+    window.close()
+
+
+def test_disabled_birdview_is_hidden_and_does_not_start_ceiling_capture(monkeypatch):
+    _qt_app()
+    settings = _settings(birdview_mode="disabled")
+    model = build_operator_display(
+        state=ParkingState.IDLE,
+        cameras=settings.active_cameras,
+        birdview_available=settings.birdview_enabled,
+    )
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(model, settings=settings)
+
+    assert CameraRole.ceiling not in window.camera_widgets
+    assert "ceiling" not in window.camera_rotation_buttons
+    assert [worker.camera.id for worker in window._workers] == ["front", "rear_side", "opposite_side"]
+    assert window.camera_summary_label.text().endswith("버드뷰 OFF")
+    assert "버드뷰 OFF" in window.warning_label.text()
+    assert "최종 OK 차단" in window.warning_label.text()
+    assert window.driver_view.display.visible_roles == (CameraRole.front,)
+
+    window._show_operator_dashboard()
+    assert window.grid.count() == 1
+    assert window.grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
+
+    window._show_all_cameras()
+    assert window.grid.count() == 3
+    assert window.grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
+    assert window.grid.itemAtPosition(0, 1).widget() is window.camera_widgets[CameraRole.rear_side]
+    assert window.grid.itemAtPosition(1, 1).widget() is window.camera_widgets[CameraRole.opposite_side]
+
+    window._simulate_vehicle_entry()
+    assert window.driver_view.display.visible_roles == (CameraRole.front,)
+    assert "버드뷰" not in window.instruction_label.text()
+    assert window.model.can_show_final_ok is False
     window.close()
 
 
@@ -631,7 +668,7 @@ def test_user_idle_button_starts_person_presence_for_streaming_cameras(monkeypat
     window.close()
 
 
-def test_user_idle_button_allows_partial_streaming_cameras(monkeypatch):
+def test_user_idle_button_blocks_when_front_is_missing_even_if_another_camera_streams(monkeypatch):
     _qt_app()
     settings = _settings()
     model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
@@ -643,8 +680,47 @@ def test_user_idle_button_allows_partial_streaming_cameras(monkeypatch):
     window.driver_test_buttons["IDLE"].click()
 
     assert window._user_mode_state == "idle"
+    assert window._purpose_task_id == ""
+    assert window._purpose_workers == []
+    assert "프론트 카메라가 정상 수신" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_user_idle_button_allows_front_only_person_presence(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(model, settings=settings)
+    window._runtime_camera_status = {"front": "정상 수신"}
+
+    window.driver_test_buttons["IDLE"].click()
+
     assert window._purpose_task_id == "person_presence"
-    assert window._purpose_workers[0].camera_ids == ("ceiling",)
+    assert window._purpose_workers[0].camera_ids == ("front",)
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_user_entry_complete_allows_front_only_person_presence_after_vehicle_worker_stops(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(model, settings=settings)
+    window._runtime_camera_status = {"front": "정상 수신"}
+    window.driver_test_buttons["진입"].click()
+
+    window.driver_test_buttons["진입완료"].click()
+    old_thread = window._purpose_threads[0]
+    old_worker = window._purpose_workers[0]
+    window._cleanup_purpose_worker(old_thread, old_worker)
+
+    assert window._purpose_task_id == "person_presence"
+    assert window._purpose_workers[-1].camera_ids == ("front",)
     assert window.model.can_show_final_ok is False
     window.close()
 
@@ -773,6 +849,81 @@ def test_user_person_alert_requires_consecutive_person_detections(monkeypatch):
     assert window.user_grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
     assert "최종 OK" in window.driver_view.status_label.text()
     window.close()
+
+
+def test_operator_window_routes_runtime_events_to_raw_data_manager(monkeypatch, tmp_path: Path):
+    _qt_app()
+    calls: list[tuple[str, object]] = []
+
+    class FakeRawDataManager:
+        def __init__(self, config, camera_ids):
+            calls.append(("init", tuple(camera_ids)))
+
+        def record_application_started(self, *, metadata):
+            calls.append(("application_started", metadata))
+
+        def start_background_sync(self):
+            calls.append(("sync", None))
+            return True
+
+        def record_detection_batch(self, camera_id, detections, *, task_id):
+            calls.append(("detections", (camera_id, task_id, tuple(detections))))
+
+        def record_vehicle_entry(self, *, camera_id, confidence=None, simulated=False, at=None):
+            calls.append(("vehicle", (camera_id, simulated)))
+
+        def record_plate(self, plate_number, **kwargs):
+            calls.append(("plate", plate_number))
+
+        def record_ai_started(self, *args, **kwargs):
+            calls.append(("ai_started", args[0]))
+
+        def record_ai_stopped(self, *args, **kwargs):
+            calls.append(("ai_stopped", args[0]))
+
+        def end_vehicle_session(self, *, reason):
+            calls.append(("vehicle_ended", reason))
+
+        def tick(self):
+            return 0
+
+        def record_application_stopped(self):
+            calls.append(("application_stopped", None))
+
+    settings = _settings()
+    settings.raw_storage = RawStorageConfig(
+        enabled=True,
+        local_dir=tmp_path,
+        nas_host="nas.example.com",
+        nas_port=45222,
+        nas_username="uploader",
+        nas_password="test-password",
+        nas_folder="/home/site",
+    )
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr("towersightai.ui.pyqt_app.RawDataManager", FakeRawDataManager)
+    window = OperatorWindow(model, settings=settings)
+    window._runtime_camera_status["front"] = "정상 수신"
+    window._purpose_task_id = "person_presence"
+    event = DetectionEvent(
+        camera_id="front",
+        label="person",
+        confidence=0.91,
+        bbox=BoundingBox(0.1, 0.1, 0.2, 0.2),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    window._set_camera_detections("front", (event,))
+    window._set_front_lpr_result({"ok": True, "plate_number": "12가3456", "last4": "3456"})
+    window._simulate_vehicle_entry()
+    window.close()
+
+    assert ("init", ("ceiling", "front", "rear_side", "opposite_side")) in calls
+    assert any(name == "detections" for name, _payload in calls)
+    assert ("plate", "12가3456") in calls
+    assert ("vehicle", ("front", True)) in calls
+    assert ("application_stopped", None) in calls
 
 
 def test_camera_settings_rotation_button_updates_runtime_rotation_state():

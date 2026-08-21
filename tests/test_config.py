@@ -2,7 +2,26 @@ from pathlib import Path
 
 import pytest
 
-from towersightai.config.settings import Settings
+from towersightai.config.settings import BirdviewMode, Settings
+
+
+def test_disabled_birdview_excludes_ceiling_from_active_cameras(tmp_path: Path):
+    settings = Settings(
+        tappas_workspace=tmp_path,
+        hailo_hef_path=tmp_path / "m.hef",
+        hailo_postprocess_so=tmp_path / "pp.so",
+        camera_1={"id": "front", "role": "front", "rtsp_url": "rtsp://a"},
+        camera_2={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://b"},
+        camera_3={"id": "rear_side", "role": "rear_side", "rtsp_url": "rtsp://c"},
+        camera_4={"id": "opposite_side", "role": "opposite_side", "rtsp_url": "rtsp://d"},
+        calibration_path=tmp_path / "calibration.json",
+        plc_endpoint="tcp://127.0.0.1:502",
+        birdview_mode="disabled",
+    )
+
+    assert settings.birdview_mode is BirdviewMode.disabled
+    assert settings.birdview_enabled is False
+    assert [camera.role.value for camera in settings.active_cameras] == ["front", "rear_side", "opposite_side"]
 
 
 def test_unique_camera_ids_required(tmp_path: Path):
