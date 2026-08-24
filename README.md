@@ -51,8 +51,9 @@ Implemented:
 - Person-presence detection uses the Hailo Apps detector's `person` class only; Re-ID embedding and gallery matching are intentionally not used.
 - Fatal Hailo/GStreamer log detection that stops stuck `gst-launch` processes instead of leaving the UI in a loading state.
 - Fake PLC adapter and state-machine core used by tests.
-- Daily JSONL raw-data capture for application/AI start, vehicle entry, plate results, raw per-camera detections, and 0.5-second person-presence samples through five seconds after clear.
-- Strict-host-key Synology SFTP synchronization for completed days, with SHA-256 verification, atomic remote publication, retry markers, and local deletion only after a verified upload is at least 14 days old.
+- Hourly JSONL raw-data shards for application/AI start, vehicle entry, plate results, raw per-camera detections, and 0.5-second person-presence samples through five seconds after clear. Closed shards are gzip-compressed.
+- Event evidence capture: JPEG snapshots plus H.264-passthrough MKV clips for real vehicle/person events, and a high-quality image for a real plate result. Simulation never creates authoritative evidence.
+- Strict-host-key Synology SFTP synchronization using a versioned, file-level SHA-256 manifest, atomic remote publication, retry markers, and local deletion only after a verified upload is at least 14 days old.
 
 Known gaps:
 
@@ -162,12 +163,13 @@ Important values:
 - `HAILO_PERSON_PRESENCE_*`: person-task HEF and postprocess mapping.
 - `FAST_ALPR_DETECTOR_MODEL`, `FAST_ALPR_OCR_MODEL`: CPU-side plate detector and OCR model selection.
 - `HAILO_NETWORK_NAME`: defaults to `filter_letterbox` for the current YOLO postprocess.
-- `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, RTSP URL, optional username/password, and `CAMERA_N_ROTATION_DEGREES`.
+- `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, preview RTSP URL, optional dedicated H.264 `CAMERA_N_RECORD_RTSP_URL`, optional username/password, and `CAMERA_N_ROTATION_DEGREES`.
 - `CALIBRATION_PATH`: calibration JSON path.
 - `PLC_ENDPOINT`: PLC or simulator endpoint.
 - `UI_CAMERA_RESOLUTION`: preview/display capture resolution, for example `1920x1080` or `1280x720`.
 - `BIRDVIEW_MODE`: `disabled` for the current three-camera UI or `ceiling` for the existing ceiling-camera birdview.
-- `RAW_DATA_*`: local JSONL directory, 0.5-second sampling, five-second person-clear tail, Asia/Seoul day boundary, synchronization interval, and 14-day retention.
+- `RAW_DATA_*`: local archive directory, hourly shard duration, 0.5-second sampling, five-second person-clear tail, Asia/Seoul day boundary, synchronization interval, and 14-day retention.
+- `RAW_MEDIA_*`: snapshot quality/staleness, five-second video pre-roll, vehicle post-roll, recorder segment/clip-part duration, and the system Python containing GStreamer GI.
 - `SYNOLOGY_NAS_*`: SFTP hostname, external port, dedicated account, password, SFTP-visible destination folder, and trusted `known_hosts` file. The host value must not include `https://` or a port.
 
 Camera rotation is part of the equipment configuration. Set `CAMERA_N_ROTATION_DEGREES` to one of `0`, `90`, `180`, or `270`; `90` means CCW 90 degrees and `270` means CW 90 degrees. The default site profile uses `CAMERA_1_ROTATION_DEGREES=90` for the ceiling birdview camera and `0` for the other cameras. The Hailo Apps adapter transforms emitted bounding-box coordinates to the same orientation shown by the operator UI.
@@ -176,9 +178,13 @@ The UI displays the actual received frame size in each camera tile, so you can v
 
 ## Raw Data And NAS Archive
 
-With `RAW_DATA_ENABLED=true`, records are appended to `artifacts/raw/YYYY-MM-DD/events.jsonl`. The current day remains local and completed days are uploaded in the background to `${SYNOLOGY_NAS_FOLDER}/raw/YYYY-MM-DD/`. Each NAS day contains `events.jsonl` and a SHA-256 `manifest.json`; publication uses an SFTP `.part` file followed by atomic rename.
+With `RAW_DATA_ENABLED=true`, records are appended to bounded `artifacts/raw/YYYY-MM-DD/events-YYYYMMDD-HHMM.jsonl` shards. A closed shard is atomically published as `.jsonl.gz`. Existing legacy `events.jsonl` files remain readable/uploadable and are not automatically rewritten or deleted.
 
-The person window starts on the first `person` detection. It records every active camera's latest person state every 0.5 seconds, treats a detection as stale after the configured interval, and continues absence samples for five seconds. Failed or unverified uploads are never deleted locally. A successful local day is deleted when it reaches the configured 14-day age.
+With `RAW_MEDIA_ENABLED=true`, real vehicle entry saves the front-camera snapshot and a clip covering five seconds before through ten seconds after the event. A real person window saves snapshots and clips from every healthy active camera, covering five seconds before the first detection through the configured clear tail. A real plate result saves the high-quality LPR source image and, when FastALPR supplies a valid bounding box, a separate plate crop; it does not create video. Video is copied from the camera H.264 stream into silent MKV without re-encoding and is capped at five-minute parts. Media bytes are never embedded in JSONL: `media_artifact_created` records store only relative path, byte size, SHA-256, capture time, and metadata. Capture failures are explicit `media_capture_failed` events and do not alter PLC state.
+
+The current day remains local and completed days are uploaded in the background to `${SYNOLOGY_NAS_FOLDER}/raw/YYYY-MM-DD/`. `manifest.json` schema v2 lists every JSONL/gzip/image/video artifact with its relative path, media type, size, and SHA-256. Changed or missing files are uploaded to `.part`, verified, atomically renamed, and the manifest is published last.
+
+The person window starts on the first `person` detection. It records every active camera's latest person state every 0.5 seconds, treats a detection as stale after the configured interval, and continues absence samples for five seconds. Failed or unverified uploads are never deleted locally. A local day is deleted recursively only when its exact manifest was verified on NAS and it reaches the configured 14-day age.
 
 Run a completed-day sync manually with:
 
@@ -186,7 +192,7 @@ Run a completed-day sync manually with:
 towersightai-sync-raw-data --env .env
 ```
 
-For an explicit test after stopping the UI writer, upload today's snapshot immediately with:
+For an explicit test after stopping every UI/raw writer, seal and upload today's archive immediately with:
 
 ```bash
 towersightai-sync-raw-data --env .env --include-current-day

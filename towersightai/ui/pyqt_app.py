@@ -24,6 +24,7 @@ from towersightai.inference.purpose_tasks import (
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.runtime_logging import new_run_id
 from towersightai.state_machine.core import ParkingState
+from towersightai.storage.evidence import EvidenceCoordinator
 from towersightai.storage.raw_data import RawDataManager
 from towersightai.ui.model import (
     AlignmentResult,
@@ -660,6 +661,7 @@ class OperatorWindow(QMainWindow):
         self._operator_unlocked = False
         self._vehicle_entry_simulation = False
         self._raw_data_manager: RawDataManager | None = None
+        self._evidence_coordinator: EvidenceCoordinator | None = None
         self._camera_layout_mode = "dashboard"
         self._camera_rotations: dict[str, int] = {
             camera.id: camera.rotation_degrees
@@ -719,6 +721,13 @@ class OperatorWindow(QMainWindow):
             thread.wait(10000)
         if self._raw_data_manager is not None:
             self._record_raw(self._raw_data_manager.record_application_stopped)
+        if self._evidence_coordinator is not None:
+            self._evidence_coordinator.close()
+            self._evidence_coordinator = None
+        if self._raw_data_manager is not None:
+            close_raw = getattr(self._raw_data_manager, "close", None)
+            if close_raw is not None:
+                close_raw()
         super().closeEvent(event)
 
     def _start_raw_data_collection(self) -> None:
@@ -729,6 +738,16 @@ class OperatorWindow(QMainWindow):
                 self.settings.raw_storage,
                 (camera.id for camera in self.settings.active_cameras),
             )
+            if self.settings.raw_storage.media_enabled:
+                self._evidence_coordinator = EvidenceCoordinator(
+                    self.settings.raw_storage,
+                    self.settings.active_cameras,
+                    artifact_callback=self._raw_data_manager.record_media_artifact,
+                    failure_callback=self._raw_data_manager.record_media_failure,
+                )
+                self._raw_data_manager.set_event_sink(self._evidence_coordinator.handle_raw_event)
+                for camera_id, status in self._runtime_camera_status.items():
+                    self._evidence_coordinator.update_camera_status(camera_id, status)
             self._raw_data_manager.record_application_started(
                 metadata={
                     "app_env": self.settings.app_env,
@@ -739,6 +758,11 @@ class OperatorWindow(QMainWindow):
             self._raw_data_manager.start_background_sync()
         except Exception:  # noqa: BLE001 - raw logging must not crash the safety UI.
             logging.getLogger(__name__).exception("raw-data collection startup failed")
+            if self._evidence_coordinator is not None:
+                self._evidence_coordinator.close()
+                self._evidence_coordinator = None
+            if self._raw_data_manager is not None:
+                self._raw_data_manager.close()
             self._raw_data_manager = None
             return
         self._raw_sample_timer = QTimer(self)
@@ -791,6 +815,8 @@ class OperatorWindow(QMainWindow):
             return
         for widget in self._camera_surfaces(tile.role):
             widget.set_frame(frame)
+        if self._evidence_coordinator is not None:
+            self._evidence_coordinator.update_frame(camera_id, frame, received_at=datetime.now(timezone.utc))
 
     def _set_camera_status(self, camera_id: str, status: str) -> None:
         tile = next((tile for tile in self.model.camera_tiles if tile.camera_id == camera_id), None)
@@ -804,6 +830,8 @@ class OperatorWindow(QMainWindow):
         if previous_status == status:
             return
         self._runtime_camera_status[camera_id] = status
+        if self._evidence_coordinator is not None:
+            self._evidence_coordinator.update_camera_status(camera_id, status)
         self._refresh_runtime_health_labels()
         self._refresh_driver_display()
 
@@ -1132,7 +1160,8 @@ class OperatorWindow(QMainWindow):
         self.camera_summary_label = QLabel()
         self.model_status_label = QLabel("모델 선택: 없음")
         self.ai_detection_label = QLabel("AI 추론 OFF")
-        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.clock_label):
+        self.evidence_status_label = QLabel("증거 OFF")
+        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.evidence_status_label, self.clock_label):
             label.setObjectName("telemetryLabel")
             # Runtime inference text can become very long. Ignore its natural
             # width so the hidden operator page cannot enlarge the shared
@@ -1232,8 +1261,10 @@ class OperatorWindow(QMainWindow):
         return root
 
     def _tick(self) -> None:
-        text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = datetime.now().strftime("%m-%d %H:%M:%S")
         self.clock_label.setText(text)
+        if self._evidence_coordinator is not None:
+            self.evidence_status_label.setText(self._evidence_coordinator.status_summary)
         if self._last_person_detection_at is not None and time.monotonic() - self._last_person_detection_at >= PERSON_ALERT_STALE_SECONDS:
             self._reset_person_alert()
             if self._driver_state_override is ParkingState.HUMAN_DETECTED and not self._driver_simulated:
@@ -1747,7 +1778,10 @@ class OperatorWindow(QMainWindow):
                 self._record_raw(
                     self._raw_data_manager.record_plate,
                     plate_number,
+                    confidence=float(payload["confidence"]) if isinstance(payload.get("confidence"), (float, int)) else None,
                     simulated=self._driver_simulated,
+                    source_image_path=str(payload.get("snapshot_path") or "") or None,
+                    plate_bbox=payload.get("plate_bbox") if isinstance(payload.get("plate_bbox"), dict) else None,
                 )
             self.instruction_label.setText(f"정면카메라LPR: {last4}")
             self.warning_label.setText(f"정면카메라LPR 완료. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
@@ -2073,12 +2107,24 @@ def _front_lpr_payload(event_path: Path) -> dict[str, object]:
     if not event_path.exists():
         return {"ok": False, "message": "정면카메라LPR 실패: 결과 없음"}
     best_plate = ""
+    best_confidence: float | None = None
+    best_bbox: dict[str, int] | None = None
     for line in event_path.read_text(encoding="utf-8").splitlines():
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
         if payload.get("type") != "plate_ocr":
+            candidate = payload.get("best_plate")
+            if not isinstance(candidate, dict):
+                continue
+            plate_number = str(candidate.get("plate_number") or "").strip()
+            if plate_number:
+                best_plate = plate_number
+                confidence = candidate.get("confidence")
+                best_confidence = float(confidence) if isinstance(confidence, (float, int)) else None
+                bbox = candidate.get("bbox")
+                best_bbox = dict(bbox) if isinstance(bbox, dict) else None
             continue
         plate_number = str(payload.get("plate_number") or "").strip()
         if plate_number:
@@ -2086,11 +2132,16 @@ def _front_lpr_payload(event_path: Path) -> dict[str, object]:
     digits = "".join(char for char in best_plate if char.isdigit())
     if not digits:
         return {"ok": False, "message": "정면카메라LPR 실패: 결과 없음"}
-    return {
+    result: dict[str, object] = {
         "ok": True,
         "plate_number": best_plate,
         "last4": digits[-4:],
     }
+    if best_confidence is not None:
+        result["confidence"] = best_confidence
+    if best_bbox is not None:
+        result["plate_bbox"] = best_bbox
+    return result
 
 
 def _rotate_cv_frame(cv2, frame, rotation_degrees: int):  # noqa: ANN001, ANN201 - cv2/numpy are optional runtime deps.

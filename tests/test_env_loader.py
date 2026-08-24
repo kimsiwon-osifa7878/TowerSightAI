@@ -43,6 +43,7 @@ CAMERA_1_ROTATION_DEGREES=90
 CAMERA_2_ID=front
 CAMERA_2_ROLE=front
 CAMERA_2_RTSP_URL=rtsp://user:secret@192.0.2.2/stream1
+CAMERA_2_RECORD_RTSP_URL=rtsp://user:secret@192.0.2.2/stream2
 CAMERA_2_ROTATION_DEGREES=0
 CAMERA_3_ID=rear_side
 CAMERA_3_ROLE=rear_side
@@ -62,6 +63,13 @@ RAW_DATA_PERSON_CLEAR_GRACE_SECONDS=5.0
 RAW_DATA_RETENTION_DAYS=14
 RAW_DATA_SYNC_INTERVAL_SECONDS=300
 RAW_DATA_TIMEZONE=Asia/Seoul
+RAW_DATA_SHARD_MINUTES=60
+RAW_MEDIA_ENABLED=true
+RAW_MEDIA_PRE_SECONDS=5
+RAW_MEDIA_VEHICLE_POST_SECONDS=10
+RAW_MEDIA_SEGMENT_SECONDS=2
+RAW_MEDIA_CLIP_PART_SECONDS=300
+RAW_MEDIA_GSTREAMER_PYTHON=/usr/bin/python3
 SYNOLOGY_NAS_HOST=nas.example.com
 SYNOLOGY_NAS_PORT=45222
 SYNOLOGY_NAS_ID=uploader
@@ -100,10 +108,15 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
     assert [camera.id for camera in settings.active_cameras] == ["front", "rear_side", "opposite_side"]
     assert settings.birdview_enabled is False
     assert [camera.rotation_degrees for camera in settings.cameras] == [90, 0, 0, 0]
+    assert settings.camera_2.record_rtsp_url == "rtsp://user:secret@192.0.2.2/stream2"
     assert settings.raw_storage.enabled is True
     assert settings.raw_storage.sample_interval_seconds == 0.5
     assert settings.raw_storage.person_clear_grace_seconds == 5.0
     assert settings.raw_storage.retention_days == 14
+    assert settings.raw_storage.shard_minutes == 60
+    assert settings.raw_storage.media_enabled is True
+    assert settings.raw_storage.media_pre_seconds == 5
+    assert settings.raw_storage.media_clip_part_seconds == 300
     assert settings.raw_storage.nas_host == "nas.example.com"
     assert settings.raw_storage.nas_port == 45222
     assert settings.raw_storage.nas_folder == "/home/site"

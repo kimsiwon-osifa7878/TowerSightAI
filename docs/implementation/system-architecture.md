@@ -20,7 +20,7 @@ This guide defines the stable implementation shape for TowerSightAI. The source 
 - `plc`: sends vehicle, human, safety, and error events through a mockable adapter.
 - `ui`: renders state-aware camera views, guidance, safety status, settings, and calibration.
 - `calibration`: stores per-camera guide geometry, ROIs, stop zones, and tolerances.
-- `storage`: appends versioned daily JSONL audit records, samples person-presence windows per camera, synchronizes completed days to Synology SFTP, and applies verified-upload retention.
+- `storage`: appends versioned hourly JSONL audit shards, captures event-scoped snapshots/H.264 MKV evidence outside the UI thread, synchronizes a file-level SHA-256 manifest to Synology SFTP, and applies verified-upload retention.
 
 ## State Flow
 

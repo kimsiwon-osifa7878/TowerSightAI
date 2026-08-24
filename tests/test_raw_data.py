@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,7 +23,13 @@ def _event(label: str, timestamp: datetime, camera_id: str = "front") -> Detecti
 
 
 def _records(root: Path, day: str) -> list[dict]:
-    return [json.loads(line) for line in (root / day / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    records: list[dict] = []
+    for path in sorted((root / day).glob("events*.jsonl")):
+        records.extend(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+    for path in sorted((root / day).glob("events*.jsonl.gz")):
+        with gzip.open(path, "rt", encoding="utf-8") as fp:
+            records.extend(json.loads(line) for line in fp)
+    return records
 
 
 def test_raw_storage_config_hides_password_and_validates_host(tmp_path: Path):
@@ -66,6 +73,7 @@ def test_records_vehicle_plate_ai_and_raw_detection_in_daily_jsonl(tmp_path: Pat
         "plate_recognized",
     ]
     assert records[-1]["payload"]["plate_number"] == "12가3456"
+    assert "source_image_path" not in records[-1]["payload"]
     assert records[2]["payload"]["detections"][0]["camera_id"] == "front"
     assert records[3]["vehicle_session_id"]
 
@@ -96,6 +104,19 @@ def test_person_window_samples_every_half_second_until_five_seconds_after_clear(
     assert records[-1]["event_type"] == "person_window_closed"
 
 
+def test_plate_source_path_is_transient_to_evidence_sink(tmp_path: Path):
+    now = datetime(2026, 8, 21, 1, 2, 3, tzinfo=timezone.utc)
+    manager = RawDataManager(RawStorageConfig(local_dir=tmp_path), ("front",), clock=lambda: now)
+    sink_records: list[dict] = []
+    manager.set_event_sink(lambda record: sink_records.append(dict(record)))
+    manager.record_plate("12가3456", source_image_path="/runtime/private/source.png")
+
+    stored = _records(tmp_path, "2026-08-21")[-1]
+    assert "source_image_path" not in stored["payload"]
+    assert sink_records[-1]["payload"]["source_image_path"] == "/runtime/private/source.png"
+    manager.close()
+
+
 def test_person_window_records_close_when_clear_deadline_falls_between_sample_ticks(tmp_path: Path):
     start = datetime(2026, 8, 21, 0, 0, 0, tzinfo=timezone.utc)
     manager = RawDataManager(
@@ -123,10 +144,10 @@ def test_person_window_records_close_when_clear_deadline_falls_between_sample_ti
 class FakeUploader:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, dict]] = []
 
-    def upload_day(self, day: str, event_path: Path, digest: str) -> str:
-        self.calls.append((day, digest))
+    def upload_day(self, day: str, day_dir: Path, manifest: dict) -> str:
+        self.calls.append((day, manifest))
         if self.fail:
             raise OSError("offline")
         return f"/home/site/raw/{day}"
@@ -158,6 +179,7 @@ def test_sync_uploads_completed_days_and_deletes_only_uploaded_data_after_14_day
     assert (tmp_path / "2026-08-21/events.jsonl").is_file()
     assert not (tmp_path / "2026-08-07").exists()
     assert (tmp_path / "2026-08-20/.nas-upload.json").is_file()
+    assert (tmp_path / "2026-08-20/manifest.json").is_file()
 
 
 def test_explicit_sync_can_upload_current_day_without_deleting_it(tmp_path: Path):

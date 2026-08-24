@@ -36,6 +36,7 @@ from towersightai.ui.pyqt_app import (
     _ai_detection_label,
     _detection_label,
     _fresh_detections,
+    _front_lpr_payload,
     _legacy_ai_detection_label,
     _network_bbox_to_source_bbox,
     _prepare_operator_window,
@@ -67,6 +68,24 @@ def _qt_app() -> QApplication:
     global _APP
     _APP = QApplication.instance() or QApplication([])
     return _APP
+
+
+def test_front_lpr_payload_returns_confidence_and_crop_bbox(tmp_path: Path):
+    event_path = tmp_path / "lpr.jsonl"
+    event_path.write_text(
+        '\n'.join(
+            (
+                '{"type":"plate_ocr","plate_number":"12가3456"}',
+                '{"status":"recognized","best_plate":{"plate_number":"12가3456","confidence":0.93,"bbox":{"x1":10,"y1":20,"x2":110,"y2":55}}}',
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = _front_lpr_payload(event_path)
+    assert payload["plate_number"] == "12가3456"
+    assert payload["confidence"] == 0.93
+    assert payload["plate_bbox"] == {"x1": 10, "y1": 20, "x2": 110, "y2": 55}
 
 
 def test_windowed_operator_window_is_capped_to_reference_and_screen():

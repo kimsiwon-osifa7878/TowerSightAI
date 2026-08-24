@@ -16,6 +16,15 @@ class RawStorageConfig:
     retention_days: int = 14
     sync_interval_seconds: float = 300.0
     timezone_name: str = "Asia/Seoul"
+    shard_minutes: int = 60
+    media_enabled: bool = False
+    media_snapshot_jpeg_quality: int = 85
+    media_frame_max_age_seconds: float = 1.0
+    media_pre_seconds: float = 5.0
+    media_vehicle_post_seconds: float = 10.0
+    media_segment_seconds: float = 2.0
+    media_clip_part_seconds: float = 300.0
+    media_gstreamer_python: Path = Path("/usr/bin/python3")
     nas_host: str = ""
     nas_port: int = 22
     nas_username: str = ""
@@ -26,6 +35,7 @@ class RawStorageConfig:
     def __post_init__(self) -> None:
         object.__setattr__(self, "local_dir", Path(self.local_dir).expanduser())
         object.__setattr__(self, "known_hosts_path", Path(self.known_hosts_path).expanduser())
+        object.__setattr__(self, "media_gstreamer_python", Path(self.media_gstreamer_python).expanduser())
         if self.sample_interval_seconds <= 0:
             raise ValueError("RAW_DATA_SAMPLE_INTERVAL_SECONDS must be positive.")
         if self.person_stale_seconds < 0:
@@ -36,6 +46,21 @@ class RawStorageConfig:
             raise ValueError("RAW_DATA_RETENTION_DAYS must be at least 1.")
         if self.sync_interval_seconds <= 0:
             raise ValueError("RAW_DATA_SYNC_INTERVAL_SECONDS must be positive.")
+        if self.shard_minutes < 1 or self.shard_minutes > 60 or 60 % self.shard_minutes:
+            raise ValueError("RAW_DATA_SHARD_MINUTES must be a positive divisor of 60.")
+        if not 1 <= self.media_snapshot_jpeg_quality <= 100:
+            raise ValueError("RAW_MEDIA_SNAPSHOT_JPEG_QUALITY must be between 1 and 100.")
+        for name, value in (
+            ("RAW_MEDIA_FRAME_MAX_AGE_SECONDS", self.media_frame_max_age_seconds),
+            ("RAW_MEDIA_PRE_SECONDS", self.media_pre_seconds),
+            ("RAW_MEDIA_VEHICLE_POST_SECONDS", self.media_vehicle_post_seconds),
+            ("RAW_MEDIA_SEGMENT_SECONDS", self.media_segment_seconds),
+            ("RAW_MEDIA_CLIP_PART_SECONDS", self.media_clip_part_seconds),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.media_clip_part_seconds < self.media_segment_seconds:
+            raise ValueError("RAW_MEDIA_CLIP_PART_SECONDS must be at least RAW_MEDIA_SEGMENT_SECONDS.")
         try:
             ZoneInfo(self.timezone_name)
         except Exception as exc:
@@ -81,6 +106,7 @@ class CameraConfig:
     username: str | None = None
     password: str | None = None
     rotation_degrees: int = 0
+    record_rtsp_url: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         rotation = int(self.rotation_degrees) % 360
@@ -186,6 +212,7 @@ class Settings:
             username=camera.get("username"),
             password=camera.get("password"),
             rotation_degrees=int(camera.get("rotation_degrees", 0)),
+            record_rtsp_url=camera.get("record_rtsp_url"),
         )
 
     def _as_resolution(self, resolution: CameraResolution | tuple[int, int] | str) -> CameraResolution:

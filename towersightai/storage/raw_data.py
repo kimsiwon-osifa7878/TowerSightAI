@@ -1,26 +1,44 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
-import posixpath
-import socket
+import shutil
 import threading
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 from zoneinfo import ZoneInfo
 
 from towersightai.config.settings import RawStorageConfig
 from towersightai.inference.events import DetectionEvent
+from towersightai.storage.archive import (
+    ParamikoManifestUploader,
+    build_day_manifest,
+    manifest_sha256,
+    write_manifest_atomic,
+)
+from towersightai.storage.hourly_writer import HourlyJsonlWriter, WriterBusyError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_TIMEZONE = "Asia/Seoul"
 PERSON_LABELS = frozenset({"person", "human"})
 VEHICLE_LABELS = frozenset({"car", "truck", "bus", "motorcycle", "vehicle"})
+_DURABLE_EVENTS = frozenset(
+    {
+        "application_started",
+        "application_stopped",
+        "vehicle_entered",
+        "vehicle_session_ended",
+        "plate_recognized",
+        "person_window_started",
+        "person_window_closed",
+        "media_artifact_created",
+        "media_capture_failed",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -31,32 +49,12 @@ class SyncResult:
     errors: tuple[str, ...] = ()
 
 
-class DailyUploader(Protocol):
-    def upload_day(self, day: str, event_path: Path, digest: str) -> str: ...
-
-
-class JsonlDailyWriter:
-    def __init__(self, root: Path, timezone_name: str = DEFAULT_TIMEZONE) -> None:
-        self.root = Path(root)
-        self.timezone = ZoneInfo(timezone_name)
-        self._lock = threading.Lock()
-
-    def append(self, record: Mapping[str, Any], *, recorded_at: datetime) -> Path:
-        if recorded_at.tzinfo is None:
-            raise ValueError("Raw record timestamp must be timezone-aware.")
-        local_day = recorded_at.astimezone(self.timezone).date().isoformat()
-        event_path = self.root / local_day / "events.jsonl"
-        line = json.dumps(dict(record), ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-        with self._lock:
-            event_path.parent.mkdir(parents=True, exist_ok=True)
-            with event_path.open("a", encoding="utf-8") as fp:
-                fp.write(line)
-                fp.flush()
-        return event_path
+class DayUploader(Protocol):
+    def upload_day(self, day: str, day_dir: Path, manifest: Mapping[str, Any]) -> str: ...
 
 
 class PersonWindowSampler:
-    """Samples all camera states while a person may be present and for a clear grace period."""
+    """Sample all camera states while a person may be present and through the clear tail."""
 
     def __init__(
         self,
@@ -82,9 +80,7 @@ class PersonWindowSampler:
         return self.session_id is not None
 
     def observe(self, camera_id: str, detections: Iterable[DetectionEvent], *, observed_at: datetime) -> bool:
-        person_events = tuple(
-            event for event in detections if event.label.strip().lower() in PERSON_LABELS
-        )
+        person_events = tuple(event for event in detections if event.label.strip().lower() in PERSON_LABELS)
         if not person_events:
             return False
         self._latest[camera_id] = person_events
@@ -138,82 +134,40 @@ class PersonWindowSampler:
         return tuple(samples)
 
 
-class ParamikoDailyUploader:
-    def __init__(self, config: RawStorageConfig) -> None:
-        self.config = config
-
-    def upload_day(self, day: str, event_path: Path, digest: str) -> str:
-        try:
-            import paramiko
-        except ImportError as exc:  # pragma: no cover - dependency packaging guard.
-            raise RuntimeError("paramiko is required for Synology SFTP upload") from exc
-
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        if self.config.known_hosts_path.is_file():
-            client.load_host_keys(str(self.config.known_hosts_path))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        try:
-            client.connect(
-                hostname=self.config.nas_host,
-                port=self.config.nas_port,
-                username=self.config.nas_username,
-                password=self.config.nas_password,
-                allow_agent=False,
-                look_for_keys=False,
-                timeout=15,
-                banner_timeout=15,
-                auth_timeout=15,
-            )
-            with client.open_sftp() as sftp:
-                sftp.get_channel().settimeout(60.0)
-                remote_dir = posixpath.join(self.config.nas_folder.rstrip("/"), "raw", day)
-                _mkdirs(sftp, remote_dir)
-                remote_event = posixpath.join(remote_dir, "events.jsonl")
-                _upload_atomic_verified(sftp, event_path, remote_event, digest)
-                manifest = {
-                    "schema_version": SCHEMA_VERSION,
-                    "day": day,
-                    "events_file": "events.jsonl",
-                    "sha256": digest,
-                    "size_bytes": event_path.stat().st_size,
-                    "uploaded_at": datetime.now(timezone.utc).isoformat(),
-                    "source_host": socket.gethostname(),
-                }
-                manifest_bytes = (
-                    json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-                ).encode("utf-8")
-                _upload_bytes_atomic(sftp, manifest_bytes, posixpath.join(remote_dir, "manifest.json"))
-                return remote_dir
-        finally:
-            client.close()
-
-
 class RawDataManager:
     def __init__(
         self,
         config: RawStorageConfig,
         camera_ids: Iterable[str],
         *,
-        uploader: DailyUploader | None = None,
+        uploader: DayUploader | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self.camera_ids = tuple(dict.fromkeys(camera_ids))
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self.writer = JsonlDailyWriter(config.local_dir, config.timezone_name)
+        self.writer = HourlyJsonlWriter(
+            config.local_dir,
+            config.timezone_name,
+            shard_minutes=config.shard_minutes,
+        )
         self.person_sampler = PersonWindowSampler(
             self.camera_ids,
             sample_interval_seconds=config.sample_interval_seconds,
             stale_seconds=config.person_stale_seconds,
             clear_grace_seconds=config.person_clear_grace_seconds,
         )
-        self.uploader = uploader or ParamikoDailyUploader(config)
+        self.uploader = uploader or ParamikoManifestUploader(config)
         self.application_session_id = uuid.uuid4().hex
         self.vehicle_session_id: str | None = None
         self._active_ai_tasks: set[str] = set()
         self._sync_lock = threading.Lock()
         self._sync_running = False
+        self._event_sink: Callable[[Mapping[str, Any]], None] | None = None
+        self._closed = False
+
+    def set_event_sink(self, sink: Callable[[Mapping[str, Any]], None] | None) -> None:
+        self._event_sink = sink
 
     def record_application_started(self, *, metadata: Mapping[str, Any] | None = None) -> None:
         self.record("application_started", payload=dict(metadata or {}))
@@ -221,7 +175,16 @@ class RawDataManager:
     def record_application_stopped(self) -> None:
         self.record("application_stopped")
 
-    def record(self, event_type: str, *, payload: Mapping[str, Any] | None = None, at: datetime | None = None) -> Path:
+    def record(
+        self,
+        event_type: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        sink_payload: Mapping[str, Any] | None = None,
+        at: datetime | None = None,
+    ) -> Path:
+        if self._closed:
+            raise RuntimeError("raw-data manager is closed")
         recorded_at = at or self.clock()
         record = {
             "schema_version": SCHEMA_VERSION,
@@ -232,16 +195,69 @@ class RawDataManager:
             "vehicle_session_id": self.vehicle_session_id,
             "payload": dict(payload or {}),
         }
-        return self.writer.append(record, recorded_at=recorded_at)
+        path = self.writer.append(record, recorded_at=recorded_at, durable=event_type in _DURABLE_EVENTS)
+        if self._event_sink is not None and not event_type.startswith("media_"):
+            try:
+                sink_record = record
+                if sink_payload:
+                    sink_record = {**record, "payload": {**record["payload"], **dict(sink_payload)}}
+                self._event_sink(sink_record)
+            except Exception:  # noqa: BLE001 - evidence failure must not suppress the raw event.
+                logging.getLogger(__name__).exception("raw evidence sink failed event_type=%s", event_type)
+        return path
+
+    def record_media_artifact(
+        self,
+        *,
+        related_event_id: str,
+        kind: str,
+        camera_id: str,
+        relative_path: str,
+        size_bytes: int,
+        sha256: str,
+        captured_at: datetime,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.record(
+            "media_artifact_created",
+            payload={
+                "related_event_id": related_event_id,
+                "kind": kind,
+                "camera_id": camera_id,
+                "relative_path": relative_path,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+                "captured_at": captured_at.isoformat(),
+                "metadata": dict(metadata or {}),
+            },
+            at=captured_at,
+        )
+
+    def record_media_failure(
+        self,
+        *,
+        related_event_id: str,
+        kind: str,
+        camera_id: str,
+        reason: str,
+        at: datetime | None = None,
+    ) -> None:
+        self.record(
+            "media_capture_failed",
+            payload={
+                "related_event_id": related_event_id,
+                "kind": kind,
+                "camera_id": camera_id,
+                "reason": reason[:240],
+            },
+            at=at,
+        )
 
     def record_ai_started(self, task_id: str, camera_ids: Iterable[str], *, simulated: bool = False) -> None:
         if task_id in self._active_ai_tasks:
             return
         self._active_ai_tasks.add(task_id)
-        self.record(
-            "ai_started",
-            payload={"task_id": task_id, "camera_ids": list(camera_ids), "simulated": simulated},
-        )
+        self.record("ai_started", payload={"task_id": task_id, "camera_ids": list(camera_ids), "simulated": simulated})
 
     def record_ai_stopped(self, task_id: str, *, reason: str = "requested") -> None:
         if task_id not in self._active_ai_tasks:
@@ -261,11 +277,7 @@ class RawDataManager:
             self.vehicle_session_id = uuid.uuid4().hex
             self.record(
                 "vehicle_entered",
-                payload={
-                    "camera_id": camera_id,
-                    "confidence": confidence,
-                    "simulated": simulated,
-                },
+                payload={"camera_id": camera_id, "confidence": confidence, "simulated": simulated},
                 at=at,
             )
         return self.vehicle_session_id
@@ -277,6 +289,8 @@ class RawDataManager:
         confidence: float | None = None,
         camera_id: str = "front",
         simulated: bool = False,
+        source_image_path: str | None = None,
+        plate_bbox: Mapping[str, int] | None = None,
         at: datetime | None = None,
     ) -> None:
         self.record(
@@ -286,7 +300,9 @@ class RawDataManager:
                 "confidence": confidence,
                 "camera_id": camera_id,
                 "simulated": simulated,
+                "plate_bbox": dict(plate_bbox) if plate_bbox else None,
             },
+            sink_payload={"source_image_path": source_image_path} if source_image_path else None,
             at=at,
         )
 
@@ -304,11 +320,7 @@ class RawDataManager:
             return
         self.record(
             "detection_batch",
-            payload={
-                "task_id": task_id,
-                "camera_id": camera_id,
-                "detections": [event.to_dict() for event in events],
-            },
+            payload={"task_id": task_id, "camera_id": camera_id, "detections": [event.to_dict() for event in events]},
             at=recorded_at,
         )
         vehicles = [event for event in events if event.label.strip().lower() in VEHICLE_LABELS]
@@ -333,11 +345,7 @@ class RawDataManager:
         for sample in samples:
             self.record("person_sample", payload=sample, at=datetime.fromisoformat(sample["sampled_at"]))
         if was_active and not self.person_sampler.active:
-            self.record(
-                "person_window_closed",
-                payload={"person_window_id": closing_window_id},
-                at=sampled_at,
-            )
+            self.record("person_window_closed", payload={"person_window_id": closing_window_id}, at=sampled_at)
         return len(samples)
 
     def end_vehicle_session(self, *, reason: str) -> None:
@@ -364,38 +372,40 @@ class RawDataManager:
                 day = date.fromisoformat(day_dir.name)
             except ValueError:
                 continue
-            event_path = day_dir / "events.jsonl"
-            if not event_path.is_file() or day > today or (day == today and not include_current_day):
+            if day > today or (day == today and not include_current_day):
                 continue
-            digest = _sha256_path(event_path)
-            marker_path = day_dir / ".nas-upload.json"
-            marker = _read_json(marker_path)
-            uploaded_ok = marker.get("sha256") == digest
-            if not uploaded_ok:
-                try:
-                    remote_dir = self.uploader.upload_day(day.isoformat(), event_path, digest)
-                    marker = {
-                        "schema_version": SCHEMA_VERSION,
-                        "sha256": digest,
-                        "remote_dir": remote_dir,
-                        "uploaded_at": self.clock().isoformat(),
-                    }
-                    _write_json_atomic(marker_path, marker)
+            try:
+                self.writer.finalize_day(day, require_exclusive=day == today)
+                manifest = build_day_manifest(day_dir, day.isoformat())
+                if not manifest["files"]:
+                    continue
+                write_manifest_atomic(day_dir, manifest)
+                digest = manifest_sha256(manifest)
+                marker_path = day_dir / ".nas-upload.json"
+                marker = _read_json(marker_path)
+                uploaded_ok = marker.get("manifest_sha256") == digest
+                if not uploaded_ok:
+                    remote_dir = self.uploader.upload_day(day.isoformat(), day_dir, manifest)
+                    _write_json_atomic(
+                        marker_path,
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "manifest_sha256": digest,
+                            "remote_dir": remote_dir,
+                            "uploaded_at": self.clock().isoformat(),
+                        },
+                    )
                     uploaded.append(day.isoformat())
                     uploaded_ok = True
-                except Exception as exc:  # noqa: BLE001 - one day must not block later retries.
-                    logging.getLogger(__name__).exception("raw-data upload failed day=%s", day)
-                    errors.append(f"{day.isoformat()}:{type(exc).__name__}")
-            age_days = (today - day).days
-            if uploaded_ok and age_days >= self.config.retention_days:
-                event_path.unlink(missing_ok=True)
-                marker_path.unlink(missing_ok=True)
-                try:
-                    day_dir.rmdir()
-                except OSError:
-                    pass
-                deleted.append(day.isoformat())
-            else:
+                age_days = (today - day).days
+                if uploaded_ok and age_days >= self.config.retention_days:
+                    shutil.rmtree(day_dir)
+                    deleted.append(day.isoformat())
+                else:
+                    retained.append(day.isoformat())
+            except Exception as exc:  # noqa: BLE001 - one day must not block later retries.
+                logging.getLogger(__name__).exception("raw-data upload failed day=%s", day)
+                errors.append(f"{day.isoformat()}:{type(exc).__name__}")
                 retained.append(day.isoformat())
         return SyncResult(tuple(uploaded), tuple(retained), tuple(deleted), tuple(errors))
 
@@ -422,48 +432,11 @@ class RawDataManager:
         threading.Thread(target=run, name="raw-data-nas-sync", daemon=True).start()
         return True
 
-
-def _mkdirs(sftp: Any, path: str) -> None:
-    current = "/" if path.startswith("/") else ""
-    for part in PurePosixPath(path).parts:
-        if part in {"/", ".", ""}:
-            continue
-        current = posixpath.join(current, part)
-        try:
-            sftp.stat(current)
-        except OSError:
-            sftp.mkdir(current)
-
-
-def _upload_atomic_verified(sftp: Any, local_path: Path, remote_path: str, digest: str) -> None:
-    part_path = remote_path + ".part"
-    with local_path.open("rb") as source, sftp.file(part_path, "wb") as target:
-        while chunk := source.read(1024 * 1024):
-            target.write(chunk)
-        target.flush()
-    remote_digest = hashlib.sha256()
-    with sftp.file(part_path, "rb") as remote:
-        while chunk := remote.read(1024 * 1024):
-            remote_digest.update(chunk)
-    if remote_digest.hexdigest() != digest:
-        raise OSError("remote SHA-256 verification failed")
-    sftp.posix_rename(part_path, remote_path)
-
-
-def _upload_bytes_atomic(sftp: Any, payload: bytes, remote_path: str) -> None:
-    part_path = remote_path + ".part"
-    with sftp.file(part_path, "wb") as target:
-        target.write(payload)
-        target.flush()
-    sftp.posix_rename(part_path, remote_path)
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fp:
-        while chunk := fp.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.writer.close()
+        self._closed = True
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -476,8 +449,18 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with temporary.open("w", encoding="utf-8") as fp:
+        json.dump(dict(payload), fp, ensure_ascii=False, indent=2, sort_keys=True)
+        fp.write("\n")
+        fp.flush()
+        os.fsync(fp.fileno())
     temporary.replace(path)
+
+
+__all__ = [
+    "DEFAULT_TIMEZONE",
+    "PersonWindowSampler",
+    "RawDataManager",
+    "SyncResult",
+    "WriterBusyError",
+]

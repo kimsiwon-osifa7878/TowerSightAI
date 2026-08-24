@@ -166,6 +166,32 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
                 "RAW_DATA_SYNC_INTERVAL_SECONDS",
             ),
             "timezone_name": values.get("RAW_DATA_TIMEZONE", "Asia/Seoul"),
+            "shard_minutes": _parse_int(values.get("RAW_DATA_SHARD_MINUTES", "60"), "RAW_DATA_SHARD_MINUTES"),
+            "media_enabled": _parse_bool(values.get("RAW_MEDIA_ENABLED", "false")),
+            "media_snapshot_jpeg_quality": _parse_int(
+                values.get("RAW_MEDIA_SNAPSHOT_JPEG_QUALITY", "85"),
+                "RAW_MEDIA_SNAPSHOT_JPEG_QUALITY",
+            ),
+            "media_frame_max_age_seconds": _parse_float(
+                values.get("RAW_MEDIA_FRAME_MAX_AGE_SECONDS", "1"),
+                "RAW_MEDIA_FRAME_MAX_AGE_SECONDS",
+            ),
+            "media_pre_seconds": _parse_float(values.get("RAW_MEDIA_PRE_SECONDS", "5"), "RAW_MEDIA_PRE_SECONDS"),
+            "media_vehicle_post_seconds": _parse_float(
+                values.get("RAW_MEDIA_VEHICLE_POST_SECONDS", "10"),
+                "RAW_MEDIA_VEHICLE_POST_SECONDS",
+            ),
+            "media_segment_seconds": _parse_float(
+                values.get("RAW_MEDIA_SEGMENT_SECONDS", "2"),
+                "RAW_MEDIA_SEGMENT_SECONDS",
+            ),
+            "media_clip_part_seconds": _parse_float(
+                values.get("RAW_MEDIA_CLIP_PART_SECONDS", "300"),
+                "RAW_MEDIA_CLIP_PART_SECONDS",
+            ),
+            "media_gstreamer_python": _expand_config_path(
+                values.get("RAW_MEDIA_GSTREAMER_PYTHON", "/usr/bin/python3"), values
+            ),
             "nas_host": values.get("SYNOLOGY_NAS_HOST", ""),
             "nas_port": _parse_int(values.get("SYNOLOGY_NAS_PORT", "22"), "SYNOLOGY_NAS_PORT"),
             "nas_username": values.get("SYNOLOGY_NAS_ID", ""),
@@ -218,6 +244,7 @@ def _camera_dict(values: Mapping[str, str], index: int) -> dict[str, str | None]
         "username": values.get(f"CAMERA_{index}_USERNAME") or None,
         "password": values.get(f"CAMERA_{index}_PASSWORD") or None,
         "rotation_degrees": values.get(f"CAMERA_{index}_ROTATION_DEGREES", "0"),
+        "record_rtsp_url": values.get(f"CAMERA_{index}_RECORD_RTSP_URL") or None,
     }
 
 

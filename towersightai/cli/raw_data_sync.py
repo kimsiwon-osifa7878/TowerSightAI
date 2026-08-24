@@ -22,7 +22,10 @@ def main() -> int:
         print(json.dumps({"ok": False, "reason": "RAW_DATA_ENABLED is false"}))
         return 2
     manager = RawDataManager(settings.raw_storage, (camera.id for camera in settings.active_cameras))
-    result = manager.sync_completed_days(include_current_day=args.include_current_day)
+    try:
+        result = manager.sync_completed_days(include_current_day=args.include_current_day)
+    finally:
+        manager.close()
     print(
         json.dumps(
             {
