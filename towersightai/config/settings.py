@@ -7,6 +7,29 @@ from zoneinfo import ZoneInfo
 
 
 @dataclass(frozen=True)
+class LD2410Config:
+    enabled: bool = False
+    bind_host: str = "0.0.0.0"
+    port: int = 9000
+    buffer_seconds: float = 30.0
+    max_sample_age_seconds: float = 1.0
+    client_idle_timeout_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        if not self.bind_host:
+            raise ValueError("LD2410_TCP_BIND_HOST must not be empty.")
+        if not 1 <= int(self.port) <= 65535:
+            raise ValueError("LD2410_TCP_PORT must be between 1 and 65535.")
+        for name, value in (
+            ("LD2410_BUFFER_SECONDS", self.buffer_seconds),
+            ("LD2410_MAX_SAMPLE_AGE_SECONDS", self.max_sample_age_seconds),
+            ("LD2410_CLIENT_IDLE_TIMEOUT_SECONDS", self.client_idle_timeout_seconds),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive.")
+
+
+@dataclass(frozen=True)
 class RawStorageConfig:
     enabled: bool = False
     local_dir: Path = Path("artifacts/raw")
@@ -183,6 +206,7 @@ class Settings:
     ui_camera_resolution: CameraResolution | tuple[int, int] | str = CameraResolution()
     birdview_mode: BirdviewMode | str = BirdviewMode.ceiling
     raw_storage: RawStorageConfig | dict | None = None
+    ld2410: LD2410Config | dict | None = None
 
     def __post_init__(self) -> None:
         self.hailo_apps_workspace = self.hailo_apps_workspace.expanduser()
@@ -200,6 +224,10 @@ class Settings:
             self.raw_storage = RawStorageConfig()
         elif isinstance(self.raw_storage, dict):
             self.raw_storage = RawStorageConfig(**self.raw_storage)
+        if self.ld2410 is None:
+            self.ld2410 = LD2410Config()
+        elif isinstance(self.ld2410, dict):
+            self.ld2410 = LD2410Config(**self.ld2410)
         self._validate_safety_constraints()
 
     def _as_camera(self, camera: CameraConfig | dict) -> CameraConfig:
@@ -245,3 +273,5 @@ class Settings:
             raise ValueError(f"Missing required camera roles: {sorted(missing)}")
         if self.app_env == "production" and not self.calibration_path.exists():
             raise ValueError("Calibration file must exist in production mode.")
+        if self.ld2410.enabled and not self.raw_storage.enabled:
+            raise ValueError("LD2410_TCP_ENABLED requires RAW_DATA_ENABLED=true for raw-only integration.")

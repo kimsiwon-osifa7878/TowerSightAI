@@ -17,10 +17,11 @@ Run on any developer machine:
 - AI decision logic.
 - Calibration geometry persistence and validation.
 - UI state-to-message mapping.
-- Operator dashboard, sidebar, EMPTY action, and simulation behavior.
+- Operator dashboard, sidebar, LD2410 console, and simulation behavior.
 - Purpose-specific Hailo pipeline builders for vehicle detection, LPR image tests, and person-presence detection.
 - Fatal Hailo/GStreamer log handling so stuck `gst-launch` processes do not leave the UI loading indefinitely.
 - Daily raw JSONL schema, 0.5-second person sampling, five-second clear tail, completed-day NAS selection, upload retry, and verified 14-day retention.
+- LD2410 split/coalesced binary parsing, malformed-frame recovery, past-only 0.5-second timestamp alignment, freshness/expiry, TCP idle timeout, and client reconnection.
 
 ## UI-Only Tests
 
@@ -33,7 +34,7 @@ Run without real hardware:
 - Dashboard and all-camera layouts switch correctly.
 - Ceiling birdview uses the vertical dashboard tile and CCW 90-degree display policy.
 - Disabled birdview mode omits the ceiling tile and worker from every UI, shows stable one/three-camera layouts, and keeps final OK blocked.
-- EMPTY buttons do not change safety state.
+- LD2410 console navigation, pause, and clear do not change safety state.
 - Vehicle-entry simulation is visually testable but keeps final OK blocked.
 - Long status text does not resize camera tiles unexpectedly.
 
@@ -88,13 +89,13 @@ Manual or semi-automated checklist:
 - Click `번호판 이미지 LPR` and confirm `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` contains FastALPR model names, per-image inference time, and OCR result or failure status.
 - Click `사람 존재 감지` and confirm `artifacts/runtime/purpose-ai/person_presence/person_presence.gst.log` contains `yolov5s_personface_reid.hef` and `yolov5_personface_letterbox`, but does not contain `repvgg_a0_person_reid_2048.hef` or `hailogallery`.
 - Click `차량 진입 시뮬레이션` and confirm only test overlay/instruction text changes.
-- Click at least one `EMPTY` button and confirm it is a safe no-op.
-- Confirm simulation and EMPTY actions do not show final OK and do not send PLC events.
+- Click `LD2410` and confirm connection state plus continuous parsed/HEX rows are visible.
+- Confirm simulation and LD2410 console actions do not show final OK and do not send PLC events.
 - Save screenshots under `tmp/operator-ui-verification/` and keep them out of commits.
 
 This UI verification is an implementation check, not a product safety approval. If the local environment cannot run the GUI, record the blocker in the final report.
 
-Future automation can extend `tools/verify_operator_ui_screenshot.sh` to use `xdotool` for clicking `메뉴`, `전체 카메라`, `사람 존재 감지`, `차량 진입 시뮬레이션`, and `EMPTY`, saving a screenshot after each step.
+The screenshot helper uses `xdotool` for `메뉴`, `전체 카메라`, `사람 존재 감지`, `LD2410`, `차량 진입 시뮬레이션`, and the user-screen test panel.
 
 ## Hardware Smoke Tests
 
@@ -154,7 +155,7 @@ UI tests should assert:
 
 - Correct operator dashboard startup.
 - Correct camera layout for dashboard and all-camera modes.
-- Sidebar and EMPTY actions are safe.
+- Sidebar and LD2410 console actions are safe.
 - Operator guidance messages match alignment result.
 - Safety screen displays human, obstacle, and in-vehicle status.
 - Settings pages redact secrets.

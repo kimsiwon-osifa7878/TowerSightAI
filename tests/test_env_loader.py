@@ -55,6 +55,12 @@ PLC_ENDPOINT=tcp://127.0.0.1:502
 UI_FULLSCREEN=false
 UI_CAMERA_RESOLUTION=1024x576
 BIRDVIEW_MODE=disabled
+LD2410_TCP_ENABLED=true
+LD2410_TCP_BIND_HOST=0.0.0.0
+LD2410_TCP_PORT=9000
+LD2410_BUFFER_SECONDS=30
+LD2410_MAX_SAMPLE_AGE_SECONDS=1
+LD2410_CLIENT_IDLE_TIMEOUT_SECONDS=5
 RAW_DATA_ENABLED=true
 RAW_DATA_LOCAL_DIR=artifacts/raw-test
 RAW_DATA_SAMPLE_INTERVAL_SECONDS=0.5
@@ -107,6 +113,12 @@ def test_load_settings_from_env_builds_settings(tmp_path: Path):
     assert [camera.id for camera in settings.cameras] == ["ceiling", "front", "rear_side", "opposite_side"]
     assert [camera.id for camera in settings.active_cameras] == ["front", "rear_side", "opposite_side"]
     assert settings.birdview_enabled is False
+    assert settings.ld2410.enabled is True
+    assert settings.ld2410.bind_host == "0.0.0.0"
+    assert settings.ld2410.port == 9000
+    assert settings.ld2410.buffer_seconds == 30
+    assert settings.ld2410.max_sample_age_seconds == 1
+    assert settings.ld2410.client_idle_timeout_seconds == 5
     assert [camera.rotation_degrees for camera in settings.cameras] == [90, 0, 0, 0]
     assert settings.camera_2.record_rtsp_url == "rtsp://user:secret@192.0.2.2/stream2"
     assert settings.raw_storage.enabled is True

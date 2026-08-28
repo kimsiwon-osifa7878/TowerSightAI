@@ -83,10 +83,10 @@ Required post-implementation checks:
 4. Click `메뉴` and capture the sidebar-open screenshot.
 5. Verify key UI flows by clicking:
    - `전체 카메라`
-   - `테스트`
+   - `사용자 화면 테스트`
    - `차량 진입 시뮬레이션`
-   - at least one `EMPTY` button
-6. Confirm the UI still keeps final OK blocked for simulation and EMPTY actions.
+   - `LD2410`
+6. Confirm the UI still keeps final OK blocked for simulation and LD2410 console actions.
 7. Store screenshots under `tmp/operator-ui-verification/` and do not commit them.
 
 Use the existing screenshot helper as the baseline command:

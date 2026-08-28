@@ -7,7 +7,7 @@ The UI contains separate driver-facing user mode and operator mode in one PyQt6 
 New features should be added in this order:
 
 1. Add the operator UI button, status row, panel, or test slot.
-2. Connect it to `EMPTY`, fake, or simulation behavior that cannot change final OK.
+2. Connect it to fake, diagnostic, or simulation behavior that cannot change final OK.
 3. Add UI and fake-data tests.
 4. Connect real camera, Hailo, calibration, AI-stage, or PLC logic.
 5. Keep the UI result auditable through the test screen or diagnostics log.
@@ -55,6 +55,7 @@ Current connected entries:
 - `차량 전용 검출`
 - `번호판 이미지 LPR`
 - `사람 존재 감지`
+- `LD2410`
 - `차량 진입 시뮬레이션`
 
 `이전 AI Detection` is a regression-isolation control. It should bypass runtime model selection and launch the previous multistream detection path that uses `HAILO_HEF_PATH`, the shared detection event directory, and the same camera rotation map as the visible UI.
@@ -67,7 +68,7 @@ Purpose-specific AI controls should use fixed, known-compatible TAPPAS example m
 
 These controls are for integration diagnosis and staged feature development. They must show running/error/log status in the operator status strip and keep final OK blocked.
 
-Unimplemented feature slots must be labeled `EMPTY`. Pressing an `EMPTY` button should only show a message such as “not connected yet” and must not alter safety state, PLC state, calibration state, or final OK.
+The `LD2410` entry opens a read-only serial-style console in the operator workspace. It shows connection state, parsed values, and original HEX for the latest 500 frames. Pause and clear affect presentation only; LD2410 remains raw audit context and cannot alter safety state, PLC state, calibration state, or final OK.
 
 ## UI Test and Simulation Behavior
 
@@ -148,7 +149,7 @@ Coordinates should be normalized unless a module has a documented reason to use 
 ## UI Testing
 
 - Tests for dashboard startup, sidebar open/close, and all-camera switching.
-- Tests that `EMPTY` buttons are safe no-ops.
+- Tests that LD2410 console navigation and display controls are safety-neutral.
 - Tests that vehicle-entry simulation remains test-only and blocks final OK.
 - Tests that purpose-specific AI buttons create the expected fixed-model pipeline and do not use arbitrary HEF selection.
 - Tests for camera tile layout, birdview rotation policy, and stale/NG display.

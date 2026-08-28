@@ -20,6 +20,7 @@ This guide defines the stable implementation shape for TowerSightAI. The source 
 - `plc`: sends vehicle, human, safety, and error events through a mockable adapter.
 - `ui`: renders state-aware camera views, guidance, safety status, settings, and calibration.
 - `calibration`: stores per-camera guide geometry, ROIs, stop zones, and tolerances.
+- `sensors`: receives raw LD2410 binary frames from one LAN ESP32 client, parses them off the UI thread, and exposes timestamp-aligned audit snapshots without entering the safety decision path.
 - `storage`: appends versioned hourly JSONL audit shards, captures event-scoped snapshots/H.264 MKV evidence outside the UI thread, synchronizes a file-level SHA-256 manifest to Synology SFTP, and applies verified-upload retention.
 
 ## State Flow
@@ -85,3 +86,4 @@ Tests must use a fake PLC adapter and assert exact event ordering for OK and NG 
 - Log every safety-relevant decision with state, camera ID, confidence, and reason.
 - Persist only sanitized operational state. Do not persist credentials outside the configured secret mechanism.
 - NAS archive availability is operational telemetry only and must never relax or authorize the PLC safety gate.
+- LD2410/ESP32 availability and values are raw audit context only. Missing, malformed, or stale sensor data must be recorded explicitly and must not alter AI, state-machine, or PLC decisions.

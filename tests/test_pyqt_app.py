@@ -10,9 +10,10 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication
 
-from towersightai.config.settings import CameraRole, RawStorageConfig, Settings
+from towersightai.config.settings import CameraRole, LD2410Config, RawStorageConfig, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.inference.purpose_tasks import PlateOcrEvent, PURPOSE_LPR_IMAGE
+from towersightai.sensors.ld2410 import LD2410Frame
 from towersightai.state_machine.core import ParkingState
 from towersightai.ui.model import AlignmentResult, DriverTone, build_operator_display
 from towersightai.ui.driver_view import (
@@ -22,6 +23,7 @@ from towersightai.ui.driver_view import (
 )
 from towersightai.ui.pyqt_app import (
     OPERATOR_PANEL_WIDTH,
+    LD2410_CONSOLE_MAX_LINES,
     SIDEBAR_ACTION_LABELS,
     PERSON_ALERT_STREAK_THRESHOLD,
     WINDOWED_DEFAULT_HEIGHT,
@@ -312,11 +314,12 @@ def test_operator_ui_starts_on_user_mode_with_sidebar_closed():
     assert "번호판 이미지 LPR" in {button.text() for button in window.sidebar_buttons.values()}
     assert "정면카메라LPR" in {button.text() for button in window.sidebar_buttons.values()}
     assert "사람 존재 감지" in {button.text() for button in window.sidebar_buttons.values()}
+    assert "LD2410" in {button.text() for button in window.sidebar_buttons.values()}
     assert "AI모델 선택" not in {button.text() for button in window.sidebar_buttons.values()}
     assert "테스트" not in {button.text() for button in window.sidebar_buttons.values()}
     assert "AI Detection" not in {button.text() for button in window.sidebar_buttons.values()}
     assert "Multi-Camera Re-ID" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert sum(1 for button in window.sidebar_buttons.values() if button.text() == "EMPTY") == 2
+    assert "EMPTY" not in {button.text() for button in window.sidebar_buttons.values()}
 
     window.sidebar_toggle_button.click()
     assert window.operator_sidebar.isHidden() is False
@@ -875,7 +878,7 @@ def test_operator_window_routes_runtime_events_to_raw_data_manager(monkeypatch, 
     calls: list[tuple[str, object]] = []
 
     class FakeRawDataManager:
-        def __init__(self, config, camera_ids):
+        def __init__(self, config, camera_ids, **kwargs):
             calls.append(("init", tuple(camera_ids)))
 
         def record_application_started(self, *, metadata):
@@ -943,6 +946,79 @@ def test_operator_window_routes_runtime_events_to_raw_data_manager(monkeypatch, 
     assert ("plate", "12가3456") in calls
     assert ("vehicle", ("front", True)) in calls
     assert ("application_stopped", None) in calls
+
+
+def test_operator_window_starts_and_stops_ld2410_raw_service(monkeypatch, tmp_path: Path):
+    _qt_app()
+    calls: list[tuple[str, object]] = []
+
+    class FakeLD2410Service:
+        def __init__(self, config):
+            calls.append(("sensor_init", (config.bind_host, config.port)))
+            self.callback = None
+
+        def set_status_callback(self, callback):
+            self.callback = callback
+
+        def set_frame_callback(self, callback):
+            calls.append(("frame_callback", callback))
+
+        def snapshot_at(self, sampled_at):
+            return {"status": "unavailable", "sampled_at": sampled_at.isoformat()}
+
+        def start(self):
+            calls.append(("sensor_start", None))
+            self.callback("listening", {"port": 9000})
+
+        def stop(self):
+            calls.append(("sensor_stop", None))
+
+    class FakeRawDataManager:
+        def __init__(self, config, camera_ids, *, ld2410_snapshot_provider=None):
+            calls.append(("raw_provider", ld2410_snapshot_provider))
+
+        def record_application_started(self, *, metadata):
+            calls.append(("application_started", metadata))
+
+        def record_ld2410_status(self, state, details):
+            calls.append(("sensor_status", (state, dict(details))))
+
+        def record_ai_stopped(self, task_id, **kwargs):
+            calls.append(("ai_stopped", task_id))
+
+        def start_background_sync(self):
+            return True
+
+        def record_application_stopped(self):
+            calls.append(("application_stopped", None))
+
+        def close(self):
+            calls.append(("raw_close", None))
+
+    settings = _settings()
+    settings.raw_storage = RawStorageConfig(
+        enabled=True,
+        local_dir=tmp_path,
+        nas_host="nas.example.com",
+        nas_username="uploader",
+        nas_password="test-password",
+        nas_folder="/home/site",
+    )
+    settings.ld2410 = LD2410Config(enabled=True)
+    model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr("towersightai.ui.pyqt_app.RawDataManager", FakeRawDataManager)
+    monkeypatch.setattr("towersightai.ui.pyqt_app.LD2410TCPService", FakeLD2410Service)
+
+    window = OperatorWindow(model, settings=settings)
+    window.close()
+
+    provider = next(payload for name, payload in calls if name == "raw_provider")
+    assert callable(provider)
+    assert ("sensor_init", ("0.0.0.0", 9000)) in calls
+    assert ("sensor_start", None) in calls
+    assert ("sensor_status", ("listening", {"port": 9000})) in calls
+    assert calls.index(("sensor_stop", None)) < calls.index(("application_stopped", None))
 
 
 def test_camera_settings_rotation_button_updates_runtime_rotation_state():
@@ -1324,17 +1400,89 @@ def test_vehicle_entry_simulation_is_ui_only_and_keeps_final_ok_blocked():
     window.close()
 
 
-def test_empty_action_notice_survives_camera_health_refresh_and_keeps_ok_blocked():
-    _qt_app()
+def test_ld2410_console_shows_frames_and_controls_are_display_only():
+    app = _qt_app()
     settings = _settings()
     model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
     window = OperatorWindow(model)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
     window._unlock_operator()
+    before_ok = window.model.can_show_final_ok
 
-    window.sidebar_buttons["EMPTY_1"].click()
-    window._set_camera_status("front", "정상 수신")
+    window.sidebar_buttons["LD2410"].click()
+    frame = LD2410Frame(
+        received_at=datetime.now(timezone.utc),
+        data_type=2,
+        target_status=2,
+        moving_distance_cm=0,
+        moving_energy=0,
+        motionless_distance_cm=82,
+        motionless_energy=31,
+        detection_distance_cm=463,
+        max_moving_gate=0,
+        max_motionless_gate=0,
+        moving_gate_energy=(0,) * 9,
+        motionless_gate_energy=(31,) + (0,) * 8,
+        raw_hex="F4 F3 F2 F1 0D 00 02 AA",
+    )
+    window._append_ld2410_frame(frame, "192.0.2.30")
+    app.processEvents()
 
-    assert "EMPTY 1" in window.warning_label.text()
-    assert "최종 OK 차단" in window.warning_label.text()
+    assert window.operator_workspace_stack.currentWidget() is window.ld2410_console_view
+    assert "BASIC" in window.ld2410_console.toPlainText()
+    assert "대상=정지" in window.ld2410_console.toPlainText()
+    assert "정지=82cm/E31" in window.ld2410_console.toPlainText()
+    assert "HEX=F4 F3 F2 F1" in window.ld2410_console.toPlainText()
+    assert "192.0.2.30" in window.ld2410_connection_label.text()
+    assert window.model.can_show_final_ok is before_ok is False
+
+    visible_before_pause = window.ld2410_console.toPlainText()
+    window.ld2410_pause_button.click()
+    window._append_ld2410_frame(frame, "192.0.2.30")
+    assert window.ld2410_console.toPlainText() == visible_before_pause
+    assert len(window._ld2410_console_lines) == 2
+    window.ld2410_pause_button.click()
+    assert window.ld2410_console.toPlainText().count("HEX=F4 F3 F2 F1") == 2
+
+    window.ld2410_clear_button.click()
+    assert window.ld2410_console.toPlainText() == ""
+    assert len(window._ld2410_console_lines) == 0
+    window.close()
+
+
+def test_ld2410_console_keeps_only_latest_five_hundred_lines():
+    _qt_app()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras))
+
+    for index in range(LD2410_CONSOLE_MAX_LINES + 7):
+        window._append_ld2410_console_line(f"line-{index}")
+
+    assert len(window._ld2410_console_lines) == LD2410_CONSOLE_MAX_LINES
+    assert "line-0\n" not in window.ld2410_console.toPlainText()
+    assert f"line-{LD2410_CONSOLE_MAX_LINES + 6}" in window.ld2410_console.toPlainText()
+    assert window.ld2410_console.document().blockCount() == LD2410_CONSOLE_MAX_LINES
+    window.close()
+
+
+def test_sidebar_user_screen_test_panel_fits_window_after_empty_removal():
+    app = _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.resize(1440, 900)
+    window.show()
+    window._unlock_operator()
+    window.sidebar_toggle_button.click()
+    window.driver_test_toggle.click()
+    app.processEvents()
+
+    last_button = window.driver_test_buttons["주차시작"]
+    sidebar_bottom = window.operator_sidebar.rect().bottom()
+    assert window.driver_test_toggle.isVisible() is True
+    assert last_button.isVisible() is True
+    assert last_button.mapTo(window.operator_sidebar, last_button.rect().bottomLeft()).y() <= sidebar_bottom
+
+    window.sidebar_buttons["LD2410"].click()
     assert window.model.can_show_final_ok is False
     window.close()

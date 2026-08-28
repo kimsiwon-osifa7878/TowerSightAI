@@ -5,6 +5,7 @@ import logging
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from towersightai.inference.purpose_tasks import (
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.runtime_logging import new_run_id
 from towersightai.state_machine.core import ParkingState
+from towersightai.sensors.ld2410 import LD2410Frame, LD2410TCPService
 from towersightai.storage.evidence import EvidenceCoordinator
 from towersightai.storage.raw_data import RawDataManager
 from towersightai.ui.model import (
@@ -52,10 +54,10 @@ SIDEBAR_ACTION_LABELS = (
     "번호판 이미지 LPR",
     "정면카메라LPR",
     "사람 존재 감지",
+    "LD2410",
     "차량 진입 시뮬레이션",
-    "EMPTY",
-    "EMPTY",
 )
+LD2410_CONSOLE_MAX_LINES = 500
 
 try:
     from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
@@ -67,6 +69,7 @@ try:
         QHBoxLayout,
         QLabel,
         QMainWindow,
+        QPlainTextEdit,
         QPushButton,
         QSizePolicy,
         QStackedWidget,
@@ -615,6 +618,9 @@ class BoundedContentViewport(QWidget):
 
 
 class OperatorWindow(QMainWindow):
+    ld2410_frame_ready = pyqtSignal(object, str)
+    ld2410_status_ready = pyqtSignal(str, object)
+
     def __init__(self, model: OperatorDisplayModel, settings: Settings | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.model = model
@@ -662,6 +668,13 @@ class OperatorWindow(QMainWindow):
         self._vehicle_entry_simulation = False
         self._raw_data_manager: RawDataManager | None = None
         self._evidence_coordinator: EvidenceCoordinator | None = None
+        self._ld2410_service: LD2410TCPService | None = None
+        self._ld2410_console_lines: deque[str] = deque(maxlen=LD2410_CONSOLE_MAX_LINES)
+        self._ld2410_console_paused = False
+        self._ld2410_connection_state = "disabled" if settings is None or not settings.ld2410.enabled else "listening"
+        self._ld2410_status_details: dict[str, object] = {}
+        self._ld2410_last_frame_at: datetime | None = None
+        self._ld2410_client_ip = ""
         self._camera_layout_mode = "dashboard"
         self._camera_rotations: dict[str, int] = {
             camera.id: camera.rotation_degrees
@@ -674,6 +687,8 @@ class OperatorWindow(QMainWindow):
         self.clock_label = QLabel()
         self.setWindowTitle("TowerSightAI Operator Console")
         self.setStyleSheet(_stylesheet())
+        self.ld2410_frame_ready.connect(self._append_ld2410_frame)
+        self.ld2410_status_ready.connect(self._apply_ld2410_status)
         self._build()
         self.apply_model(model)
         if self.settings is not None:
@@ -719,6 +734,9 @@ class OperatorWindow(QMainWindow):
         for thread in self._front_lpr_threads:
             thread.quit()
             thread.wait(10000)
+        if self._ld2410_service is not None:
+            self._ld2410_service.stop()
+            self._ld2410_service = None
         if self._raw_data_manager is not None:
             self._record_raw(self._raw_data_manager.record_application_stopped)
         if self._evidence_coordinator is not None:
@@ -734,9 +752,14 @@ class OperatorWindow(QMainWindow):
         if self.settings is None or not self.settings.raw_storage.enabled:
             return
         try:
+            if self.settings.ld2410.enabled:
+                self._ld2410_service = LD2410TCPService(self.settings.ld2410)
             self._raw_data_manager = RawDataManager(
                 self.settings.raw_storage,
                 (camera.id for camera in self.settings.active_cameras),
+                ld2410_snapshot_provider=(
+                    self._ld2410_service.snapshot_at if self._ld2410_service is not None else None
+                ),
             )
             if self.settings.raw_storage.media_enabled:
                 self._evidence_coordinator = EvidenceCoordinator(
@@ -753,14 +776,29 @@ class OperatorWindow(QMainWindow):
                     "app_env": self.settings.app_env,
                     "camera_ids": [camera.id for camera in self.settings.active_cameras],
                     "birdview_mode": self.settings.birdview_mode.value,
+                    "ld2410_tcp_enabled": self.settings.ld2410.enabled,
                 }
             )
+            if self._ld2410_service is not None:
+                self._ld2410_service.set_status_callback(self._record_ld2410_status)
+                self._ld2410_service.set_frame_callback(self._receive_ld2410_frame)
+                try:
+                    self._ld2410_service.start()
+                except Exception as exc:  # noqa: BLE001 - raw-only sensor failure must not stop the safety UI.
+                    logging.getLogger(__name__).exception("LD2410 TCP server startup failed")
+                    self._record_ld2410_status(
+                        "error",
+                        {"reason": type(exc).__name__, "phase": "startup"},
+                    )
             self._raw_data_manager.start_background_sync()
         except Exception:  # noqa: BLE001 - raw logging must not crash the safety UI.
             logging.getLogger(__name__).exception("raw-data collection startup failed")
             if self._evidence_coordinator is not None:
                 self._evidence_coordinator.close()
                 self._evidence_coordinator = None
+            if self._ld2410_service is not None:
+                self._ld2410_service.stop()
+                self._ld2410_service = None
             if self._raw_data_manager is not None:
                 self._raw_data_manager.close()
             self._raw_data_manager = None
@@ -777,6 +815,14 @@ class OperatorWindow(QMainWindow):
             callback(*args, **kwargs)
         except Exception:  # noqa: BLE001 - persistence failure must be visible in logs, not crash UI.
             logging.getLogger(__name__).exception("raw-data record failed")
+
+    def _record_ld2410_status(self, state: str, details) -> None:  # noqa: ANN001 - worker callback boundary.
+        if self._raw_data_manager is not None:
+            self._record_raw(self._raw_data_manager.record_ld2410_status, state, details)
+        self.ld2410_status_ready.emit(state, dict(details))
+
+    def _receive_ld2410_frame(self, frame: LD2410Frame, client_ip: str) -> None:
+        self.ld2410_frame_ready.emit(frame, client_ip)
 
     def _sample_raw_person_window(self) -> None:
         if self._raw_data_manager is not None:
@@ -1144,9 +1190,11 @@ class OperatorWindow(QMainWindow):
             preview_mode=True,
         )
         self.driver_preview_host = DriverPreviewHost(self.driver_preview)
+        self.ld2410_console_view = self._build_ld2410_console_view()
         self.operator_workspace_stack = QStackedWidget()
         self.operator_workspace_stack.addWidget(self.operator_camera_area)
         self.operator_workspace_stack.addWidget(self.driver_preview_host)
+        self.operator_workspace_stack.addWidget(self.ld2410_console_view)
         self.operator_workspace_stack.setCurrentWidget(self.operator_camera_area)
         main_layout.addWidget(self.operator_workspace_stack, 1)
 
@@ -1174,8 +1222,56 @@ class OperatorWindow(QMainWindow):
         self._set_camera_layout("dashboard")
         return root
 
+    def _build_ld2410_console_view(self) -> QWidget:
+        root = QWidget()
+        root.setObjectName("ld2410ConsoleView")
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("LD2410 RAW 모니터")
+        title.setObjectName("testTitleLabel")
+        header.addWidget(title)
+        self.ld2410_connection_label = QLabel()
+        self.ld2410_connection_label.setObjectName("ld2410ConnectionLabel")
+        self.ld2410_connection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.addWidget(self.ld2410_connection_label)
+        header.addStretch(1)
+        self.ld2410_endpoint_label = QLabel()
+        self.ld2410_endpoint_label.setObjectName("telemetryLabel")
+        header.addWidget(self.ld2410_endpoint_label)
+        layout.addLayout(header)
+
+        note = QLabel("0.5초 ESP32 수신값 표시 · RAW 기록 보조 전용 · AI/PLC 안전판정에는 사용하지 않음")
+        note.setObjectName("ld2410SafetyNote")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.ld2410_console = QPlainTextEdit()
+        self.ld2410_console.setObjectName("testLog")
+        self.ld2410_console.setReadOnly(True)
+        self.ld2410_console.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.ld2410_console.document().setMaximumBlockCount(LD2410_CONSOLE_MAX_LINES)
+        self.ld2410_console.setPlaceholderText("LD2410 프레임 수신을 기다리는 중입니다.")
+        layout.addWidget(self.ld2410_console, 1)
+
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        self.ld2410_pause_button = QPushButton("화면 일시정지")
+        self.ld2410_pause_button.setObjectName("smallModeButton")
+        self.ld2410_pause_button.clicked.connect(self._toggle_ld2410_console_pause)
+        controls.addWidget(self.ld2410_pause_button)
+        self.ld2410_clear_button = QPushButton("화면 지우기")
+        self.ld2410_clear_button.setObjectName("smallModeButton")
+        self.ld2410_clear_button.clicked.connect(self._clear_ld2410_console)
+        controls.addWidget(self.ld2410_clear_button)
+        layout.addLayout(controls)
+
+        self._refresh_ld2410_console_status()
+        return root
+
     def _add_sidebar_buttons(self, layout: QVBoxLayout) -> None:
-        empty_count = 0
         for label in SIDEBAR_ACTION_LABELS:
             button = QPushButton(label)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1205,13 +1301,13 @@ class OperatorWindow(QMainWindow):
                 button.setCheckable(True)
                 self.purpose_task_buttons[PURPOSE_PERSON_PRESENCE] = button
                 button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_PERSON_PRESENCE))
+            elif label == "LD2410":
+                button.clicked.connect(self._show_ld2410_console)
             elif label == "차량 진입 시뮬레이션":
                 button.clicked.connect(self._simulate_vehicle_entry)
             else:
-                empty_count += 1
-                button.clicked.connect(lambda _checked=False, name=f"EMPTY {empty_count}": self._empty_action(name))
-            key = f"EMPTY_{empty_count}" if label == "EMPTY" else label
-            self.sidebar_buttons[key] = button
+                raise ValueError(f"Unsupported sidebar action: {label}")
+            self.sidebar_buttons[label] = button
             layout.addWidget(button)
 
     def _build_settings_view(self) -> QWidget:
@@ -1263,6 +1359,7 @@ class OperatorWindow(QMainWindow):
     def _tick(self) -> None:
         text = datetime.now().strftime("%m-%d %H:%M:%S")
         self.clock_label.setText(text)
+        self._refresh_ld2410_console_status()
         if self._evidence_coordinator is not None:
             self.evidence_status_label.setText(self._evidence_coordinator.status_summary)
         if self._last_person_detection_at is not None and time.monotonic() - self._last_person_detection_at >= PERSON_ALERT_STALE_SECONDS:
@@ -1324,6 +1421,15 @@ class OperatorWindow(QMainWindow):
         self._set_driver_test_preview(False)
         self._activate_operator_layout("all")
 
+    def _show_ld2410_console(self) -> None:
+        if not self._operator_unlocked:
+            return
+        self._set_driver_test_preview(False)
+        self.stack.setCurrentWidget(self.operator_view)
+        self.operator_workspace_stack.setCurrentWidget(self.ld2410_console_view)
+        self._render_ld2410_console()
+        self._refresh_ld2410_console_status()
+
     def _activate_operator_layout(self, mode: str) -> None:
         self.setUpdatesEnabled(False)
         try:
@@ -1373,9 +1479,91 @@ class OperatorWindow(QMainWindow):
         self.warning_label.setText("실제 표시 모델로 복귀했습니다. 안전 조건 확인 전 최종 OK는 차단됩니다.")
         self._refresh_user_mode_labels()
 
-    def _empty_action(self, name: str) -> None:
-        self._operator_notice_until = time.monotonic() + 3.0
-        self.warning_label.setText(f"{name}: 아직 기능이 연결되지 않았습니다. 최종 OK 차단 상태를 유지합니다.")
+    def _append_ld2410_frame(self, frame: LD2410Frame, client_ip: str) -> None:
+        self._ld2410_connection_state = "client_connected"
+        self._ld2410_client_ip = client_ip
+        self._ld2410_last_frame_at = frame.received_at
+        self._append_ld2410_console_line(_format_ld2410_console_line(frame, client_ip))
+        self._refresh_ld2410_console_status()
+
+    def _apply_ld2410_status(self, state: str, details: object) -> None:
+        status_details = dict(details) if isinstance(details, dict) else {}
+        self._ld2410_connection_state = state
+        self._ld2410_status_details = status_details
+        client_ip = status_details.get("client_ip")
+        if client_ip:
+            self._ld2410_client_ip = str(client_ip)
+        self._append_ld2410_console_line(_format_ld2410_status_line(state, status_details))
+        self._refresh_ld2410_console_status()
+
+    def _append_ld2410_console_line(self, line: str) -> None:
+        self._ld2410_console_lines.append(line)
+        if self._ld2410_console_paused:
+            return
+        self.ld2410_console.appendPlainText(line)
+        scrollbar = self.ld2410_console.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _render_ld2410_console(self) -> None:
+        if self._ld2410_console_paused:
+            return
+        self.ld2410_console.setPlainText("\n".join(self._ld2410_console_lines))
+        scrollbar = self.ld2410_console.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _toggle_ld2410_console_pause(self) -> None:
+        self._ld2410_console_paused = not self._ld2410_console_paused
+        self.ld2410_pause_button.setText("화면 재개" if self._ld2410_console_paused else "화면 일시정지")
+        self.ld2410_pause_button.setProperty("active", self._ld2410_console_paused)
+        self.ld2410_pause_button.style().unpolish(self.ld2410_pause_button)
+        self.ld2410_pause_button.style().polish(self.ld2410_pause_button)
+        if not self._ld2410_console_paused:
+            self._render_ld2410_console()
+
+    def _clear_ld2410_console(self) -> None:
+        self._ld2410_console_lines.clear()
+        self.ld2410_console.clear()
+
+    def _refresh_ld2410_console_status(self) -> None:
+        if not hasattr(self, "ld2410_connection_label"):
+            return
+        if self.settings is None:
+            host, port = "-", "-"
+            effective_state = "disabled"
+        else:
+            host, port = self.settings.ld2410.bind_host, str(self.settings.ld2410.port)
+            effective_state = self._ld2410_connection_state
+            if not self.settings.ld2410.enabled:
+                effective_state = "disabled"
+            elif effective_state == "client_connected" and self._ld2410_last_frame_at is not None:
+                age = (datetime.now(timezone.utc) - self._ld2410_last_frame_at).total_seconds()
+                if age > self.settings.ld2410.max_sample_age_seconds:
+                    effective_state = "stale"
+
+        labels = {
+            "disabled": ("비활성", "disabled"),
+            "listening": ("연결 대기", "waiting"),
+            "client_connected": ("연결됨", "connected"),
+            "stale": ("수신 지연", "waiting"),
+            "client_disconnected": ("연결 끊김", "waiting"),
+            "error": ("서버 오류", "error"),
+            "stopped": ("서버 중지", "disabled"),
+        }
+        text, style_state = labels.get(effective_state, ("상태 확인 중", "waiting"))
+        detail_parts = [text]
+        if self._ld2410_client_ip:
+            detail_parts.append(f"클라이언트 {self._ld2410_client_ip}")
+        if self._ld2410_last_frame_at is not None:
+            age = max(0.0, (datetime.now(timezone.utc) - self._ld2410_last_frame_at).total_seconds())
+            detail_parts.append(f"마지막 수신 {age:.1f}초 전")
+        reason = self._ld2410_status_details.get("reason")
+        if reason and effective_state in {"client_disconnected", "error"}:
+            detail_parts.append(str(reason))
+        self.ld2410_connection_label.setText(" · ".join(detail_parts))
+        self.ld2410_connection_label.setProperty("status", style_state)
+        self.ld2410_connection_label.style().unpolish(self.ld2410_connection_label)
+        self.ld2410_connection_label.style().polish(self.ld2410_connection_label)
+        self.ld2410_endpoint_label.setText(f"서버 {host}:{port}")
 
     def _simulate_vehicle_entry(self) -> None:
         self._operator_notice_until = time.monotonic() + 3.0
@@ -2334,6 +2522,48 @@ def _purpose_detection_label(
     return text
 
 
+def _format_ld2410_console_line(frame: LD2410Frame, client_ip: str) -> str:
+    timestamp = frame.received_at.astimezone().strftime("%H:%M:%S.%f")[:-3]
+    data_type = {1: "ENGINEERING", 2: "BASIC"}.get(frame.data_type, f"TYPE-{frame.data_type}")
+    target = {
+        0: "대상 없음",
+        1: "이동",
+        2: "정지",
+        3: "이동+정지",
+    }.get(frame.target_status, f"알 수 없음({frame.target_status})")
+    fields = [
+        f"[{timestamp}] RX {client_ip}",
+        data_type,
+        f"대상={target}",
+        f"이동={frame.moving_distance_cm}cm/E{frame.moving_energy}",
+        f"정지={frame.motionless_distance_cm}cm/E{frame.motionless_energy}",
+        f"감지거리={frame.detection_distance_cm}cm",
+    ]
+    if frame.data_type == 1:
+        moving = ",".join(str(value) for value in frame.moving_gate_energy)
+        motionless = ",".join(str(value) for value in frame.motionless_gate_energy)
+        fields.extend((f"MG=[{moving}]", f"SG=[{motionless}]", f"조도={frame.light}", f"OUT={frame.out_pin}"))
+    fields.append(f"HEX={frame.raw_hex}")
+    return " | ".join(fields)
+
+
+def _format_ld2410_status_line(state: str, details: dict[str, object]) -> str:
+    timestamp = datetime.now().astimezone().strftime("%H:%M:%S.%f")[:-3]
+    labels = {
+        "listening": "서버 연결 대기",
+        "client_connected": "클라이언트 연결",
+        "client_disconnected": "클라이언트 연결 끊김",
+        "error": "서버 오류",
+        "stopped": "서버 중지",
+    }
+    message = labels.get(state, state)
+    fields = [f"[{timestamp}] STATUS {message}"]
+    for key in ("bind_host", "port", "client_ip", "reason", "parse_error_count"):
+        if key in details:
+            fields.append(f"{key}={details[key]}")
+    return " | ".join(fields)
+
+
 def _prepare_operator_window(window: OperatorWindow, *, fullscreen: bool) -> None:
     screen = window.screen() or QApplication.primaryScreen()
     available = screen.availableGeometry() if screen is not None else QRect(0, 0, WINDOWED_MAX_WIDTH, WINDOWED_MAX_HEIGHT)
@@ -2457,6 +2687,42 @@ def _stylesheet() -> str:
         font-family: "DejaVu Sans Mono", monospace;
         padding: 8px;
         border-bottom: 1px solid #293241;
+    }
+    #ld2410ConnectionLabel {
+        min-width: 190px;
+        font-size: 18px;
+        font-weight: 800;
+        padding: 8px 12px;
+        border: 1px solid #4b5563;
+        background: #111827;
+    }
+    #ld2410ConnectionLabel[status="connected"] {
+        color: #cffafe;
+        border-color: #0891b2;
+        background: #123142;
+    }
+    #ld2410ConnectionLabel[status="waiting"] {
+        color: #fef3c7;
+        border-color: #d97706;
+        background: #3b2a10;
+    }
+    #ld2410ConnectionLabel[status="error"] {
+        color: #fee2e2;
+        border-color: #ef4444;
+        background: #3f1115;
+    }
+    #ld2410ConnectionLabel[status="disabled"] {
+        color: #9ca3af;
+        border-color: #4b5563;
+        background: #111827;
+    }
+    #ld2410SafetyNote {
+        font-size: 17px;
+        font-weight: 700;
+        color: #fef3c7;
+        padding: 8px;
+        border: 1px solid #92400e;
+        background: #2a2112;
     }
     #testTitleLabel {
         font-size: 26px;

@@ -104,6 +104,90 @@ def test_person_window_samples_every_half_second_until_five_seconds_after_clear(
     assert records[-1]["event_type"] == "person_window_closed"
 
 
+def test_person_samples_attach_ld2410_snapshot_at_each_half_second(tmp_path: Path):
+    start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    sampled_times: list[datetime] = []
+
+    def snapshot_provider(sampled_at: datetime) -> dict:
+        sampled_times.append(sampled_at)
+        return {
+            "status": "fresh",
+            "source": "ld2410_tcp",
+            "received_at": sampled_at.isoformat(),
+            "age_ms": 0,
+            "target_status": 2,
+            "raw_hex": "F4 F3 F2 F1",
+        }
+
+    manager = RawDataManager(
+        RawStorageConfig(
+            local_dir=tmp_path,
+            sample_interval_seconds=0.5,
+            person_stale_seconds=1.0,
+            person_clear_grace_seconds=5.0,
+        ),
+        ("front",),
+        clock=lambda: start,
+        ld2410_snapshot_provider=snapshot_provider,
+    )
+    manager.record_detection_batch("front", (_event("person", start),), task_id="person_presence", at=start)
+
+    assert manager.tick(now=start + timedelta(seconds=1)) == 3
+
+    samples = [
+        record["payload"]
+        for record in _records(tmp_path, "2026-08-21")
+        if record["event_type"] == "person_sample"
+    ]
+    assert sampled_times == [start, start + timedelta(seconds=0.5), start + timedelta(seconds=1)]
+    assert [sample["ld2410"]["status"] for sample in samples] == ["fresh", "fresh", "fresh"]
+    assert samples[-1]["ld2410"]["target_status"] == 2
+    assert samples[-1]["ld2410"]["raw_hex"] == "F4 F3 F2 F1"
+
+
+def test_ld2410_provider_is_not_called_outside_person_window(tmp_path: Path):
+    start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    calls: list[datetime] = []
+    manager = RawDataManager(
+        RawStorageConfig(local_dir=tmp_path),
+        ("front",),
+        clock=lambda: start,
+        ld2410_snapshot_provider=lambda sampled_at: calls.append(sampled_at) or {},
+    )
+
+    assert manager.tick(now=start + timedelta(seconds=10)) == 0
+    assert calls == []
+
+
+def test_ld2410_provider_failure_is_explicit_and_status_is_raw_only(tmp_path: Path):
+    start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+
+    def failing_provider(_sampled_at: datetime) -> dict:
+        raise RuntimeError("sensor unavailable")
+
+    manager = RawDataManager(
+        RawStorageConfig(local_dir=tmp_path),
+        ("front",),
+        clock=lambda: start,
+        ld2410_snapshot_provider=failing_provider,
+    )
+    manager.record_ld2410_status("listening", {"port": 9000})
+    manager.record_detection_batch("front", (_event("person", start),), task_id="person_presence", at=start)
+    assert manager.tick(now=start) == 1
+
+    records = _records(tmp_path, "2026-08-21")
+    server_status = next(record for record in records if record["event_type"] == "ld2410_server_status")
+    sample = next(record for record in records if record["event_type"] == "person_sample")
+    assert server_status["payload"]["safety_effect"] == "raw_only"
+    assert sample["payload"]["ld2410"] == {
+        "status": "unavailable",
+        "source": "ld2410_tcp",
+        "received_at": None,
+        "age_ms": None,
+        "reason": "provider_error",
+    }
+
+
 def test_plate_source_path_is_transient_to_evidence_sink(tmp_path: Path):
     now = datetime(2026, 8, 21, 1, 2, 3, tzinfo=timezone.utc)
     manager = RawDataManager(RawStorageConfig(local_dir=tmp_path), ("front",), clock=lambda: now)

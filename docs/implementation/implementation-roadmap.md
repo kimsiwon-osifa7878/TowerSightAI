@@ -50,10 +50,10 @@ Done when OK/NG flows can be represented by tests without live PLC hardware.
 - Show ceiling birdview and front camera as the primary first screen.
 - Provide a collapsible sidebar for navigation and feature slots.
 - Keep development state controls in the operator-only user-screen test panel.
-- Label unimplemented feature slots as `EMPTY`.
+- Keep diagnostic entries explicit and safety-neutral; the current sidebar uses the connected LD2410 console instead of empty placeholders.
 - Keep the in-UI test screen as the first field-verification hub.
 
-Done when user mode has no development controls, mode switching is non-accidental, and the operator can switch dashboard/all-camera/test views, press EMPTY buttons safely, and see that final OK remains blocked.
+Done when user mode has no development controls, mode switching is non-accidental, and the operator can switch dashboard/all-camera/test/LD2410 views while final OK remains blocked.
 
 ## Phase 6: Camera and AI Visualization Panels
 

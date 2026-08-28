@@ -24,7 +24,7 @@ USER_AFTER_ALL_CAMERAS_SCREENSHOT="$OUT_DIR/user-ui-after-all-cameras-$STAMP.png
 PERSON_SCREENSHOT="$OUT_DIR/operator-ui-person-presence-$STAMP.png"
 USER_AFTER_PERSON_SCREENSHOT="$OUT_DIR/user-ui-after-person-presence-$STAMP.png"
 SIMULATION_SCREENSHOT="$OUT_DIR/operator-ui-simulation-$STAMP.png"
-EMPTY_SCREENSHOT="$OUT_DIR/operator-ui-empty-$STAMP.png"
+LD2410_SCREENSHOT="$OUT_DIR/operator-ui-ld2410-$STAMP.png"
 DRIVER_TEST_SCREENSHOT="$OUT_DIR/operator-ui-driver-test-$STAMP.png"
 LOG_FILE="$OUT_DIR/operator-ui-$STAMP.log"
 
@@ -151,14 +151,14 @@ if [[ -n "$WINDOW_ID" ]]; then
 
   enter_operator
   click_at 150 606
+  gnome-screenshot -f "$LD2410_SCREENSHOT"
+  identify "$LD2410_SCREENSHOT"
+
+  click_at 150 670
   gnome-screenshot -f "$SIMULATION_SCREENSHOT"
   identify "$SIMULATION_SCREENSHOT"
 
-  click_at 150 670
-  gnome-screenshot -f "$EMPTY_SCREENSHOT"
-  identify "$EMPTY_SCREENSHOT"
-
-  click_at 150 798
+  click_at 150 734
   gnome-screenshot -f "$DRIVER_TEST_SCREENSHOT"
   identify "$DRIVER_TEST_SCREENSHOT"
 fi

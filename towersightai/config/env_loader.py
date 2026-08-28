@@ -145,6 +145,23 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
         ui_fullscreen=_parse_bool(values.get("UI_FULLSCREEN", "true")),
         ui_camera_resolution=values.get("UI_CAMERA_RESOLUTION", "1280x720"),
         birdview_mode=values.get("BIRDVIEW_MODE", "ceiling"),
+        ld2410={
+            "enabled": _parse_bool(values.get("LD2410_TCP_ENABLED", "false")),
+            "bind_host": values.get("LD2410_TCP_BIND_HOST", "0.0.0.0"),
+            "port": _parse_int(values.get("LD2410_TCP_PORT", "9000"), "LD2410_TCP_PORT"),
+            "buffer_seconds": _parse_float(
+                values.get("LD2410_BUFFER_SECONDS", "30"),
+                "LD2410_BUFFER_SECONDS",
+            ),
+            "max_sample_age_seconds": _parse_float(
+                values.get("LD2410_MAX_SAMPLE_AGE_SECONDS", "1"),
+                "LD2410_MAX_SAMPLE_AGE_SECONDS",
+            ),
+            "client_idle_timeout_seconds": _parse_float(
+                values.get("LD2410_CLIENT_IDLE_TIMEOUT_SECONDS", "5"),
+                "LD2410_CLIENT_IDLE_TIMEOUT_SECONDS",
+            ),
+        },
         raw_storage={
             "enabled": _parse_bool(values.get("RAW_DATA_ENABLED", "false")),
             "local_dir": _expand_config_path(values.get("RAW_DATA_LOCAL_DIR", "artifacts/raw"), values),

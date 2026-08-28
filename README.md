@@ -34,7 +34,7 @@ Implemented:
 - RTSP preview pipeline generation with redacted source handling.
 - PyQt6 application that starts in driver-facing user mode and enters the operator dashboard through a hidden two-second hold in the top-right corner.
 - Configurable birdview mode: `disabled` hides and stops the ceiling source, while `ceiling` restores the existing ceiling/front layout.
-- Collapsible sidebar with connected actions and `EMPTY` feature slots.
+- Collapsible sidebar with connected actions and an LD2410 live raw console.
 - Runtime camera capture for active cameras, with disconnected active cameras shown as NG.
 - Hailo installation checks and sample image smoke test using `data/samples/test-car.png`.
 - Hailo callback normalization into JSONL detection events.
@@ -67,11 +67,11 @@ Known gaps:
 Near-term work is UI-first:
 
 1. Add the operator UI button, status row, panel, or test slot.
-2. Connect it to `EMPTY`, fake, or simulation behavior that cannot change final OK.
+2. Connect it to fake, diagnostic, or simulation behavior that cannot change final OK.
 3. Add UI and fake-data tests.
 4. Connect real camera, Hailo, calibration, AI-stage, or PLC logic.
 
-`EMPTY` buttons are placeholders for future functionality. Pressing them must not change safety state or send PLC events.
+The LD2410 operator console is diagnostic-only. Viewing, pausing, or clearing it must not change safety state or send PLC events.
 
 ## Safety Rules
 
@@ -168,6 +168,7 @@ Important values:
 - `PLC_ENDPOINT`: PLC or simulator endpoint.
 - `UI_CAMERA_RESOLUTION`: preview/display capture resolution, for example `1920x1080` or `1280x720`.
 - `BIRDVIEW_MODE`: `disabled` for the current three-camera UI or `ceiling` for the existing ceiling-camera birdview.
+- `LD2410_TCP_*`: enables the one-client ESP32 TCP listener (default `0.0.0.0:9000`), 30-second timestamp buffer, one-second freshness limit, and five-second invalid/idle-client timeout.
 - `RAW_DATA_*`: local archive directory, hourly shard duration, 0.5-second sampling, five-second person-clear tail, Asia/Seoul day boundary, synchronization interval, and 14-day retention.
 - `RAW_MEDIA_*`: snapshot quality/staleness, five-second video pre-roll, vehicle post-roll, recorder segment/clip-part duration, and the system Python containing GStreamer GI.
 - `SYNOLOGY_NAS_*`: SFTP hostname, external port, dedicated account, password, SFTP-visible destination folder, and trusted `known_hosts` file. The host value must not include `https://` or a port.
@@ -184,7 +185,11 @@ With `RAW_MEDIA_ENABLED=true`, real vehicle entry saves the front-camera snapsho
 
 The current day remains local and completed days are uploaded in the background to `${SYNOLOGY_NAS_FOLDER}/raw/YYYY-MM-DD/`. `manifest.json` schema v2 lists every JSONL/gzip/image/video artifact with its relative path, media type, size, and SHA-256. Changed or missing files are uploaded to `.part`, verified, atomically renamed, and the manifest is published last.
 
-The person window starts on the first `person` detection. It records every active camera's latest person state every 0.5 seconds, treats a detection as stale after the configured interval, and continues absence samples for five seconds. Failed or unverified uploads are never deleted locally. A local day is deleted recursively only when its exact manifest was verified on NAS and it reaches the configured 14-day age.
+The person window starts on the first `person` detection. It records every active camera's latest person state every 0.5 seconds, treats a detection as stale after the configured interval, and continues absence samples for five seconds. When `LD2410_TCP_ENABLED=true`, the application also listens for raw LD2410 binary report frames from one ESP32 client. Each `person_sample` embeds the latest frame received at or before that sample time, including parsed distances/energy/gates and the original hex. Frames up to one second old are `fresh`, older buffered frames are `stale`, and missing frames are `unavailable`; future frames are never selected. LD2410 input is audit-only and cannot affect AI, the state machine, or PLC OK/NG.
+
+The ESP32 should connect to this Ubuntu device's LAN address and `LD2410_TCP_PORT`, then forward complete or chunked LD2410 bytes beginning with `F4 F3 F2 F1` every 0.5 seconds. Reserve the Ubuntu device's address in the router DHCP configuration so the ESP32 target does not change. The listener accepts a reconnect after disconnect and closes a client that produces no valid frame for five seconds.
+
+Failed or unverified uploads are never deleted locally. A local day is deleted recursively only when its exact manifest was verified on NAS and it reaches the configured 14-day age.
 
 Run a completed-day sync manually with:
 
@@ -229,8 +234,8 @@ Dashboard behavior:
 - `차량 전용 검출` runs the configured Hailo Apps detector on the front camera and keeps vehicle labels only.
 - `번호판 이미지 LPR` runs the Hailo LPR example models against sanitized images in `tmp/car_number-test`.
 - `사람 존재 감지` runs the configured Hailo Apps detector on currently streaming cameras and keeps `person` only.
+- `LD2410` shows the latest 500 ESP32 frames as parsed values plus original hexadecimal bytes, with connection status and display-only pause/clear controls.
 - `차량 진입 시뮬레이션` is UI-only and keeps PLC OK blocked.
-- `EMPTY` buttons are safe no-op feature slots.
 
 Disconnected active cameras remain visible as NG tiles and are not used as inference targets. A disabled birdview is not counted as a failed active camera, but is shown separately as `버드뷰 OFF` and always blocks final OK. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
 
@@ -311,8 +316,8 @@ For UI-centered changes, also verify the main button flows directly in the runni
 3. Click `전체 카메라` and confirm the four-camera view appears.
 4. Click `사람 존재 감지` and confirm the status strip shows the purpose AI task.
 5. Click `차량 진입 시뮬레이션` and confirm it is visibly test-only.
-6. Click an `EMPTY` button and confirm it only shows a not-connected message.
-7. Confirm simulation and `EMPTY` actions do not show final OK.
+6. Click `LD2410` and confirm live parsed values plus HEX appear without changing PLC or safety state.
+7. Confirm simulation and LD2410 console actions do not show final OK.
 
 If a GUI session is unavailable, record that the screenshot/button verification was not run and why. UI screenshot verification is not safety approval and never authorizes PLC OK.
 

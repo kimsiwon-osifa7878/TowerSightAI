@@ -37,6 +37,7 @@ _DURABLE_EVENTS = frozenset(
         "person_window_closed",
         "media_artifact_created",
         "media_capture_failed",
+        "ld2410_server_status",
     }
 )
 
@@ -142,6 +143,7 @@ class RawDataManager:
         *,
         uploader: DayUploader | None = None,
         clock: Callable[[], datetime] | None = None,
+        ld2410_snapshot_provider: Callable[[datetime], Mapping[str, Any]] | None = None,
     ) -> None:
         self.config = config
         self.camera_ids = tuple(dict.fromkeys(camera_ids))
@@ -164,6 +166,7 @@ class RawDataManager:
         self._sync_lock = threading.Lock()
         self._sync_running = False
         self._event_sink: Callable[[Mapping[str, Any]], None] | None = None
+        self._ld2410_snapshot_provider = ld2410_snapshot_provider
         self._closed = False
 
     def set_event_sink(self, sink: Callable[[Mapping[str, Any]], None] | None) -> None:
@@ -251,6 +254,12 @@ class RawDataManager:
                 "reason": reason[:240],
             },
             at=at,
+        )
+
+    def record_ld2410_status(self, state: str, details: Mapping[str, Any] | None = None) -> None:
+        self.record(
+            "ld2410_server_status",
+            payload={"state": state, "details": dict(details or {}), "safety_effect": "raw_only"},
         )
 
     def record_ai_started(self, task_id: str, camera_ids: Iterable[str], *, simulated: bool = False) -> None:
@@ -343,7 +352,20 @@ class RawDataManager:
         was_active = self.person_sampler.active
         samples = self.person_sampler.due_samples(sampled_at)
         for sample in samples:
-            self.record("person_sample", payload=sample, at=datetime.fromisoformat(sample["sampled_at"]))
+            sample_time = datetime.fromisoformat(sample["sampled_at"])
+            if self._ld2410_snapshot_provider is not None:
+                try:
+                    sample["ld2410"] = dict(self._ld2410_snapshot_provider(sample_time))
+                except Exception:  # noqa: BLE001 - sensor context failure must remain explicit and raw-only.
+                    logging.getLogger(__name__).exception("LD2410 person-sample snapshot failed")
+                    sample["ld2410"] = {
+                        "status": "unavailable",
+                        "source": "ld2410_tcp",
+                        "received_at": None,
+                        "age_ms": None,
+                        "reason": "provider_error",
+                    }
+            self.record("person_sample", payload=sample, at=sample_time)
         if was_active and not self.person_sampler.active:
             self.record("person_window_closed", payload={"person_window_id": closing_window_id}, at=sampled_at)
         return len(samples)
