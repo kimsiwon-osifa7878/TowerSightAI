@@ -226,13 +226,16 @@ One PyQt6 application, two surfaces in a `QStackedWidget`:
   `왼쪽 이동`, `전진`, `후진`, `주차기 밖으로 이동`), compact bottom status strip. No dev buttons, model
   names, paths, or inference counters. Camera priority follows state: front while idle → front + ceiling
   birdview through entry/alignment/safety.
-- **Operator mode** — dark industrial HMI: collapsible sidebar, dashboard / all-camera / camera-settings
-  layouts, purpose AI controls, LD2410 console, diagnostics, simulations. Entered only via the invisible
-  72×72 px top-right hotspot held for 2 s (early release or pointer exit cancels), or `Ctrl+Shift+O`.
+- **Operator mode** — dark industrial HMI: collapsible scrollable sidebar, dashboard / all-camera /
+  camera-settings layouts, purpose AI controls, LD2410 console, diagnostics, simulations. Entered via the
+  visible bottom-right `운영자 모드` button (the on-site entry point), the invisible 72×72 px top-right hotspot
+  held for 2 s (early release or pointer exit cancels), or `Ctrl+Shift+O`.
 
 Sidebar actions (`SIDEBAR_ACTION_LABELS` in `ui/pyqt_app.py`): `사용자모드`, `전체 카메라`, `카메라 설정`,
 `이전 AI Detection`, `차량 전용 검출`, `번호판 이미지 LPR`, `정면카메라LPR`, `사람 존재 감지`, `LD2410`,
-`차량 진입 시뮬레이션`.
+`차량 진입 시뮬레이션`, `종료`. `종료` closes the application behind `_confirm_shutdown()`; mode and lifecycle
+controls never touch safety state or PLC output. The menu lives in a `QScrollArea` so new entries can never be
+pushed below the sidebar edge.
 
 Threading: `CameraCaptureWorker`, `LiveDetectionWorker`, `PurposeInferenceWorker`, `FrontCameraLprWorker` each
 run on a `QThread` and communicate by signals. OpenCV and PyQt imports are lazy so headless tests still run.

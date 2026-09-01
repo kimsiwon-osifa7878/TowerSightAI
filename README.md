@@ -220,7 +220,14 @@ For a normal desktop window:
 ./run-window.sh
 ```
 
-The default entry screen is user mode. Hold the invisible `72 x 72 px` area in the top-right corner for two seconds with a mouse or touch input to enter the operator dashboard. Releasing early or moving outside the area cancels the transition. `Ctrl+Shift+O` remains a service-keyboard fallback.
+The default entry screen is user mode. Press the `운영자 모드` button in the bottom-right corner to enter the
+operator dashboard; this is the intended on-site entry point. Holding the invisible `72 x 72 px` area in the
+top-right corner for two seconds with a mouse or touch input does the same thing, and releasing early or moving
+outside that area cancels the transition. `Ctrl+Shift+O` remains a service-keyboard fallback.
+
+From operator mode, `사용자모드` in the sidebar returns to the driver display and `종료` closes the application
+after a confirmation dialog. Declining the confirmation leaves the application running. Neither control changes
+safety state or sends a PLC event.
 
 Dashboard behavior:
 
@@ -236,6 +243,8 @@ Dashboard behavior:
 - `사람 존재 감지` runs the configured Hailo Apps detector on currently streaming cameras and keeps `person` only.
 - `LD2410` shows the latest 500 ESP32 frames as parsed values plus original hexadecimal bytes, with connection status and display-only pause/clear controls.
 - `차량 진입 시뮬레이션` is UI-only and keeps PLC OK blocked.
+- `종료` asks for confirmation and then closes the application. It never sends a PLC event.
+- The sidebar scrolls vertically, so every menu entry stays reachable on short displays.
 
 Disconnected active cameras remain visible as NG tiles and are not used as inference targets. A disabled birdview is not counted as a failed active camera, but is shown separately as `버드뷰 OFF` and always blocks final OK. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
 

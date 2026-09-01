@@ -43,6 +43,7 @@ Reference hardware experiments:
 ## Driver Display Direction
 
 - Keep user mode and operator mode as separate surfaces within the same application.
+- User mode keeps two operator entry points: the hidden two-second top-right hold and a visible bottom-right `운영자 모드` service button for on-site use. Operator mode owns the return path (`사용자모드`) and application exit (`종료`, confirmation required) in its menu. These are mode/lifecycle controls only and must never carry diagnostics, change safety state, or emit PLC events.
 - User mode is the parking-machine display seen by the driver. Prioritize live camera context, ceiling birdview alignment, one current instruction, and the blocking reason.
 - Operator mode owns diagnostics, model details, camera inspection, settings, calibration, and test controls. Do not expose local paths, inference counters, or development state buttons on the driver-facing surface.
 - Use the provided ParkIO concept guide for product flow and visual direction only. It is not a verified safety specification and does not prove that alignment, occupancy, obstacle, exit, or PLC behavior is implemented.

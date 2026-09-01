@@ -21,6 +21,7 @@ The app starts in user mode on the installed parking-machine display.
 - Keep branding, stage, and blocking status small in a bottom strip.
 - Do not expose development state buttons, model details, paths, or inference counters.
 - A visually hidden `72 x 72 px` top-right hotspot enters operator mode only after a continuous two-second mouse or touch hold.
+- A visible `운영자 모드` button in the bottom-right corner enters operator mode in one press. It exists because holding the hidden hotspot is impractical at the installed machine. It only switches surfaces: it must never expose diagnostics, change safety state, or emit PLC events, and it must stay out of the operator-mode driver preview.
 - User-visible camera priority is front only while idle, then front plus ceiling birdview after vehicle detection and throughout entry, alignment, and safety guidance.
 - Rear-side and opposite-side cameras continue running for person/obstacle safety checks but are shown only in the operator `전체 카메라` inspection view. Hidden safety cameras remain required inputs and can still block the user display and final OK.
 - Front-camera health is the minimum requirement for user-mode diagnostic/basic flows. With only front healthy, vehicle, plate, and person tasks may run against front data, while missing side/ceiling safety coverage remains explicit NG and final PLC OK stays blocked.
@@ -45,18 +46,25 @@ In disabled birdview mode, the dashboard shows only front and the all-camera lay
 
 ## Sidebar and Feature Slots
 
-The sidebar is a collapsible operator control surface.
+The sidebar is a collapsible, vertically scrollable operator control surface. The menu must stay reachable on short displays, so entries live in a scroll area rather than an unbounded column.
 
 Current connected entries:
 
-- `운영 대시보드`
+- `사용자모드`
 - `전체 카메라`
+- `카메라 설정`
 - `이전 AI Detection`
 - `차량 전용 검출`
 - `번호판 이미지 LPR`
+- `정면카메라LPR`
 - `사람 존재 감지`
 - `LD2410`
 - `차량 진입 시뮬레이션`
+- `종료`
+
+`사용자모드` returns to the driver-facing surface. `종료` closes the application and must ask for explicit
+confirmation first; a declined confirmation changes nothing. Neither action changes safety state, calibration
+state, or PLC output.
 
 `이전 AI Detection` is a regression-isolation control. It should bypass runtime model selection and launch the previous multistream detection path that uses `HAILO_HEF_PATH`, the shared detection event directory, and the same camera rotation map as the visible UI.
 

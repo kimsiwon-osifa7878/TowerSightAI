@@ -18,11 +18,13 @@ from towersightai.state_machine.core import ParkingState
 from towersightai.ui.model import AlignmentResult, DriverTone, build_operator_display
 from towersightai.ui.driver_view import (
     DRIVER_STYLESHEET,
+    OPERATOR_BUTTON_LABEL,
     OPERATOR_HOLD_MS,
     OperatorEntryHotspot,
 )
 from towersightai.ui.pyqt_app import (
     OPERATOR_PANEL_WIDTH,
+    OPERATOR_SIDEBAR_WIDTH,
     LD2410_CONSOLE_MAX_LINES,
     SIDEBAR_ACTION_LABELS,
     PERSON_ALERT_STREAK_THRESHOLD,
@@ -1485,4 +1487,164 @@ def test_sidebar_user_screen_test_panel_fits_window_after_empty_removal():
 
     window.sidebar_buttons["LD2410"].click()
     assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_user_mode_operator_button_sits_bottom_right_and_opens_operator_mode():
+    app = _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.resize(1920, 1024)
+    window.show()
+    app.processEvents()
+
+    view = window.driver_view
+    button = view.operator_button
+    assert button.text() == OPERATOR_BUTTON_LABEL
+    assert button.objectName() == "driverOperatorButton"
+    assert button.isVisible() is True
+
+    geometry = button.geometry()
+    assert geometry.right() <= view.width()
+    assert geometry.left() > view.width() // 2
+    assert geometry.bottom() <= view.height() - view.bottom_strip.height()
+    assert geometry.top() > view.instruction_panel.geometry().bottom()
+
+    button.click()
+    assert window._operator_unlocked is True
+    assert window.stack.currentWidget() is window.operator_view
+
+    window.sidebar_toggle_button.click()
+    window.sidebar_buttons["사용자모드"].click()
+    assert window.stack.currentWidget() is window.user_view
+    assert view.operator_button.isVisible() is True
+    assert view.operator_button.geometry().right() <= view.width()
+    window.close()
+
+
+def test_user_mode_operator_button_stays_inside_view_after_resize():
+    app = _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.show()
+    for width, height in ((1920, 1024), (1440, 900), (1280, 720)):
+        window.resize(width, height)
+        app.processEvents()
+        view = window.driver_view
+        geometry = view.operator_button.geometry()
+        assert geometry.left() >= 0
+        assert geometry.top() >= 0
+        assert geometry.right() <= view.width()
+        assert geometry.bottom() <= view.height() - view.bottom_strip.height()
+        assert geometry.width() >= 104
+        assert geometry.height() >= 32
+    window.close()
+
+
+def test_driver_preview_in_operator_mode_has_no_operator_entry_button(monkeypatch):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.resize(1440, 900)
+    window.show()
+    window._unlock_operator()
+    window.sidebar_toggle_button.click()
+    window.driver_test_toggle.click()
+    app.processEvents()
+
+    assert window.driver_preview.operator_button.isVisible() is False
+    assert window.driver_preview.operator_button.isEnabled() is False
+    assert window.driver_preview.operator_hotspot.isVisible() is False
+    window.close()
+
+
+def test_operator_menu_exit_button_requires_confirmation_and_keeps_ok_blocked(monkeypatch):
+    app = _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.resize(1440, 900)
+    window.show()
+    window._unlock_operator()
+    window.sidebar_toggle_button.click()
+    app.processEvents()
+
+    exit_button = window.sidebar_buttons["종료"]
+    assert exit_button.text() == "종료"
+    assert exit_button.objectName() == "sidebarButton"
+    assert exit_button.property("danger") == "true"
+
+    monkeypatch.setattr(window, "_confirm_shutdown", lambda: False)
+    exit_button.click()
+    app.processEvents()
+    assert window.isVisible() is True
+    assert window.model.can_show_final_ok is False
+
+    monkeypatch.setattr(window, "_confirm_shutdown", lambda: True)
+    exit_button.click()
+    app.processEvents()
+    assert window.isVisible() is False
+
+
+def test_exit_is_ignored_while_operator_mode_is_locked(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.show()
+    confirmed: list[bool] = []
+    monkeypatch.setattr(window, "_confirm_shutdown", lambda: confirmed.append(True) or True)
+
+    window._request_shutdown()
+    assert confirmed == []
+    assert window.isVisible() is True
+    window.close()
+
+
+def test_sidebar_menu_is_scrollable_so_every_action_stays_reachable():
+    app = _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.resize(1280, 720)
+    window.show()
+    window._unlock_operator()
+    window.sidebar_toggle_button.click()
+    window.driver_test_toggle.click()
+    app.processEvents()
+
+    scroll = window.sidebar_scroll
+    assert scroll.widgetResizable() is True
+    assert scroll.horizontalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert scroll.viewport().width() <= OPERATOR_SIDEBAR_WIDTH
+
+    exit_button = window.sidebar_buttons["종료"]
+    scroll.ensureWidgetVisible(exit_button)
+    app.processEvents()
+    viewport = scroll.viewport()
+    top_left = exit_button.mapTo(viewport, exit_button.rect().topLeft())
+    bottom_left = exit_button.mapTo(viewport, exit_button.rect().bottomLeft())
+    assert top_left.y() >= 0
+    assert bottom_left.y() <= viewport.height()
+    window.close()
+
+
+def test_driver_camera_status_text_is_lifted_above_the_bottom_strip():
+    app = _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.resize(1920, 1024)
+    window.show()
+    app.processEvents()
+
+    front = window.camera_widgets[CameraRole.front]
+    strip_height = window.driver_view.bottom_strip.height()
+    assert front.bottom_inset >= strip_height
+
+    window.driver_view.operator_button.click()
+    app.processEvents()
+    assert front.bottom_inset == 0
+
+    window.sidebar_toggle_button.click()
+    window.sidebar_buttons["사용자모드"].click()
+    app.processEvents()
+    assert front.bottom_inset >= strip_height
     window.close()

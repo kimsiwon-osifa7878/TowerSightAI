@@ -56,6 +56,7 @@ SIDEBAR_ACTION_LABELS = (
     "사람 존재 감지",
     "LD2410",
     "차량 진입 시뮬레이션",
+    "종료",
 )
 LD2410_CONSOLE_MAX_LINES = 500
 
@@ -69,8 +70,10 @@ try:
         QHBoxLayout,
         QLabel,
         QMainWindow,
+        QMessageBox,
         QPlainTextEdit,
         QPushButton,
+        QScrollArea,
         QSizePolicy,
         QStackedWidget,
         QVBoxLayout,
@@ -98,6 +101,9 @@ class CameraSurface(QFrame):
         self._detections: tuple[DetectionEvent, ...] = ()
         self._frame_size_text = ""
         self._vehicle_simulation = False
+        # Pixels reserved at the bottom for an overlay that covers the tile, such as the
+        # driver bottom strip. Operator layouts keep this at 0.
+        self.bottom_inset = 0
         self.setMinimumSize(360, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -132,6 +138,13 @@ class CameraSurface(QFrame):
         if mode not in {"contain", "cover"}:
             raise ValueError(f"Unsupported camera display mode: {mode}")
         self.display_mode = mode
+        self.update()
+
+    def set_bottom_inset(self, pixels: int) -> None:
+        inset = max(0, int(pixels))
+        if inset == self.bottom_inset:
+            return
+        self.bottom_inset = inset
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
@@ -217,7 +230,11 @@ class CameraSurface(QFrame):
             painter.setPen(QColor("#cbd5e1"))
             painter.drawText(content.adjusted(-140, 10, -12, -10), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, self._frame_size_text)
         painter.setPen(QColor("#f87171" if self.status.startswith("NG") else "#86efac"))
-        painter.drawText(content.adjusted(12, -32, -12, -8), Qt.AlignmentFlag.AlignBottom, self.status)
+        painter.drawText(
+            content.adjusted(12, -32, -12, -8 - self.bottom_inset),
+            Qt.AlignmentFlag.AlignBottom,
+            self.status,
+        )
 
 
 class CameraCaptureWorker(QObject):
@@ -1099,14 +1116,30 @@ class OperatorWindow(QMainWindow):
         self.operator_sidebar.setObjectName("sidePanel")
         self.operator_sidebar.setFixedWidth(OPERATOR_SIDEBAR_WIDTH)
         self.operator_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        sidebar_layout = QVBoxLayout(self.operator_sidebar)
-        sidebar_layout.setContentsMargins(14, 14, 14, 14)
-        sidebar_layout.setSpacing(8)
+        sidebar_frame = QVBoxLayout(self.operator_sidebar)
+        sidebar_frame.setContentsMargins(14, 14, 14, 14)
+        sidebar_frame.setSpacing(8)
         title = QLabel("운영 메뉴")
         title.setObjectName("testTitleLabel")
-        sidebar_layout.addWidget(title)
+        sidebar_frame.addWidget(title)
+
+        # The menu grows as features land. Keep it scrollable so a short display can
+        # never hide an operator action below the sidebar edge.
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("sidebarScroll")
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar_content = QWidget()
+        sidebar_content.setObjectName("sidebarScrollContent")
+        sidebar_layout = QVBoxLayout(sidebar_content)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(6)
+        self.sidebar_scroll.setWidget(sidebar_content)
+        sidebar_frame.addWidget(self.sidebar_scroll, 1)
         self._add_sidebar_buttons(sidebar_layout)
         self.driver_test_toggle = QPushButton("사용자 화면 테스트")
+        self.driver_test_toggle.setObjectName("sidebarButton")
         self.driver_test_toggle.setCheckable(True)
         self.driver_test_toggle.clicked.connect(self._toggle_driver_test_panel)
         sidebar_layout.addWidget(self.driver_test_toggle)
@@ -1274,6 +1307,7 @@ class OperatorWindow(QMainWindow):
     def _add_sidebar_buttons(self, layout: QVBoxLayout) -> None:
         for label in SIDEBAR_ACTION_LABELS:
             button = QPushButton(label)
+            button.setObjectName("sidebarButton")
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             if label == "사용자모드":
                 button.clicked.connect(self._show_user_mode)
@@ -1305,6 +1339,9 @@ class OperatorWindow(QMainWindow):
                 button.clicked.connect(self._show_ld2410_console)
             elif label == "차량 진입 시뮬레이션":
                 button.clicked.connect(self._simulate_vehicle_entry)
+            elif label == "종료":
+                button.setProperty("danger", "true")
+                button.clicked.connect(self._request_shutdown)
             else:
                 raise ValueError(f"Unsupported sidebar action: {label}")
             self.sidebar_buttons[label] = button
@@ -1450,6 +1487,24 @@ class OperatorWindow(QMainWindow):
     def _unlock_operator(self) -> None:
         self._operator_unlocked = True
         self._show_operator_dashboard()
+
+    def _request_shutdown(self) -> None:
+        """Operator-menu application exit. Safety state is never changed by this path."""
+        if not self._operator_unlocked:
+            return
+        if not self._confirm_shutdown():
+            return
+        self.close()
+
+    def _confirm_shutdown(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "TowerSightAI 종료",
+            "감시 화면을 종료합니다.\n종료 중에는 AI 감시와 안내가 중단됩니다. 계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer is QMessageBox.StandardButton.Yes
 
     def _toggle_sidebar(self) -> None:
         self.operator_sidebar.setVisible(not self.operator_sidebar.isVisible())
@@ -1760,6 +1815,8 @@ class OperatorWindow(QMainWindow):
         self._camera_layout_mode = mode
         for widget in self.camera_widgets.values():
             widget.set_display_mode("contain")
+            if hasattr(widget, "set_bottom_inset"):
+                widget.set_bottom_inset(0)
         if hasattr(self, "driver_view"):
             self.driver_view.detach_cameras()
         while self.grid.count():
@@ -2751,6 +2808,39 @@ def _stylesheet() -> str:
         border-color: #38bdf8;
         background: #123142;
         color: #e0f2fe;
+    }
+    #sidebarButton {
+        min-height: 32px;
+        font-size: 16px;
+        padding: 5px 8px;
+        text-align: left;
+    }
+    #sidebarButton[danger="true"] {
+        background: #2a1417;
+        color: #fecdd3;
+        border: 1px solid #9f1239;
+    }
+    #sidebarButton[danger="true"]:hover {
+        background: #3b191e;
+        border-color: #e11d48;
+    }
+    #sidebarScroll, #sidebarScrollContent {
+        background: transparent;
+        border: 0;
+    }
+    #sidebarScroll QScrollBar:vertical {
+        background: transparent;
+        width: 8px;
+        margin: 0;
+    }
+    #sidebarScroll QScrollBar::handle:vertical {
+        background: #374151;
+        min-height: 28px;
+        border-radius: 4px;
+    }
+    #sidebarScroll QScrollBar::add-line:vertical,
+    #sidebarScroll QScrollBar::sub-line:vertical {
+        height: 0;
     }
     #testLog {
         font-size: 15px;

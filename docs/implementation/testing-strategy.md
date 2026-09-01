@@ -29,6 +29,9 @@ Run without real hardware:
 
 - App starts in driver-facing user mode with no development buttons.
 - The hidden top-right hotspot requires a completed two-second hold and cancels on early release or pointer exit.
+- The visible bottom-right `운영자 모드` button enters operator mode in one press, stays inside the view and clear of the instruction panel and bottom strip at every supported size, and is absent from the operator-mode driver preview.
+- The operator `종료` action is ignored while operator mode is locked, keeps the application running when the confirmation is declined, and never changes `can_show_final_ok`.
+- Every sidebar entry stays reachable through the scrollable menu on a short display.
 - User and operator surfaces switch within the stack instead of appearing together.
 - Sidebar opens and closes.
 - Dashboard and all-camera layouts switch correctly.
@@ -80,6 +83,8 @@ Manual or semi-automated checklist:
 
 - Confirm the app starts in the dark, camera-first user mode.
 - Hold the top-right hotspot for two seconds and confirm the operator dashboard replaces user mode.
+- Return to user mode, press the bottom-right `운영자 모드` button, and confirm one press enters the operator dashboard.
+- Click `종료`, confirm the dialog appears, cancel it, and confirm the application is still running.
 - With `BIRDVIEW_MODE=disabled`, confirm the front camera is the only dashboard tile and `버드뷰 OFF` is visible in the status strip.
 - Confirm `전체 카메라` shows front, rear-side, and opposite-side without a ceiling tile.
 - Confirm `메뉴` opens the sidebar.

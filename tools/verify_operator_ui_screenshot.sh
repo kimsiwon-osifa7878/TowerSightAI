@@ -26,6 +26,8 @@ USER_AFTER_PERSON_SCREENSHOT="$OUT_DIR/user-ui-after-person-presence-$STAMP.png"
 SIMULATION_SCREENSHOT="$OUT_DIR/operator-ui-simulation-$STAMP.png"
 LD2410_SCREENSHOT="$OUT_DIR/operator-ui-ld2410-$STAMP.png"
 DRIVER_TEST_SCREENSHOT="$OUT_DIR/operator-ui-driver-test-$STAMP.png"
+OPERATOR_BUTTON_SCREENSHOT="$OUT_DIR/operator-ui-from-user-button-$STAMP.png"
+EXIT_CONFIRM_SCREENSHOT="$OUT_DIR/operator-ui-exit-confirm-$STAMP.png"
 LOG_FILE="$OUT_DIR/operator-ui-$STAMP.log"
 
 PYTHON=""
@@ -105,22 +107,37 @@ if [[ -n "$WINDOW_ID" ]]; then
     exit 2
   fi
 
+  # BoundedContentViewport caps the UI canvas at 1920x1024 and centers it, so a
+  # fullscreen window is larger than the clickable content. Every coordinate below is
+  # content-relative and click_at() adds the centering offset.
+  CONTENT_W=$(( _WINDOW_W < 1920 ? _WINDOW_W : 1920 ))
+  CONTENT_H=$(( _WINDOW_H < 1024 ? _WINDOW_H : 1024 ))
+  OFFSET_X=$(( (_WINDOW_W - CONTENT_W) / 2 ))
+  OFFSET_Y=$(( (_WINDOW_H - CONTENT_H) / 2 ))
+  echo "Content canvas: ${CONTENT_W}x${CONTENT_H}+${OFFSET_X}+${OFFSET_Y}"
+
   click_at() {
-    local rel_x="$1"
-    local rel_y="$2"
+    local rel_x=$(( OFFSET_X + $1 ))
+    local rel_y=$(( OFFSET_Y + $2 ))
     xdotool windowactivate "$WINDOW_ID" 2>/dev/null || true
     xdotool mousemove --window "$WINDOW_ID" "$rel_x" "$rel_y" click 1
     sleep 1
   }
 
-  HOTSPOT_X=$((_WINDOW_W - 36))
+  HOTSPOT_X=$(( OFFSET_X + CONTENT_W - 36 ))
+  HOTSPOT_Y=$(( OFFSET_Y + 36 ))
   enter_operator() {
     xdotool windowactivate "$WINDOW_ID" 2>/dev/null || true
-    xdotool mousemove --window "$WINDOW_ID" "$HOTSPOT_X" 36
+    xdotool mousemove --window "$WINDOW_ID" "$HOTSPOT_X" "$HOTSPOT_Y"
     xdotool mousedown 1
     sleep 3
     xdotool mouseup 1
     sleep 1
+  }
+
+  # Visible bottom-right service control added for on-site operator entry.
+  enter_operator_by_button() {
+    click_at $(( CONTENT_W - 60 )) $(( CONTENT_H - 72 ))
   }
 
   enter_operator
@@ -132,7 +149,7 @@ if [[ -n "$WINDOW_ID" ]]; then
   gnome-screenshot -f "$SIDEBAR_SCREENSHOT"
   identify "$SIDEBAR_SCREENSHOT"
 
-  click_at 150 162
+  click_at 150 147
   gnome-screenshot -f "$ALL_CAMERAS_SCREENSHOT"
   identify "$ALL_CAMERAS_SCREENSHOT"
 
@@ -141,7 +158,7 @@ if [[ -n "$WINDOW_ID" ]]; then
   identify "$USER_AFTER_ALL_CAMERAS_SCREENSHOT"
 
   enter_operator
-  click_at 150 542
+  click_at 150 447
   gnome-screenshot -f "$PERSON_SCREENSHOT"
   identify "$PERSON_SCREENSHOT"
 
@@ -150,17 +167,35 @@ if [[ -n "$WINDOW_ID" ]]; then
   identify "$USER_AFTER_PERSON_SCREENSHOT"
 
   enter_operator
-  click_at 150 606
+  click_at 150 497
   gnome-screenshot -f "$LD2410_SCREENSHOT"
   identify "$LD2410_SCREENSHOT"
 
-  click_at 150 670
+  click_at 150 547
   gnome-screenshot -f "$SIMULATION_SCREENSHOT"
   identify "$SIMULATION_SCREENSHOT"
 
-  click_at 150 734
+  click_at 150 647
   gnome-screenshot -f "$DRIVER_TEST_SCREENSHOT"
   identify "$DRIVER_TEST_SCREENSHOT"
+
+  # Operator menu exit control. Escape dismisses the confirmation so the app survives.
+  click_at 150 597
+  gnome-screenshot -f "$EXIT_CONFIRM_SCREENSHOT"
+  identify "$EXIT_CONFIRM_SCREENSHOT"
+  xdotool key --clearmodifiers Escape
+  sleep 1
+  if ! kill -0 "$APP_PID" 2>/dev/null; then
+    echo "operator ui exited after the cancelled shutdown confirmation; see $LOG_FILE" >&2
+    exit 2
+  fi
+
+  # Return to user mode and re-enter operator mode with the visible bottom-right button.
+  click_at 150 97
+  sleep 1
+  enter_operator_by_button
+  gnome-screenshot -f "$OPERATOR_BUTTON_SCREENSHOT"
+  identify "$OPERATOR_BUTTON_SCREENSHOT"
 fi
 
 echo "$SCREENSHOT"

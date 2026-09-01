@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -20,6 +21,10 @@ from towersightai.ui.model import DriverDisplayModel, DriverLayout, DriverTone
 
 OPERATOR_HOLD_MS = 2000
 OPERATOR_HOTSPOT_SIZE = 72
+OPERATOR_BUTTON_LABEL = "운영자 모드"
+OPERATOR_BUTTON_WIDTH = 168
+OPERATOR_BUTTON_HEIGHT = 46
+OPERATOR_BUTTON_MARGIN = 18
 DRIVER_BOTTOM_STRIP_HEIGHT = 42
 DRIVER_REFERENCE_WIDTH = 1920
 DRIVER_REFERENCE_HEIGHT = 1024
@@ -190,10 +195,23 @@ class DriverView(QWidget):
 
         self.operator_hotspot = OperatorEntryHotspot(self)
         self.operator_hotspot.activated.connect(self.operator_requested)
+
+        # On-site service control. Holding the hidden hotspot is impractical on the
+        # installed display, so a visible bottom-right entry point is provided. It only
+        # switches surfaces and never changes safety state or PLC output.
+        self.operator_button = QPushButton(OPERATOR_BUTTON_LABEL, self)
+        self.operator_button.setObjectName("driverOperatorButton")
+        self.operator_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.operator_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.operator_button.clicked.connect(lambda _checked=False: self.operator_requested.emit())
+
         if preview_mode:
             self.operator_hotspot.setEnabled(False)
             self.operator_hotspot.hide()
+            self.operator_button.setEnabled(False)
+            self.operator_button.hide()
         self.operator_hotspot.raise_()
+        self.operator_button.raise_()
         self._apply_scale(DRIVER_REFERENCE_WIDTH)
 
     def apply_display(
@@ -315,10 +333,12 @@ class DriverView(QWidget):
         self.bottom_strip.show()
         if not self.preview_mode:
             self.operator_hotspot.show()
+            self.operator_button.show()
         self.instruction_panel.raise_()
         self.bottom_strip.raise_()
         if not self.preview_mode:
             self.operator_hotspot.raise_()
+            self.operator_button.raise_()
         self.update()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
@@ -358,11 +378,26 @@ class DriverView(QWidget):
             width,
             bottom_height,
         )
+        # Camera tiles run edge to edge under the bottom strip, so their status text has to
+        # be lifted above it instead of being hidden by the overlay.
+        for widget in self.camera_widgets.values():
+            if hasattr(widget, "set_bottom_inset"):
+                widget.set_bottom_inset(bottom_height + 6)
         self.operator_hotspot.move(max(0, width - OPERATOR_HOTSPOT_SIZE), 0)
+        button_width = max(104, round(OPERATOR_BUTTON_WIDTH * scale))
+        button_height = max(32, round(OPERATOR_BUTTON_HEIGHT * scale))
+        button_margin = max(8, round(OPERATOR_BUTTON_MARGIN * scale))
+        self.operator_button.setGeometry(
+            max(0, width - button_width - button_margin),
+            max(0, height - bottom_height - button_height - button_margin),
+            button_width,
+            button_height,
+        )
         self.instruction_panel.raise_()
         self.bottom_strip.raise_()
         if not self.preview_mode:
             self.operator_hotspot.raise_()
+            self.operator_button.raise_()
 
     def _apply_scale(self, width: int) -> None:
         minimum_headline = 24 if self.preview_mode else 38
@@ -497,5 +532,23 @@ DRIVER_STYLESHEET = """
     #operatorEntryHotspot {
         background: transparent;
         border: 0;
+    }
+    #driverOperatorButton {
+        min-height: 0;
+        font-size: 18px;
+        font-weight: 700;
+        padding: 0 12px;
+        background: rgba(2, 8, 12, 168);
+        color: #cbd5e1;
+        border: 1px solid rgba(148, 163, 184, 122);
+        border-radius: 6px;
+    }
+    #driverOperatorButton:hover {
+        color: #e2e8f0;
+        border-color: rgba(103, 232, 249, 184);
+    }
+    #driverOperatorButton:pressed {
+        background: rgba(3, 18, 27, 208);
+        border-color: rgba(103, 232, 249, 220);
     }
 """
