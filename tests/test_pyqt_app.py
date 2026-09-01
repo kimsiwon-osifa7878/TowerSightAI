@@ -22,7 +22,10 @@ from towersightai.ui.driver_view import (
     OPERATOR_HOLD_MS,
     OperatorEntryHotspot,
 )
+from towersightai.storage.connection_test import NasConnectionTestResult
 from towersightai.ui.pyqt_app import (
+    NAS_TEST_CLIP_FPS,
+    NAS_TEST_CLIP_SECONDS,
     OPERATOR_PANEL_WIDTH,
     OPERATOR_SIDEBAR_WIDTH,
     LD2410_CONSOLE_MAX_LINES,
@@ -1647,4 +1650,168 @@ def test_driver_camera_status_text_is_lifted_above_the_bottom_strip():
     window.sidebar_buttons["사용자모드"].click()
     app.processEvents()
     assert front.bottom_inset >= strip_height
+    window.close()
+
+
+def _nas_settings(tmp_path, **overrides):
+    raw_storage = {
+        "enabled": False,
+        "local_dir": tmp_path / "raw",
+        "nas_host": "nas.example.test",
+        "nas_username": "uploader",
+        "nas_password": "secret",
+        "nas_folder": "/home/site",
+        "known_hosts_path": tmp_path / "known_hosts",
+    }
+    raw_storage.update(overrides)
+    return Settings(
+        tappas_workspace="/tmp/tappas",
+        hailo_hef_path="/tmp/model.hef",
+        hailo_postprocess_so="/tmp/post.so",
+        camera_1={"id": "ceiling", "role": "ceiling", "rtsp_url": "rtsp://a"},
+        camera_2={"id": "front", "role": "front", "rtsp_url": "rtsp://b"},
+        camera_3={"id": "rear_side", "role": "rear_side", "rtsp_url": "rtsp://c"},
+        camera_4={"id": "opposite_side", "role": "opposite_side", "rtsp_url": "rtsp://d"},
+        calibration_path=tmp_path / "calibration.json",
+        plc_endpoint="tcp://127.0.0.1:502",
+        raw_storage=raw_storage,
+    )
+
+
+def _open_operator_menu(window):
+    window._unlock_operator()
+    window.sidebar_toggle_button.click()
+
+
+def test_nas_connection_test_button_is_in_the_operator_menu():
+    _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    assert "NAS 연결 확인" in window.sidebar_buttons
+    assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
+    assert window.sidebar_buttons["NAS 연결 확인"].isEnabled() is True
+    window.close()
+
+
+def test_nas_connection_test_without_settings_reports_and_keeps_ok_blocked(tmp_path: Path):
+    app = _qt_app()
+    settings = _nas_settings(tmp_path, nas_host="", nas_username="", nas_password="", nas_folder="")
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+
+    window.sidebar_buttons["NAS 연결 확인"].click()
+    app.processEvents()
+
+    assert window._nas_test_running is False
+    assert "SYNOLOGY_NAS" in window.warning_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_nas_connection_test_runs_without_camera_and_keeps_ok_blocked(monkeypatch, tmp_path: Path):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+
+    window.sidebar_buttons["NAS 연결 확인"].click()
+    app.processEvents()
+
+    assert window._nas_test_running is True
+    assert window.sidebar_buttons["NAS 연결 확인"].isEnabled() is False
+    assert window._nas_test_camera_id == ""
+    assert window._nas_test_timer is None  # no camera, so no frame collection phase
+    assert len(window._nas_test_workers) == 1
+    worker = window._nas_test_workers[0]
+    assert worker.frames == ()
+    assert worker.config.nas_folder == "/home/site"
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_nas_connection_test_collects_frames_from_a_streaming_camera(monkeypatch, tmp_path: Path):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+
+    frame = QImage(64, 48, QImage.Format.Format_RGB888)
+    frame.fill(QColor("#204060"))
+    window.camera_widgets[CameraRole.front].set_frame(frame)
+    window._runtime_camera_status["front"] = "정상 수신"
+
+    window.sidebar_buttons["NAS 연결 확인"].click()
+    app.processEvents()
+
+    assert window._nas_test_camera_id == "front"
+    assert window._nas_test_timer is not None
+    assert window._nas_test_workers == []
+
+    for _ in range(round(NAS_TEST_CLIP_SECONDS * NAS_TEST_CLIP_FPS)):
+        window._collect_nas_test_frame()
+    app.processEvents()
+
+    assert window._nas_test_timer is None
+    assert len(window._nas_test_workers) == 1
+    worker = window._nas_test_workers[0]
+    assert len(worker.frames) == round(NAS_TEST_CLIP_SECONDS * NAS_TEST_CLIP_FPS)
+    assert worker.camera_id == "front"
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_nas_connection_test_result_is_reported_and_never_authorizes_ok(monkeypatch, tmp_path: Path):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+
+    window._set_nas_test_result(
+        NasConnectionTestResult(
+            ok=True,
+            summary="NAS 저장 확인: 2개 파일 1,024B, 0.4s",
+            remote_dir="/home/site/connectiontest/check-20260901-040506Z",
+        )
+    )
+    assert "connectiontest" in window.instruction_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+
+    window._set_nas_test_result(
+        NasConnectionTestResult(ok=False, summary="NAS 저장 실패", error="OSError: timed out")
+    )
+    assert window.instruction_label.text() == "NAS 연결 확인 실패"
+    assert "OSError" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_nas_connection_test_ignores_a_second_click_while_running(monkeypatch, tmp_path: Path):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+
+    window.sidebar_buttons["NAS 연결 확인"].click()
+    app.processEvents()
+    window._start_nas_connection_test()
+    app.processEvents()
+
+    assert len(window._nas_test_workers) == 1
+    assert "이미 실행 중" in window.warning_label.text()
     window.close()

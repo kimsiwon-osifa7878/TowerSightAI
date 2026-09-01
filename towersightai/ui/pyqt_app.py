@@ -26,6 +26,7 @@ from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.runtime_logging import new_run_id
 from towersightai.state_machine.core import ParkingState
 from towersightai.sensors.ld2410 import LD2410Frame, LD2410TCPService
+from towersightai.storage.connection_test import NasConnectionTestResult, run_nas_connection_test
 from towersightai.storage.evidence import EvidenceCoordinator
 from towersightai.storage.raw_data import RawDataManager
 from towersightai.ui.model import (
@@ -56,9 +57,13 @@ SIDEBAR_ACTION_LABELS = (
     "사람 존재 감지",
     "LD2410",
     "차량 진입 시뮬레이션",
+    "NAS 연결 확인",
     "종료",
 )
 LD2410_CONSOLE_MAX_LINES = 500
+NAS_TEST_CLIP_SECONDS = 2.0
+NAS_TEST_CLIP_FPS = 10
+NAS_TEST_DIR = Path("artifacts/runtime/nas-connection-test")
 
 try:
     from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
@@ -614,6 +619,112 @@ class FrontCameraLprWorker(QObject):
         self.finished.emit()
 
 
+class NasConnectionTestWorker(QObject):
+    """Encode the collected preview frames and write one test payload to the NAS.
+
+    Diagnostic only: the result never changes safety state, calibration state, or PLC output.
+    """
+
+    status_changed = pyqtSignal(str)
+    result_ready = pyqtSignal(object)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        config,  # noqa: ANN001 - RawStorageConfig, kept untyped to avoid a settings import cycle.
+        frames: tuple[QImage, ...] = (),
+        *,
+        camera_id: str = "",
+        work_dir: Path = NAS_TEST_DIR,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.config = config
+        self.frames = tuple(frame.copy() for frame in frames)
+        self.camera_id = camera_id
+        self.work_dir = Path(work_dir)
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:
+        logger = logging.getLogger("towersightai.storage.nas_check")
+        if self._stop_requested:
+            self.finished.emit()
+            return
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        video_path: Path | None = None
+        video_error = ""
+        if self.frames:
+            self.status_changed.emit(f"NAS 연결 확인: {self.camera_id or 'camera'} 영상 {len(self.frames)}프레임 인코딩 중")
+            try:
+                video_path = self._encode_clip()
+            except Exception as exc:  # noqa: BLE001 - a clip failure must not hide the NAS result.
+                video_error = f"{type(exc).__name__}: {exc}"
+                logger.exception("nas-check-clip-encode-failed camera=%s", self.camera_id)
+
+        metadata = {
+            "camera_id": self.camera_id,
+            "frame_count": len(self.frames),
+            "clip_seconds": round(len(self.frames) / NAS_TEST_CLIP_FPS, 2) if self.frames else 0.0,
+            "clip_fps": NAS_TEST_CLIP_FPS if self.frames else 0,
+            "video_error": video_error,
+        }
+        self.status_changed.emit("NAS 연결 확인: 업로드 중")
+        result = run_nas_connection_test(
+            self.config,
+            work_dir=self.work_dir,
+            metadata=metadata,
+            video_path=video_path,
+        )
+        logger.info(
+            "nas-check-end ok=%s remote_dir=%s files=%s bytes=%s error=%s",
+            result.ok,
+            result.remote_dir,
+            len(result.artifacts),
+            result.total_bytes,
+            result.error,
+        )
+        self.result_ready.emit(result)
+        self.finished.emit()
+
+    def _encode_clip(self) -> Path | None:
+        import cv2
+        import numpy as np
+
+        first = self.frames[0]
+        width, height = first.width(), first.height()
+        if width <= 0 or height <= 0:
+            return None
+        path = self.work_dir / f"camera-clip-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%SZ')}.mp4"
+        writer = cv2.VideoWriter(
+            str(path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(NAS_TEST_CLIP_FPS),
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError("cv2.VideoWriter could not open the clip file")
+        try:
+            for frame in self.frames:
+                image = frame.convertToFormat(QImage.Format.Format_RGB888)
+                buffer = image.constBits()
+                buffer.setsize(image.height() * image.bytesPerLine())
+                array = np.frombuffer(buffer, dtype=np.uint8).reshape(
+                    (image.height(), image.bytesPerLine() // 3, 3)
+                )[:, : image.width(), :]
+                bgr = array[:, :, ::-1]
+                if (image.width(), image.height()) != (width, height):
+                    bgr = cv2.resize(bgr, (width, height))
+                writer.write(np.ascontiguousarray(bgr))
+        finally:
+            writer.release()
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError("encoded clip is empty")
+        return path
+
+
 class BoundedContentViewport(QWidget):
     """Center the UI canvas while allowing the top-level window to be fullscreen."""
 
@@ -653,6 +764,14 @@ class OperatorWindow(QMainWindow):
         self._purpose_workers: list[PurposeInferenceWorker] = []
         self._front_lpr_threads: list[QThread] = []
         self._front_lpr_workers: list[FrontCameraLprWorker] = []
+        self._nas_test_threads: list[QThread] = []
+        self._nas_test_workers: list[NasConnectionTestWorker] = []
+        self._nas_test_running = False
+        self._nas_test_frames: list[QImage] = []
+        self._nas_test_camera_id = ""
+        self._nas_test_timer: QTimer | None = None
+        self._nas_test_ticks = 0
+        self._nas_test_widget: CameraSurface | None = None
         self._detection_enabled = False
         self._detection_camera_ids: tuple[str, ...] = ()
         self._detection_event_counts: dict[str, int] = {}
@@ -742,6 +861,7 @@ class OperatorWindow(QMainWindow):
         self._stop_ai_detection()
         self._stop_purpose_inference()
         self._stop_front_camera_lpr()
+        self._stop_nas_connection_test()
         for thread in self._detection_threads:
             thread.quit()
             thread.wait(5000)
@@ -749,6 +869,9 @@ class OperatorWindow(QMainWindow):
             thread.quit()
             thread.wait(5000)
         for thread in self._front_lpr_threads:
+            thread.quit()
+            thread.wait(10000)
+        for thread in self._nas_test_threads:
             thread.quit()
             thread.wait(10000)
         if self._ld2410_service is not None:
@@ -1339,6 +1462,9 @@ class OperatorWindow(QMainWindow):
                 button.clicked.connect(self._show_ld2410_console)
             elif label == "차량 진입 시뮬레이션":
                 button.clicked.connect(self._simulate_vehicle_entry)
+            elif label == "NAS 연결 확인":
+                self.nas_test_button = button
+                button.clicked.connect(self._start_nas_connection_test)
             elif label == "종료":
                 button.setProperty("danger", "true")
                 button.clicked.connect(self._request_shutdown)
@@ -2053,6 +2179,131 @@ class OperatorWindow(QMainWindow):
         if not self._front_lpr_workers:
             self._front_lpr_enabled = False
             self._set_front_lpr_button_text()
+
+    def _start_nas_connection_test(self, checked: bool = False) -> None:
+        """Write one diagnostic payload to the NAS. It never authorizes final OK."""
+        del checked
+        if not self._operator_unlocked:
+            return
+        if self._nas_test_running:
+            self._set_nas_test_status("NAS 연결 확인이 이미 실행 중입니다")
+            return
+        config = self.settings.raw_storage if self.settings is not None else None
+        if config is None or not config.nas_host:
+            self.instruction_label.setText("NAS 연결 확인 불가")
+            self._set_nas_test_status("NAS 설정이 없습니다. .env의 SYNOLOGY_NAS_* 값을 확인해 주세요")
+            return
+
+        self._nas_test_running = True
+        self._nas_test_frames = []
+        self._nas_test_ticks = 0
+        camera_id, widget = self._nas_test_source()
+        self._nas_test_camera_id = camera_id
+        self._nas_test_widget = widget
+        self._refresh_nas_test_button()
+        if widget is None:
+            self._set_nas_test_status("NAS 연결 확인: 수신 중인 카메라가 없어 영상 없이 진행합니다")
+            self._launch_nas_test_worker()
+            return
+
+        self._set_nas_test_status(
+            f"NAS 연결 확인: {camera_id} 영상 {NAS_TEST_CLIP_SECONDS:.0f}초 수집 중"
+        )
+        timer = QTimer(self)
+        timer.setInterval(max(1, round(1000 / NAS_TEST_CLIP_FPS)))
+        timer.timeout.connect(self._collect_nas_test_frame)
+        self._nas_test_timer = timer
+        timer.start()
+
+    def _nas_test_source(self) -> tuple[str, CameraSurface | None]:
+        """Prefer the front camera, then any other camera that is actually streaming."""
+        if self.settings is None:
+            return "", None
+        ordered = sorted(
+            self.settings.active_cameras,
+            key=lambda camera: 0 if camera.role is CameraRole.front else 1,
+        )
+        for camera in ordered:
+            widget = self.camera_widgets.get(camera.role)
+            if widget is None or self._runtime_camera_status.get(camera.id) != "정상 수신":
+                continue
+            if widget.current_frame() is None:
+                continue
+            return camera.id, widget
+        return "", None
+
+    def _collect_nas_test_frame(self) -> None:
+        self._nas_test_ticks += 1
+        widget = getattr(self, "_nas_test_widget", None)
+        frame = widget.current_frame() if widget is not None else None
+        if frame is not None:
+            self._nas_test_frames.append(frame)
+        if self._nas_test_ticks >= max(1, round(NAS_TEST_CLIP_SECONDS * NAS_TEST_CLIP_FPS)):
+            self._finish_nas_test_collection()
+
+    def _finish_nas_test_collection(self) -> None:
+        self._stop_nas_test_timer()
+        self._launch_nas_test_worker()
+
+    def _stop_nas_test_timer(self) -> None:
+        if self._nas_test_timer is not None:
+            self._nas_test_timer.stop()
+            self._nas_test_timer.deleteLater()
+            self._nas_test_timer = None
+
+    def _launch_nas_test_worker(self) -> None:
+        if self.settings is None:
+            self._nas_test_running = False
+            self._refresh_nas_test_button()
+            return
+        thread = QThread(self)
+        worker = NasConnectionTestWorker(
+            self.settings.raw_storage,
+            tuple(self._nas_test_frames),
+            camera_id=self._nas_test_camera_id,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.status_changed.connect(self._set_nas_test_status)
+        worker.result_ready.connect(self._set_nas_test_result)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(lambda worker=worker, thread=thread: self._cleanup_nas_test_worker(thread, worker))
+        self._nas_test_threads.append(thread)
+        self._nas_test_workers.append(worker)
+        thread.start()
+
+    def _set_nas_test_status(self, message: str) -> None:
+        self.warning_label.setText(f"{message}. 진단 전용이며 최종 OK는 차단됩니다.")
+
+    def _set_nas_test_result(self, result: NasConnectionTestResult) -> None:
+        clip = f" · {self._nas_test_camera_id} 영상 {len(self._nas_test_frames)}프레임" if self._nas_test_frames else ""
+        if result.ok:
+            self.instruction_label.setText(f"NAS 연결 확인 성공: {result.remote_dir}")
+            self._set_nas_test_status(f"{result.summary}{clip}")
+        else:
+            self.instruction_label.setText("NAS 연결 확인 실패")
+            self._set_nas_test_status(f"{result.summary} · {result.error}")
+        self._nas_test_frames = []
+        self._nas_test_widget = None
+
+    def _refresh_nas_test_button(self) -> None:
+        button = getattr(self, "nas_test_button", None)
+        if button is not None:
+            button.setEnabled(not self._nas_test_running)
+
+    def _stop_nas_connection_test(self) -> None:
+        self._stop_nas_test_timer()
+        for worker in tuple(self._nas_test_workers):
+            worker.stop()
+
+    def _cleanup_nas_test_worker(self, thread: QThread, worker: NasConnectionTestWorker) -> None:
+        if thread in self._nas_test_threads:
+            self._nas_test_threads.remove(thread)
+        if worker in self._nas_test_workers:
+            self._nas_test_workers.remove(worker)
+        if not self._nas_test_workers:
+            self._nas_test_running = False
+            self._refresh_nas_test_button()
 
     def _start_purpose_inference(self, task_id: str) -> None:
         if self.settings is None:

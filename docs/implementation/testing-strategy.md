@@ -21,6 +21,7 @@ Run on any developer machine:
 - Purpose-specific Hailo pipeline builders for vehicle detection, LPR image tests, and person-presence detection.
 - Fatal Hailo/GStreamer log handling so stuck `gst-launch` processes do not leave the UI loading indefinitely.
 - Daily raw JSONL schema, 0.5-second person sampling, five-second clear tail, completed-day NAS selection, upload retry, and verified 14-day retention.
+- NAS connection-check payload contents, `connectiontest` remote path construction, missing-settings handling, and failure reporting through an injected uploader instead of a live SFTP session.
 - LD2410 split/coalesced binary parsing, malformed-frame recovery, past-only 0.5-second timestamp alignment, freshness/expiry, TCP idle timeout, and client reconnection.
 
 ## UI-Only Tests
@@ -31,6 +32,7 @@ Run without real hardware:
 - The hidden top-right hotspot requires a completed two-second hold and cancels on early release or pointer exit.
 - The visible bottom-right `운영자 모드` button enters operator mode in one press, stays inside the view and clear of the instruction panel and bottom strip at every supported size, and is absent from the operator-mode driver preview.
 - The operator `종료` action is ignored while operator mode is locked, keeps the application running when the confirmation is declined, and never changes `can_show_final_ok`.
+- `NAS 연결 확인` reports missing `SYNOLOGY_NAS_*` settings without contacting the NAS, runs without a camera, collects a two-second clip when a camera is streaming, ignores a second click while running, and keeps final OK blocked for both success and failure results.
 - Every sidebar entry stays reachable through the scrollable menu on a short display.
 - User and operator surfaces switch within the stack instead of appearing together.
 - Sidebar opens and closes.

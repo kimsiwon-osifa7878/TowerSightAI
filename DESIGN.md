@@ -195,6 +195,7 @@ Render overlays in this order:
 - Follows the current PyQt dark industrial HMI direction: collapsible sidebar, persistent NG status, dashboard/all-camera layouts, camera settings, and a telemetry strip.
 - Provides a visible `사용자모드` sidebar action for returning to the driver-facing surface.
 - Provides a `종료` sidebar action that closes the application after an explicit confirmation dialog. Cancelling the dialog changes nothing, and neither outcome alters safety state or emits a PLC event.
+- Provides a `NAS 연결 확인` sidebar action that writes and verifies one test payload under the NAS `connectiontest` folder, including a two-second camera clip when a camera is streaming. The outcome is shown as operator status text only and never alters safety state or emits a PLC event.
 - Keeps the sidebar menu scrollable so a short display can never hide an operator action below the sidebar edge.
 - Owns manual state playback used for UI testing.
 - Never lets fake or simulated input authorize PLC OK.

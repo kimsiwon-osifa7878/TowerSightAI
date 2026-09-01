@@ -205,6 +205,12 @@ towersightai-sync-raw-data --env .env --include-current-day
 
 This storage path is an operational audit/archive function only. Its success or failure does not authorize PLC OK.
 
+To check the NAS write path on site without waiting for a completed day, use the operator sidebar's
+`NAS 연결 확인`. It uploads a summary JSON, plus a two-second camera clip when a camera is streaming, to
+`${SYNOLOGY_NAS_FOLDER}/connectiontest/check-<UTC timestamp>/`, verifies every file by SHA-256 read-back, and
+reports the remote path in the operator status row. These runs are diagnostic artifacts: delete the
+`connectiontest` folder whenever you want, and never treat a pass as safety approval.
+
 ## Run The Operator UI
 
 Start the fullscreen operator console. The script uses the repository `.venv`
@@ -243,6 +249,9 @@ Dashboard behavior:
 - `사람 존재 감지` runs the configured Hailo Apps detector on currently streaming cameras and keeps `person` only.
 - `LD2410` shows the latest 500 ESP32 frames as parsed values plus original hexadecimal bytes, with connection status and display-only pause/clear controls.
 - `차량 진입 시뮬레이션` is UI-only and keeps PLC OK blocked.
+- `NAS 연결 확인` writes a test payload to `${SYNOLOGY_NAS_FOLDER}/connectiontest/check-<UTC timestamp>/` and
+  verifies it by reading it back. When a camera is streaming it also uploads a two-second clip from that
+  camera. It is diagnostic only and keeps PLC OK blocked.
 - `종료` asks for confirmation and then closes the application. It never sends a PLC event.
 - The sidebar scrolls vertically, so every menu entry stays reachable on short displays.
 

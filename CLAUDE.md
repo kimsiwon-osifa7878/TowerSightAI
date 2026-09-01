@@ -101,7 +101,8 @@ towersightai/
 │   ├── raw_data.py            # RawDataManager, PersonWindowSampler, schema v2 JSONL records
 │   ├── hourly_writer.py       # bounded hourly shards + atomic gzip publication
 │   ├── evidence.py            # EvidenceCoordinator: JPEG snapshots + MKV clips for real events
-│   └── archive.py             # manifest v2 (SHA-256 per file) + Synology SFTP atomic upload
+│   ├── archive.py             # manifest v2 (SHA-256 per file) + Synology SFTP atomic upload
+│   └── connection_test.py     # operator NAS write check into <folder>/connectiontest/ (diagnostic only)
 ├── sensors/ld2410.py          # LD2410 binary frame parser, ring buffer, one-client TCP service
 ├── diagnostics.py             # DiagnosticsService: settings/hailo/image/camera/plc/full smoke
 └── runtime_logging.py         # runtime log config, credential redaction, run IDs, run-status files
@@ -233,9 +234,10 @@ One PyQt6 application, two surfaces in a `QStackedWidget`:
 
 Sidebar actions (`SIDEBAR_ACTION_LABELS` in `ui/pyqt_app.py`): `사용자모드`, `전체 카메라`, `카메라 설정`,
 `이전 AI Detection`, `차량 전용 검출`, `번호판 이미지 LPR`, `정면카메라LPR`, `사람 존재 감지`, `LD2410`,
-`차량 진입 시뮬레이션`, `종료`. `종료` closes the application behind `_confirm_shutdown()`; mode and lifecycle
-controls never touch safety state or PLC output. The menu lives in a `QScrollArea` so new entries can never be
-pushed below the sidebar edge.
+`차량 진입 시뮬레이션`, `NAS 연결 확인`, `종료`. `종료` closes the application behind `_confirm_shutdown()`;
+`NAS 연결 확인` runs `storage/connection_test.py` against the NAS `connectiontest` folder. Mode, lifecycle, and
+diagnostic controls never touch safety state or PLC output. The menu lives in a `QScrollArea` so new entries
+can never be pushed below the sidebar edge.
 
 Threading: `CameraCaptureWorker`, `LiveDetectionWorker`, `PurposeInferenceWorker`, `FrontCameraLprWorker` each
 run on a `QThread` and communicate by signals. OpenCV and PyQt imports are lazy so headless tests still run.

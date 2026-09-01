@@ -60,11 +60,20 @@ Current connected entries:
 - `사람 존재 감지`
 - `LD2410`
 - `차량 진입 시뮬레이션`
+- `NAS 연결 확인`
 - `종료`
 
 `사용자모드` returns to the driver-facing surface. `종료` closes the application and must ask for explicit
 confirmation first; a declined confirmation changes nothing. Neither action changes safety state, calibration
 state, or PLC output.
+
+`NAS 연결 확인` writes one throwaway payload to `<SYNOLOGY_NAS_FOLDER>/connectiontest/check-<UTC timestamp>/`
+using the same strict-host-key SFTP, atomic `.part` publication, and SHA-256 read-back verification as the
+operational archive path, so a pass proves the real write path rather than a reachability ping. It always
+uploads a summary JSON carrying `safe_to_operate: false`, and when a camera is streaming it also uploads a
+two-second clip from that camera. Frame collection runs on a UI timer and the encode/upload runs off the UI
+thread. Missing `SYNOLOGY_NAS_*` settings must be reported in the operator status row instead of attempting a
+connection. The result is diagnostic evidence only and never authorizes final OK.
 
 `이전 AI Detection` is a regression-isolation control. It should bypass runtime model selection and launch the previous multistream detection path that uses `HAILO_HEF_PATH`, the shared detection event directory, and the same camera rotation map as the visible UI.
 

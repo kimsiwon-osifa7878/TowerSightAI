@@ -37,13 +37,13 @@ def build_day_manifest(day_dir: Path, day: str) -> dict[str, Any]:
         if not path.is_file() or _excluded(path, day_dir):
             continue
         relative = path.relative_to(day_dir).as_posix()
-        _validate_relative_path(relative)
+        validate_relative_path(relative)
         artifacts.append(
             FileArtifact(
                 relative_path=relative,
                 size_bytes=path.stat().st_size,
                 sha256=sha256_path(path),
-                media_type=_media_type(path),
+                media_type=media_type(path),
             )
         )
     return {
@@ -104,7 +104,7 @@ class ParamikoManifestUploader:
             with client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(60.0)
                 remote_dir = posixpath.join(self.config.nas_folder.rstrip("/"), "raw", day)
-                _mkdirs(sftp, remote_dir)
+                mkdirs(sftp, remote_dir)
                 remote_manifest = _read_remote_json(sftp, posixpath.join(remote_dir, "manifest.json"))
                 remote_hashes = {
                     str(item.get("relative_path")): str(item.get("sha256"))
@@ -115,17 +115,17 @@ class ParamikoManifestUploader:
                     if not isinstance(item, dict):
                         continue
                     relative = str(item["relative_path"])
-                    _validate_relative_path(relative)
+                    validate_relative_path(relative)
                     if remote_hashes.get(relative) == item.get("sha256"):
                         continue
                     local_path = day_dir / PurePosixPath(relative)
                     remote_path = posixpath.join(remote_dir, relative)
-                    _mkdirs(sftp, posixpath.dirname(remote_path))
-                    _upload_atomic_verified(sftp, local_path, remote_path, str(item["sha256"]))
+                    mkdirs(sftp, posixpath.dirname(remote_path))
+                    upload_atomic_verified(sftp, local_path, remote_path, str(item["sha256"]))
                 manifest_bytes = canonical_manifest_bytes(manifest)
                 remote_manifest_path = posixpath.join(remote_dir, "manifest.json")
                 _upload_bytes_atomic(sftp, manifest_bytes, remote_manifest_path)
-                remote_bytes = _read_remote_bytes(sftp, remote_manifest_path)
+                remote_bytes = read_remote_bytes(sftp, remote_manifest_path)
                 if hashlib.sha256(remote_bytes).hexdigest() != hashlib.sha256(manifest_bytes).hexdigest():
                     raise OSError("remote manifest SHA-256 verification failed")
                 return remote_dir
@@ -150,7 +150,7 @@ def _excluded(path: Path, day_dir: Path) -> bool:
     return path.name.endswith(".sealed.jsonl") or bool(path.name.startswith(".manifest.json."))
 
 
-def _media_type(path: Path) -> str:
+def media_type(path: Path) -> str:
     suffixes = "".join(path.suffixes).lower()
     if suffixes.endswith(".jsonl.gz"):
         return "application/x-ndjson+gzip"
@@ -160,18 +160,20 @@ def _media_type(path: Path) -> str:
         return "image/jpeg"
     if path.suffix.lower() == ".mkv":
         return "video/x-matroska"
+    if path.suffix.lower() == ".mp4":
+        return "video/mp4"
     if path.suffix.lower() == ".json":
         return "application/json"
     return "application/octet-stream"
 
 
-def _validate_relative_path(relative: str) -> None:
+def validate_relative_path(relative: str) -> None:
     path = PurePosixPath(relative)
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise ValueError(f"unsafe archive relative path: {relative}")
 
 
-def _mkdirs(sftp: Any, path: str) -> None:
+def mkdirs(sftp: Any, path: str) -> None:
     current = "/" if path.startswith("/") else ""
     for part in PurePosixPath(path).parts:
         if part in {"/", ".", ""}:
@@ -183,7 +185,7 @@ def _mkdirs(sftp: Any, path: str) -> None:
             sftp.mkdir(current)
 
 
-def _upload_atomic_verified(sftp: Any, local_path: Path, remote_path: str, digest: str) -> None:
+def upload_atomic_verified(sftp: Any, local_path: Path, remote_path: str, digest: str) -> None:
     part_path = remote_path + ".part"
     with local_path.open("rb") as source, sftp.file(part_path, "wb") as target:
         while chunk := source.read(1024 * 1024):
@@ -203,7 +205,7 @@ def _upload_bytes_atomic(sftp: Any, payload: bytes, remote_path: str) -> None:
     sftp.posix_rename(part_path, remote_path)
 
 
-def _read_remote_bytes(sftp: Any, path: str) -> bytes:
+def read_remote_bytes(sftp: Any, path: str) -> bytes:
     payload = bytearray()
     with sftp.file(path, "rb") as remote:
         while chunk := remote.read(1024 * 1024):
@@ -221,7 +223,7 @@ def _remote_sha256(sftp: Any, path: str) -> str:
 
 def _read_remote_json(sftp: Any, path: str) -> dict[str, Any]:
     try:
-        payload = json.loads(_read_remote_bytes(sftp, path).decode("utf-8"))
+        payload = json.loads(read_remote_bytes(sftp, path).decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}

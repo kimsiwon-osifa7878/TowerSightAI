@@ -175,12 +175,12 @@ if [[ -n "$WINDOW_ID" ]]; then
   gnome-screenshot -f "$SIMULATION_SCREENSHOT"
   identify "$SIMULATION_SCREENSHOT"
 
-  click_at 150 647
+  click_at 150 697
   gnome-screenshot -f "$DRIVER_TEST_SCREENSHOT"
   identify "$DRIVER_TEST_SCREENSHOT"
 
   # Operator menu exit control. Escape dismisses the confirmation so the app survives.
-  click_at 150 597
+  click_at 150 647
   gnome-screenshot -f "$EXIT_CONFIRM_SCREENSHOT"
   identify "$EXIT_CONFIRM_SCREENSHOT"
   xdotool key --clearmodifiers Escape
