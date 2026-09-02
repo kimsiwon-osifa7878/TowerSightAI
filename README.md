@@ -1,396 +1,185 @@
 # TowerSightAI
 
-TowerSightAI is a safety-first AI monitoring system for a parking machine. It combines four RTSP camera streams, Hailo-8 object detection, conservative state handling, PLC adapter boundaries, and a PyQt6 operator console.
+주차기(기계식 주차 설비) 내부를 4대의 RTSP 카메라와 Hailo-8 AI 가속기로 감시해, 차량 진입·번호판 인식·
+정렬 안내·사람 감지를 수행하고 **모든 안전 조건이 증명될 때만** PLC에 OK를 보내는 시스템입니다.
 
-The current repository is still an implementation prototype, not a production safety release. The core rule is unchanged: unknown, stale, missing, low-confidence, simulated, or unhealthy inputs must block final OK and keep the system in NG/wait.
+현재는 구현 프로토타입 단계입니다. 핵심 규칙은 변하지 않습니다: 불확실하거나, 오래됐거나, 시뮬레이션이거나,
+비정상인 입력은 **항상 최종 OK를 차단**합니다.
 
-## Product Workflow And Display Intent
+이 문서는 **설치·운영·문제 해결 방법** 위주입니다. 개발/에이전트용 문서는 [맨 아래](#개발자에이전트-문서)를 보세요.
 
-TowerSightAI is intended to support the full parking-machine journey without shifting the safety burden to the driver or operator:
+---
 
-```text
-vehicle approach
-  -> parking position guidance
-  -> plate recognition
-  -> driver exit guidance
-  -> parking-machine and in-vehicle person checks
-  -> operation remains blocked until every required safety condition is verified
-```
+## 1. 설치
 
-The installed display has two distinct modes:
+### 요구 스택 (Hailo-8 기준, 버전 고정)
 
-- **User mode** is the default driver-facing guidance surface. It prioritizes edge-to-edge live camera context, one large current instruction, and an unmistakable stop/blocked state. Ceiling birdview alignment is shown only when `BIRDVIEW_MODE=ceiling`.
-- **Operator mode** retains camera inspection, AI diagnostics, settings, and test controls. Development telemetry and model details belong here rather than on the driver-facing screen.
+- Ubuntu 24.04, Python 3.12
+- **HailoRT 4.23.0 + TAPPAS Core 5.1.0 + Hailo Apps 26.03.1** — HailoRT 5.x는 Hailo-10H용이므로 설치 금지
+- 새 장비는 이 가이드를 처음부터 따라가면 됩니다: **[Hailo-8 Ubuntu 설치 가이드](docs/hailo8-ubuntu-installation.md)**
 
-The visual direction for user mode is a near-black automotive surround-view display with a 50%-transparent top instruction overlay, compact bottom status, and prominent red blocking states. The references are a product and visual guide, not proof that any safety function is implemented or validated.
-
-The current implementation covers entry-side camera and Hailo integration only in part. Driver approach, vehicle movement, and exit-complete confirmation during the outbound flow remain future product work and must not be inferred from the current UI.
-
-## Current Status
-
-Implemented:
-
-- Typed `.env` loading and validation for four camera roles: `ceiling`, `front`, `rear_side`, `opposite_side`.
-- RTSP preview pipeline generation with redacted source handling.
-- PyQt6 application that starts in driver-facing user mode and enters the operator dashboard through a hidden two-second hold in the top-right corner.
-- Configurable birdview mode: `disabled` hides and stops the ceiling source, while `ceiling` restores the existing ceiling/front layout.
-- Collapsible sidebar with connected actions and an LD2410 live raw console.
-- Runtime camera capture for active cameras, with disconnected active cameras shown as NG.
-- Hailo installation checks and sample image smoke test using `data/samples/test-car.png`.
-- Hailo callback normalization into JSONL detection events.
-- Live AI inference overlays on camera frames.
-- Live Hailo multistream detection using one GStreamer pipeline:
-
-  ```text
-  RTSP sources -> Hailo Apps multisource pipeline -> buffer callback -> JSONL events -> UI overlays
-  ```
-
-- Bounding-box correction for the difference between source frame resolution and YOLO 640x640 letterboxed inference input.
-- Actual received frame resolution display in each camera tile.
-- Purpose-specific Hailo buttons for vehicle-only detection, LPR image checks, and person-presence detection.
-- Person-presence detection uses the Hailo Apps detector's `person` class only; Re-ID embedding and gallery matching are intentionally not used.
-- Fatal Hailo/GStreamer log detection that stops stuck `gst-launch` processes instead of leaving the UI in a loading state.
-- Fake PLC adapter and state-machine core used by tests.
-- Hourly JSONL raw-data shards for application/AI start, vehicle entry, plate results, raw per-camera detections, and 0.5-second person-presence samples through five seconds after clear. Closed shards are gzip-compressed.
-- Event evidence capture: JPEG snapshots plus H.264-passthrough MKV clips for real vehicle/person events, and a high-quality image for a real plate result. Simulation never creates authoritative evidence.
-- Strict-host-key Synology SFTP synchronization using a versioned, file-level SHA-256 manifest, atomic remote publication, retry markers, and local deletion only after a verified upload is at least 14 days old.
-
-Known gaps:
-
-- Stage-specific AI decisions are not complete: vehicle alignment, plate recognition, person/obstacle safety fusion, and in-vehicle occupancy still need production logic.
-- Calibration editing and validation UI is not implemented yet.
-- Real PLC protocol adapter is not implemented yet.
-- Final OK remains blocked until the missing safety prerequisites are implemented and verified.
-
-## Development Direction
-
-Near-term work is UI-first:
-
-1. Add the operator UI button, status row, panel, or test slot.
-2. Connect it to fake, diagnostic, or simulation behavior that cannot change final OK.
-3. Add UI and fake-data tests.
-4. Connect real camera, Hailo, calibration, AI-stage, or PLC logic.
-
-The LD2410 operator console is diagnostic-only. Viewing, pausing, or clearing it must not change safety state or send PLC events.
-
-## Safety Rules
-
-- Never send PLC OK on camera loss, missing frames, unknown PLC state, invalid calibration, Hailo failure, low confidence, simulated input, or possible human/obstacle presence.
-- Keep deployment-specific values in `.env`; do not commit real RTSP credentials, PLC secrets, or local Hailo install paths.
-- `.env.example` must contain placeholders only.
-- Hardware tests must be opt-in or clearly manual.
-- UI tests and simulations are implementation checks only and do not imply safe operation.
-
-## Install
+### 프로젝트 설치
 
 ```bash
-cd /home/erumtni/TowerSightAI
+cd ~/TowerSightAI
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[ui]" pytest
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e ".[ui]" pytest
 ```
 
-On the Ubuntu/Hailo target, do not install the Developer Zone's unconditional `Latest` runtime. TowerSightAI targets Hailo-8 and uses the officially compatible **HailoRT 4.23.0 + TAPPAS Core 5.1.0** stack. HailoRT 5.x combinations are for Hailo-10H.
+`fast-alpr[onnx]`(번호판 인식, CPU)와 `paramiko`(NAS)가 함께 설치됩니다. 번호판 모델은 최초 1회
+온라인 상태에서 초기화되어 `~/.cache/`에 받아집니다(설치 가이드에 포함).
 
-For a fresh Ubuntu 24.04 installation, follow the guide below from Developer Zone account setup and package selection through selective `yolov8m` download, postprocess compilation, FastALPR preparation, and real Hailo inference verification:
-
-- [Hailo-8 Ubuntu 설치 가이드](docs/hailo8-ubuntu-installation.md)
-
-Runtime defaults are `~/hailo-apps`, Hailo-8 `yolov8m.hef`, and `libyolo_hailortpp_postprocess.so`. Vehicle detection filters the compatible COCO detector to vehicle labels, while person presence filters it to `person`. The legacy `hailopython`, purpose-specific YOLOv5 HEFs, JSON configs, and crop libraries are not active.
-
-### FastALPR Models
-
-`번호판 이미지 인식` does **not** use the TAPPAS `tiny_yolov4_license_plates.hef` or `lprnet.hef` pipeline. The current implementation uses [FastALPR](https://github.com/ankandrew/fast-alpr) on the CPU with:
-
-- Detector: `yolo-v9-t-384-license-plate-end2end`
-- OCR: `cct-xs-v2-global-model`
-
-Installing this project with `python -m pip install -e ".[ui]"` installs `fast-alpr[onnx]`. `FAST_ALPR_DETECTOR_MODEL` and `FAST_ALPR_OCR_MODEL` select the two active FastALPR models. The installation guide initializes FastALPR once while online so both ONNX models are downloaded to the deployment user's cache before the UI is used. This path is independent of Hailo Apps.
-
-Installation and inference checks never authorize PLC OK. If an AI button fails after following the installation guide, inspect:
-
-- `artifacts/runtime/detections/` for previous/general AI detection.
-- `artifacts/runtime/purpose-ai/vehicle_detection/vehicle.gst.log` for vehicle-only detection.
-- `artifacts/runtime/purpose-ai/person_presence/person_presence.gst.log` for person-presence detection.
-- `artifacts/runtime/purpose-ai/lpr_image/lpr.gst.log` for FastALPR image LPR.
-- `artifacts/runtime/purpose-ai/front_camera_lpr/lpr.gst.log` for front-camera snapshot LPR.
-
-### Collect AI Failure Results
-
-Run the operator UI with diagnostic logging enabled:
-
-```bash
-LOG_LEVEL=DEBUG towersightai-operator-ui --env .env
-```
-
-The terminal and `artifacts/runtime/towersightai.log` show each AI run ID, resolved model/config/library paths, process ID, first result, event counts, exit code, and the relevant raw-log path. RTSP credentials are redacted.
-
-Immediately after reproducing a failure, and before launching a different AI task, collect the latest evidence into one text file:
-
-```bash
-# Run this once after pulling the logging update so the new CLI is registered.
-python -m pip install -e ".[ui]"
-
-towersightai-ai-diagnostics --env .env \
-  --output artifacts/runtime/ai-diagnostics.txt
-```
-
-If the console script is not yet on `PATH`, use the equivalent module command:
-
-```bash
-python -m towersightai.cli.ai_diagnostics --env .env \
-  --output artifacts/runtime/ai-diagnostics.txt
-```
-
-The collector does not start a camera, GStreamer pipeline, Hailo inference, or FastALPR inference. It only reads the existing run-status files, JSONL events, log tails, configured resource metadata, executable locations, and FastALPR cache metadata. Missing files are reported as `missing` instead of aborting collection. Send the resulting `artifacts/runtime/ai-diagnostics.txt` when reporting the failure; the `.env` contents and RTSP credentials are not included.
-
-## Environment
-
-Create a site-local `.env` from the placeholder file:
+### 사이트 설정 (.env)
 
 ```bash
 cp .env.example .env
 ```
 
-Important values:
+`.env.example`의 주석을 따라 채우면 됩니다. 특히 주의할 값:
 
-- `HAILO_APPS_WORKSPACE`, `HAILO_APPS_RESOURCES`, `HAILO_APPS_PYTHON`: Hailo Apps checkout, resource tree, and its Python.
-- `TAPPAS_WORKSPACE`: backward-compatible alias; set it to `${HAILO_APPS_WORKSPACE}`.
-- `HAILO_MODEL_DIR`: architecture-specific Hailo Apps model directory.
-- `HAILO_HEF_PATH`, `HAILO_POSTPROCESS_SO`, `HAILO_NETWORK_NAME`: previous/general AI model mapping.
-- `HAILO_VEHICLE_DETECTION_*`: vehicle-task HEF and postprocess mapping.
-- `HAILO_PERSON_PRESENCE_*`: person-task HEF and postprocess mapping.
-- `FAST_ALPR_DETECTOR_MODEL`, `FAST_ALPR_OCR_MODEL`: CPU-side plate detector and OCR model selection.
-- `HAILO_NETWORK_NAME`: defaults to `filter_letterbox` for the current YOLO postprocess.
-- `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, preview RTSP URL, dedicated H.264
-  `CAMERA_N_RECORD_RTSP_URL` (point it at `stream2`: preview and AI inference both hold `stream1`
-  sessions, and Tapo refuses a third `stream1` session with RTSP 400), optional username/password,
-  and `CAMERA_N_ROTATION_DEGREES`.
-- `CALIBRATION_PATH`: calibration JSON path.
-- `PLC_ENDPOINT`: PLC or simulator endpoint.
-- `UI_CAMERA_RESOLUTION`: preview/display capture resolution, for example `1920x1080` or `1280x720`.
-- `BIRDVIEW_MODE`: `disabled` for the current three-camera UI or `ceiling` for the existing ceiling-camera birdview.
-- `LD2410_TCP_*`: enables the one-client ESP32 TCP listener (default `0.0.0.0:9000`), 30-second timestamp buffer, one-second freshness limit, and five-second invalid/idle-client timeout.
-- `RAW_DATA_*`: local archive directory, hourly shard duration, 0.5-second sampling, five-second person-clear tail, Asia/Seoul day boundary, synchronization interval, and 14-day retention.
-- `RAW_MEDIA_*`: snapshot quality/staleness, five-second video pre-roll, vehicle post-roll, recorder segment/clip-part duration, and the system Python containing GStreamer GI.
-- `SYNOLOGY_NAS_*`: SFTP hostname, external port, dedicated account, password, SFTP-visible destination folder, and trusted `known_hosts` file. The host value must not include `https://` or a port.
+- `CAMERA_1..4_*`: ID/역할/RTSP URL/계정/회전. 역할 4종(ceiling, front, rear_side, opposite_side)은
+  모두 있어야 합니다. 천장 카메라 미설치 현장은 `BIRDVIEW_MODE=disabled` + ceiling URL은 접속 불가
+  placeholder(`192.0.2.10` 등)로 두세요.
+- **`CAMERA_N_RECORD_RTSP_URL`은 반드시 `stream2`로.** Tapo 카메라는 스트림당 동시 세션이 2개라,
+  프리뷰와 AI 추론이 stream1을 쓰는 동안 증거 레코더까지 stream1로 붙으면 추론이 RTSP 400으로
+  거부됩니다.
+- `SYNOLOGY_NAS_*`: NAS 업로드 계정. 호스트 키는 아래 §5 참고.
+- 카메라 IP는 공유기에서 **DHCP 고정 예약**을 해두세요. 재부팅 후 IP가 바뀌면 카메라가 NG로 뜹니다.
 
-Camera rotation is part of the equipment configuration. Set `CAMERA_N_ROTATION_DEGREES` to one of `0`, `90`, `180`, or `270`; `90` means CCW 90 degrees and `270` means CW 90 degrees. The default site profile uses `CAMERA_1_ROTATION_DEGREES=90` for the ceiling birdview camera and `0` for the other cameras. The Hailo Apps adapter transforms emitted bounding-box coordinates to the same orientation shown by the operator UI.
+---
 
-The UI displays the actual received frame size in each camera tile, so you can verify whether the configured resolution is being applied.
-
-## Raw Data And NAS Archive
-
-With `RAW_DATA_ENABLED=true`, records are appended to bounded `artifacts/raw/YYYY-MM-DD/events-YYYYMMDD-HHMM.jsonl` shards. A closed shard is atomically published as `.jsonl.gz`. Existing legacy `events.jsonl` files remain readable/uploadable and are not automatically rewritten or deleted.
-
-With `RAW_MEDIA_ENABLED=true`, real vehicle entry saves the front-camera snapshot and a clip covering five seconds before through ten seconds after the event. A real person window saves snapshots and clips from every healthy active camera, covering five seconds before the first detection through the configured clear tail. A real plate result saves the high-quality LPR source image and, when FastALPR supplies a valid bounding box, a separate plate crop; it does not create video. Video is copied from the camera H.264 stream into silent MKV without re-encoding and is capped at five-minute parts. Media bytes are never embedded in JSONL: `media_artifact_created` records store only relative path, byte size, SHA-256, capture time, and metadata. Capture failures are explicit `media_capture_failed` events and do not alter PLC state.
-
-The current day remains local and completed days are uploaded in the background to `${SYNOLOGY_NAS_FOLDER}/raw/YYYY-MM-DD/`. `manifest.json` schema v2 lists every JSONL/gzip/image/video artifact with its relative path, media type, size, and SHA-256. Changed or missing files are uploaded to `.part`, verified, atomically renamed, and the manifest is published last.
-
-The person window starts on the first `person` detection. It records every active camera's latest person state every 0.5 seconds, treats a detection as stale after the configured interval, and continues absence samples for five seconds. When `LD2410_TCP_ENABLED=true`, the application also listens for raw LD2410 binary report frames from one ESP32 client. Each `person_sample` embeds the latest frame received at or before that sample time, including parsed distances/energy/gates and the original hex. Frames up to one second old are `fresh`, older buffered frames are `stale`, and missing frames are `unavailable`; future frames are never selected. LD2410 input is audit-only and cannot affect AI, the state machine, or PLC OK/NG.
-
-The ESP32 should connect to this Ubuntu device's LAN address and `LD2410_TCP_PORT`, then forward complete or chunked LD2410 bytes beginning with `F4 F3 F2 F1` every 0.5 seconds. Reserve the Ubuntu device's address in the router DHCP configuration so the ESP32 target does not change. The listener accepts a reconnect after disconnect and closes a client that produces no valid frame for five seconds.
-
-Failed or unverified uploads are never deleted locally. A local day is deleted recursively only when its exact manifest was verified on NAS and it reaches the configured 14-day age.
-
-Run a completed-day sync manually with:
+## 2. 실행
 
 ```bash
-towersightai-sync-raw-data --env .env
+./run.sh          # 현장 전체화면
+./run-window.sh   # 개발/점검용 창모드
 ```
 
-For an explicit test after stopping every UI/raw writer, seal and upload today's archive immediately with:
+첫 화면은 운전자용 **사용자 화면**입니다. 운영자(개발자) 콘솔 진입 방법 3가지:
+
+1. 우하단 **`운영자 모드` 버튼** (현장 권장)
+2. 우상단 보이지 않는 72×72px 영역을 **2초간 꾹** (조기 release/이탈 시 취소)
+3. 키보드 `Ctrl+Shift+O`
+
+운영자 콘솔에서 `사용자 화면`으로 복귀, `프로그램 종료`(확인창)로 종료합니다.
+
+---
+
+## 3. 운영자 콘솔 사용법
+
+사이드바는 `메뉴` 버튼으로 열고, 세 섹션으로 나뉩니다. 각 항목은 페이지를 열며, 실행 버튼은 페이지
+안에 있습니다. **모든 진단·시뮬레이션은 최종 OK를 절대 허용하지 않습니다.**
+
+### 운영
+| 메뉴 | 하는 일 |
+|---|---|
+| 사용자 화면 | 운전자용 화면으로 복귀 |
+| 주차 프로세스 테스트 | 주차 단계(IDLE→진입→진입완료→번호판인식→주차시작)를 버튼으로 재현. `차량 진입 시뮬레이션` 포함. UI 확인 전용 |
+
+### 진단
+| 메뉴 | 하는 일 |
+|---|---|
+| 전체 카메라 | 활성 카메라 실시간 그리드. `이전 AI Detection`(회귀 격리용 구 경로) 토글 포함 |
+| 차량 감지 | front 카메라에서 Hailo 검출(차량 라벨만). `차량 감지 시작/중지` |
+| 사람 감지 | 수신 중인 모든 카메라에서 person 감지. 박스는 각 타일에 표시 |
+| 번호판 인식 | `정면 카메라 인식`(현재 프레임 1장) / `번호판 이미지 인식`(tmp/car_number-test 일괄). FastALPR(CPU) |
+| 레이더 (LD2410) | ESP32가 보내는 레이더 원시 프레임 콘솔. 표시 전용(안전판정 미사용) |
+| NAS 연결 확인 | NAS `connectiontest/`에 검증 페이로드 기록+SHA-256 재확인. 카메라 수신 중이면 2초 클립 동봉 |
+| 시스템 점검 | 설정/Hailo 설치/샘플 추론/카메라별 프레임/PLC 시뮬레이터 개별 실행, `전체 스모크`는 전부 순차 실행. **Hailo 장치 상태 패널**(60초 자동 갱신) 포함 |
+| 실행 로그 | `towersightai.log` 실시간 tail + 문자열 필터 |
+
+> 실행 중인 AI가 있을 때 다른 AI를 시작하면 **기존 것이 자동 중지되고 새 것이 이어서 시작**됩니다.
+
+### 시스템
+| 메뉴 | 하는 일 |
+|---|---|
+| 카메라 설정 | 카메라별 회전(0/90/180/270) 런타임 변경 |
+| 프로그램 종료 | 확인창 후 앱 종료 |
+
+### 하단 상태줄 읽는 법
+
+`상태 | PLC | 카메라 n/m | 모델 | AI 추론 | HAILO | 증거 | 시각`
+
+- **HAILO 알약**: 초록 `HAILO 정상 65°C` / 노랑 `HAILO 링크오류 +N`(PCIe 오류 증가 — §6 참고) /
+  빨강 `HAILO 오류`(장치 응답 없음). 상세는 시스템 점검 페이지.
+- 카메라 손실, 버드뷰 OFF, PLC UNKNOWN 등 차단 사유는 상단 경고줄에 항상 표시됩니다.
+
+---
+
+## 4. 명령어 (CLI)
 
 ```bash
-towersightai-sync-raw-data --env .env --include-current-day
+pytest -q                                                        # 하드웨어 없이 전체 테스트
+towersightai-check-settings --env .env --health-check-cameras    # 카메라별 1프레임 수신 진단
+towersightai-check-settings --env .env --check-hailo             # Hailo 설치 점검
+towersightai-ai-diagnostics --env .env --output artifacts/runtime/ai-diagnostics.txt   # 장애 증거 수집(읽기 전용)
+towersightai-sync-raw-data --env .env                            # 완료된 날짜 NAS 업로드 수동 실행
+RUN_HARDWARE_TESTS=1 towersightai-hailo-image-smoke --env .env --image data/samples/test-car.png --check-installation --run
 ```
 
-This storage path is an operational audit/archive function only. Its success or failure does not authorize PLC OK.
+자세한 로그가 필요하면 `LOG_LEVEL=DEBUG ./run-window.sh`.
 
-To check the NAS write path on site without waiting for a completed day, use the operator sidebar's
-`NAS 연결 확인`. It uploads a summary JSON, plus a two-second camera clip when a camera is streaming, to
-`${SYNOLOGY_NAS_FOLDER}/connectiontest/check-<UTC timestamp>/`, verifies every file by SHA-256 read-back, and
-reports the remote path in the operator status row. These runs are diagnostic artifacts: delete the
-`connectiontest` folder whenever you want, and never treat a pass as safety approval.
+---
 
-## Run The Operator UI
+## 5. 원격 아카이브(NAS)
 
-Start the fullscreen operator console. The script uses the repository `.venv`
-and `.env` automatically:
+`RAW_DATA_ENABLED=true`면 이벤트가 `artifacts/raw/YYYY-MM-DD/`에 시간별 JSONL로 쌓이고, 완료된 날짜는
+백그라운드로 Synology SFTP(`${SYNOLOGY_NAS_FOLDER}/raw/`)에 업로드됩니다(파일별 SHA-256 검증, 검증된
+업로드 14일 후 로컬 삭제). `RAW_MEDIA_ENABLED=true`면 실제 차량/사람/번호판 이벤트의 스냅샷과 무재인코딩
+H.264 클립도 함께 보관됩니다. **아카이브 성공/실패는 안전 판정과 무관한 감사 기능입니다.**
+
+**새 장비 최초 1회 — NAS 호스트 키 등록** (안 하면 `not found in known_hosts`로 업로드 실패):
 
 ```bash
-./run.sh
+sftp -P 45222 <NAS계정>@<NAS호스트>
 ```
 
-For a normal desktop window:
+지문을 기존 장비와 대조 후 `yes` → 비밀번호 확인 → `exit`. 이후 운영자 콘솔의 `NAS 연결 확인`으로 검증.
 
-```bash
-./run-window.sh
-```
+---
 
-The default entry screen is user mode. Press the `운영자 모드` button in the bottom-right corner to enter the
-operator dashboard; this is the intended on-site entry point. Holding the invisible `72 x 72 px` area in the
-top-right corner for two seconds with a mouse or touch input does the same thing, and releasing early or moving
-outside that area cancels the transition. `Ctrl+Shift+O` remains a service-keyboard fallback.
+## 6. 문제 해결
 
-From operator mode, `사용자 화면` in the sidebar returns to the driver display and `프로그램 종료` closes the application
-after a confirmation dialog. Declining the confirmation leaves the application running. Neither control changes
-safety state or sends a PLC event.
+| 증상 | 원인/조치 |
+|---|---|
+| 카메라 타일이 `NG: 카메라 연결 이상` | ① `--health-check-cameras`로 진단 ② ping으로 IP 확인(DHCP 변경이 최다 원인) ③ Tapo 앱의 "카메라 계정"(RTSP 전용 계정) 확인 |
+| front만 나오고 나머지 안 나옴 (구버전) | 최신 코드로 `git pull` — pip OpenCV의 GStreamer 부재를 전 카메라 FFmpeg 폴백으로 처리함 |
+| AI 시작하자마자 `Bad Request (400)` | 카메라 동시 세션 초과. ① `.env`의 `CAMERA_N_RECORD_RTSP_URL`이 stream2인지 ② **잔존 UI 프로세스**(`pgrep -f operator_ui`)가 세션을 물고 있는지 확인 후 종료 |
+| AI 시작하자마자 `HAILO_DRIVER_OPERATION_FAILED(36)` / HAILO 알약 빨강 | Hailo 장치가 응답하지 않음. `sudo modprobe -r hailo_pci && sudo modprobe hailo_pci` → 안 되면 **콜드 부팅(전원 완전 차단 30초)**, 재발 시 M.2 재장착 |
+| HAILO 알약 노랑 `링크오류 +N` | PCIe 링크 신호 불량 누적(장치 행의 전조). M.2 장착 상태 점검, 지속되면 BIOS에서 해당 슬롯 PCIe Gen3→Gen2 |
+| AI 버튼 오류의 상세 확인 | `실행 로그` 페이지에서 `hailo-health`, `ai-`, `camera-capture` 필터. 파일 로그: `artifacts/runtime/purpose-ai/<task>/…gst.log` |
+| NAS 업로드 실패 | `실행 로그`에서 `raw-data`/`nas` 필터. `not found in known_hosts`면 §5 |
+| 장애 보고 시 | `towersightai-ai-diagnostics` 출력 파일을 전달 (자격증명 미포함) |
 
-Operator console behavior (developer mode):
+---
 
-- User mode fills the display with state-priority cameras and overlays one large driver action at the top.
-- The operator sidebar is grouped into `운영` / `진단` / `시스템` sections and navigates to workspace pages;
-  task run/stop controls live inside their pages. It scrolls vertically so every entry stays reachable.
-- `전체 카메라` is the landing page: the active-camera grid with centered, ratio-correct tiles, plus the
-  `이전 AI Detection` regression-isolation toggle.
-- With `BIRDVIEW_MODE=disabled` the grid shows front plus both side cameras; with `BIRDVIEW_MODE=ceiling`
-  the ceiling birdview joins the grid using its configured rotation. Either way final OK stays blocked.
-- `차량 감지` focuses the front camera and runs the configured Hailo Apps detector with vehicle labels only.
-- `사람 감지` runs the detector on currently streaming cameras and keeps `person` only.
-- `번호판 인식` offers `정면 카메라 인식` (front snapshot) and `이미지 LPR` (`tmp/car_number-test`), both FastALPR
-  on CPU, with the latest result shown on the page.
-- `레이더 (LD2410)` shows the latest 500 ESP32 frames as parsed values plus original hexadecimal bytes, with connection status and display-only pause/clear controls.
-- `NAS 연결 확인` writes a test payload to `${SYNOLOGY_NAS_FOLDER}/connectiontest/check-<UTC timestamp>/` and
-  verifies it by reading it back. When a camera is streaming it also uploads a two-second clip from that
-  camera. It is diagnostic only and keeps PLC OK blocked.
-- `시스템 점검` runs settings/Hailo/camera/PLC diagnostics off the UI thread; every result stays
-  `safe_to_operate=False`. The page also shows a Hailo device-health panel refreshed every 60 s:
-  PCIe presence, driver version, `/dev/hailo0`, chip responsiveness + temperature, and the AER RxErr
-  counter whose growth precedes a hung device. The same health state is always visible as a `HAILO`
-  pill in the status strip (green/amber/red) and is written to `towersightai.log` under
-  `towersightai.hailo.health` — filter the `실행 로그` page with `hailo-health` to see the history.
-- `실행 로그` tails `artifacts/runtime/towersightai.log` with a substring filter and follow mode.
-- `주차 프로세스 테스트` hosts the driver-stage playback buttons and `차량 진입 시뮬레이션`; all of it is UI-only
-  and keeps PLC OK blocked.
-- `프로그램 종료` asks for confirmation and then closes the application. It never sends a PLC event.
+## 7. 안전 규칙 (요약)
 
-Camera preview capture first tries the OpenCV GStreamer backend. When the installed `cv2` was built
-without GStreamer (the pip `opencv-python` wheels are), every active camera falls back to a direct FFmpeg
-RTSP capture; the configured rotation is applied in software on that path. The fallback and each per-camera
-capture state transition are logged under `towersightai.camera.capture` in
-`artifacts/runtime/towersightai.log`, so a camera that never opens is now visible in the log as
-`camera-capture-status ... status=open-failed`.
+- 카메라 손실, 낮은 신뢰도, 미검증 캘리브레이션, PLC 미상, 시뮬레이션 입력, 사람 가능성 → **절대 OK 금지**
+- 진단·테스트 통과는 구현 확인일 뿐 안전 승인이 아님 (`safe_to_operate=False`)
+- 실제 자격증명은 `.env`에만. 로그·화면은 자동 마스킹됨
+- 전체 규칙: [AGENTS.md](AGENTS.md)
 
-Disconnected active cameras remain visible as NG tiles and are not used as inference targets. A disabled birdview is not counted as a failed active camera, but is shown separately as `버드뷰 OFF` and always blocks final OK. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
+---
 
-## Purpose AI Checks
+## 개발자/에이전트 문서
 
-Purpose-specific AI buttons use the current Hailo Apps detection resource set and always keep PLC OK blocked:
+코드를 수정하려는 사람/에이전트는 README가 아니라 아래를 읽으세요:
 
-- `차량 감지`: `HAILO_VEHICLE_DETECTION_HEF_PATH`, defaulting to Hailo-8 `yolov8m.hef`, with vehicle-label filtering.
-- `번호판 이미지 인식`: CPU-side FastALPR with `yolo-v9-t-384-license-plate-end2end` and `cct-xs-v2-global-model`; it does not use the legacy TAPPAS LPR HEFs.
-- `사람 감지`: `HAILO_PERSON_PRESENCE_HEF_PATH`, defaulting to Hailo-8 `yolov8m.hef`, with `person` filtering; it does not run Re-ID embedding, gallery matching, or same-person tracking.
+| 문서 | 내용 |
+|---|---|
+| [CLAUDE.md](CLAUDE.md) | **에이전트 진입점**: 저장소 구조, 안전 게이트 위치, Hailo/GStreamer 런타임, 함정(gotchas) |
+| [INTENT.md](INTENT.md) | 사용자와 합의된 작업 방식, 의사결정 이유, 현장 이력, 미해결 항목 |
+| [AGENTS.md](AGENTS.md) | 안전 규칙, 아키텍처 경계, UI 검증 체크리스트 |
+| [DESIGN.md](DESIGN.md) | 화면 설계 계약 (사용자 화면 시안/네이비, 운영자 콘솔 패널 HMI) |
+| [PLAN.md](PLAN.md) | UI-first 작업 큐 |
+| [docs/주차기_AI_안전감시_시스템_설계안.md](docs/주차기_AI_안전감시_시스템_설계안.md) | 제품 동작 명세 (상태 흐름, PLC 페이로드, 안전 원칙) |
+| [docs/implementation/](docs/implementation/) | 영역별 구현 가이드 (아키텍처/카메라/Hailo/AI 스테이지/UI·캘리브레이션/테스트/로드맵) |
+| [docs/design/](docs/design/) | 승인된 UI 시안 (사용자 화면 프로토타입, 운영 콘솔 시안 A·B) |
 
-Logs are written under `artifacts/runtime/purpose-ai/`. These buttons are implementation and integration checks only; they do not authorize PLC OK.
-
-For regression debugging, `이전 AI Detection` bypasses purpose-specific controls and launches the previous multistream path that uses `HAILO_HEF_PATH`, shared `artifacts/runtime/detections/multistream.jsonl`, and the current UI camera rotation map.
-
-The inference runner watches GStreamer logs for fatal Hailo conditions such as `HAILO_OUT_OF_PHYSICAL_DEVICES`, `Failed to create vdevice`, `CHECK_SUCCESS failed`, and `Caught SIGSEGV`. If one appears, the UI shows an inference error, terminates the process group, and keeps final OK blocked.
-
-Recent hardware checks on the target verified:
-
-```text
-vehicle_detection: 2 events, no errors
-person_presence: 138 events, no errors
-```
-
-If detections disappear after some time, check the relevant log under `artifacts/runtime/purpose-ai/` or `artifacts/runtime/detections/` and confirm the model matches the configured postprocess library and network name.
-
-## Hailo Sample Image Smoke
-
-The sample image smoke test uses:
-
-```text
-data/samples/test-car.png
-```
-
-CLI dry run:
-
-```bash
-towersightai-hailo-image-smoke --env .env --image data/samples/test-car.png --check-installation
-```
-
-Run on the Hailo target:
-
-```bash
-RUN_HARDWARE_TESTS=1 towersightai-hailo-image-smoke \
-  --env .env \
-  --image data/samples/test-car.png \
-  --check-installation \
-  --run
-```
-
-This command is validation only. It never authorizes PLC OK.
-
-## Settings And Camera Checks
-
-```bash
-towersightai-check-settings --env .env
-towersightai-check-settings --env .env --check-hailo
-towersightai-check-settings --env .env --health-check-cameras
-towersightai-check-settings --env .env --preview-cameras --dry-run
-```
-
-The CLI redacts RTSP credentials before printing sources or pipelines.
-
-## UI Screenshot Verification
-
-On the Ubuntu desktop target:
+UI를 바꿨다면 커밋 전에 실제 화면 검증:
 
 ```bash
 WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-verification
 ```
-
-This launches the operator UI, captures the desktop, prints PNG metadata, and exits the app. Generated screenshots under `tmp/` are local verification artifacts and should not be committed.
-
-For UI-centered changes, also verify the main button flows directly in the running UI:
-
-1. Confirm the first screen is the operator dashboard.
-2. Click `메뉴` and confirm the sidebar opens.
-3. Click `전체 카메라` and confirm the four-camera view appears.
-4. Click `사람 감지` and confirm the status strip shows the purpose AI task.
-5. Click `차량 진입 시뮬레이션` and confirm it is visibly test-only.
-6. Click `레이더 (LD2410)` and confirm live parsed values plus HEX appear without changing PLC or safety state.
-7. Confirm simulation and LD2410 console actions do not show final OK.
-
-If a GUI session is unavailable, record that the screenshot/button verification was not run and why. UI screenshot verification is not safety approval and never authorizes PLC OK.
-
-## Tests
-
-```bash
-pytest -q
-```
-
-Current local result:
-
-```text
-51 passed
-```
-
-Unit and UI tests do not require live RTSP cameras, Hailo-8, or PLC hardware.
-
-## Project Layout
-
-```text
-TowerSightAI/
-├── data/samples/                  # sanitized sample images
-├── docs/                          # design and implementation guides
-├── refers/                        # Hailo/GStreamer reference code; do not edit unless requested
-├── tests/                         # hardware-free unit and UI tests
-├── tools/                         # local verification scripts
-└── towersightai/
-    ├── camera/                    # RTSP/GStreamer preview helpers
-    ├── config/                    # typed settings and .env loader
-    ├── inference/                 # Hailo checks, callbacks, smoke tests, live detection
-    ├── plc/                       # PLC adapter boundary and fake adapter
-    ├── state_machine/             # safety state machine
-    └── ui/                        # PyQt6 operator console and UI model
-```
-
-## Development Notes
-
-- Read `AGENTS.md` and the implementation docs before changing safety behavior.
-- Keep `refers/` unchanged unless specifically asked.
-- Add UI-visible controls and tests before connecting new production behavior.

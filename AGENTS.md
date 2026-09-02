@@ -6,6 +6,8 @@ This repository implements TowerSightAI, an AI safety monitoring system for a pa
 
 Read these before implementation work:
 
+- `CLAUDE.md` (repository map, runtime facts, gotchas)
+- `INTENT.md` (agreed working style, decision rationale, open field items)
 - `docs/주차기_AI_안전감시_시스템_설계안.md`
 - `docs/implementation/system-architecture.md`
 - `docs/implementation/camera-and-config.md`

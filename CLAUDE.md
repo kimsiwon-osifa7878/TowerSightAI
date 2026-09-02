@@ -16,11 +16,12 @@ Source-of-truth documents, in priority order:
 
 | File | What it fixes |
 |---|---|
+| `INTENT.md` | Agreed working style with the user, decision rationale, field history, open items |
 | `AGENTS.md` | Agent rules, architecture boundaries, UI verification checklist |
 | `docs/주차기_AI_안전감시_시스템_설계안.md` | Product/behavior spec: flow, states, PLC payloads, safety principles |
 | `DESIGN.md` | Driver (user-mode) display design contract, color tokens, per-state layouts |
 | `PLAN.md` | Current UI-first work queue |
-| `README.md` | Operator manual: install, commands, `.env` keys, raw/NAS archive, troubleshooting |
+| `README.md` | Usage-focused operator manual (Korean): install, run, console pages, troubleshooting |
 | `docs/implementation/*.md` | Per-area guides (architecture, camera/config, hailo, ai-stages, ui/calibration, testing, roadmap) |
 | `docs/hailo8-ubuntu-installation.md` | Verified Ubuntu 24.04 + Hailo-8 install path (Korean) |
 
@@ -34,9 +35,10 @@ RTSP URLs, credentials, or host paths into product code.
   `models/hailo/**` YOLOv5 layout (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`, JSON configs, crop
   `.so`). **That path is dead.** The live stack is Hailo Apps + `yolov8m.hef` with label filtering — see
   `.env.example` and `docs/implementation/hailo-gstreamer.md`.
-- `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs in the expected log
-  content.
-- `README.md` claims "51 passed". Actual current result is **182 passed** (`pytest -q`, ~2 s).
+- `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
+  (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
+  `yolov8m.hef` with label filtering.
+- Current suite size: **225 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -93,7 +95,7 @@ towersightai/
 │   ├── fast_alpr_lpr.py       # CPU FastALPR ONNX plate detection + OCR
 │   └── event_video_recorder.py# H.264 passthrough MKV segment recorder subprocess
 ├── ui/
-│   ├── pyqt_app.py            # OperatorWindow + camera/detection/purpose/LPR QThread workers (~2.8k lines)
+│   ├── pyqt_app.py            # OperatorWindow, workspace pages, camera/detection/purpose/LPR/NAS/health workers (~3.6k lines)
 │   ├── driver_view.py         # DriverView, OperatorEntryHotspot (2 s hold), driver stylesheet
 │   └── model.py               # OperatorDisplayModel / DriverDisplayModel + the safety gate
 ├── state_machine/core.py      # ParkingState enum + ALLOWED transition map
@@ -108,10 +110,10 @@ towersightai/
 ├── diagnostics.py             # DiagnosticsService: settings/hailo/image/camera/plc/full smoke
 └── runtime_logging.py         # runtime log config, credential redaction, run IDs, run-status files
 
-tests/          # 182 hardware-free unit/UI/fake-data tests
+tests/          # 225 hardware-free unit/UI/fake-data tests
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
 data/samples/   # sanitized sample images (test-car.png)
-docs/design/    # towersightai-ui-prototype.html (approved visual contract)
+docs/design/    # approved visual contracts (driver prototype, operator console proposals A/B)
 artifacts/      # runtime logs, detections, raw JSONL/media  (gitignored)
 models/, tmp/   # gitignored
 ```
@@ -284,7 +286,7 @@ authorize, or influence the safety gate, AI, or the state machine.
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 182 passed, hardware-free
+pytest -q                                     # 225 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed
@@ -337,32 +339,26 @@ verification is implementation verification only — never product safety approv
 
 ## 11. Status and next work
 
-Implemented: typed config + `.env` loading and validation; RTSP preview pipelines with rotation and redaction;
-PyQt6 user/operator surfaces with the 2 s hidden operator gesture; runtime camera capture and NG tiles; Hailo
-installation checks and sample-image smoke; Hailo Apps multistream live detection with JSONL normalization,
-overlays, letterbox bbox correction, fatal-log handling and supervised restart; purpose AI tasks (vehicle,
-person-presence, image LPR, front-camera LPR); LD2410 TCP console; hourly raw JSONL + media evidence +
-verified Synology SFTP archive with retention; fake/simulator PLC adapters and the transition-only state machine.
+Implemented: typed config + `.env` loading; RTSP preview with rotation/redaction and an all-camera FFmpeg
+fallback (pip cv2 has no GStreamer); PyQt6 driver surface + the proposal-B developer console (sectioned
+sidebar, workspace pages, shared camera grid); Hailo Apps multistream + purpose tasks (차량/사람 감지,
+번호판 인식) with letterbox bbox correction, fatal-log handling, child-exit retry, and automatic
+task-to-task switching; Hailo device-health monitor (pill + 시스템 점검 panel +
+`towersightai.hailo.health` log); DiagnosticsService wired to the 시스템 점검 page; runtime-log viewer;
+NAS connection check; LD2410 console; hourly raw JSONL + media evidence + verified Synology SFTP archive;
+fake/simulator PLC adapters and the transition-only state machine.
 
-Open gaps (roughly `PLAN.md` order):
+Open gaps (see `INTENT.md` §5 for immediate field items and `PLAN.md` for the queue):
 
 1. Centralize the final-OK prerequisites in one safety gate shared by UI and PLC paths.
-2. Stage AI decisions: alignment/parking-position, plate handling, person + obstacle fusion across healthy
-   cameras, in-vehicle occupancy (all behind interfaces).
-3. Calibration workflow — no module or UI yet: per-camera lane centerline, boundaries, stop zone, danger/cabin
-   ROIs, tolerances, versioned JSON with normalized coordinates, explicit review/activation; missing, invalid,
-   or unreviewed calibration blocks final OK.
+2. Stage AI decisions: alignment/parking-position, plate handling, person + obstacle fusion, in-vehicle
+   occupancy (all behind interfaces).
+3. Calibration workflow — no module or UI yet; missing/invalid/unreviewed calibration must block final OK.
 4. Real PLC adapter behind the existing boundary, with event-ordering tests.
-5. Per-camera preview-health vs inference-health separation, last-detection timestamps, `AI stale` /
-   `AI no events` display, GStreamer stderr tail in the UI log.
-6. Stage simulation / fake event playback controls, clearly marked test-only.
-7. Field hardening: watchdogs, deployment runbook, log rotation, structured safety audit traces, site
-   acceptance checklist driven from the operator test hub.
+5. Field hardening: watchdogs, deployment runbook, structured safety audit traces.
 
-Outbound flow (driver approach, vehicle movement, exit-complete confirmation) is a **future concept** — it has
-no state, AI, or PLC contract yet and must not be inferred from the UI or the ParkIO reference material.
-
----
+Outbound flow (driver approach, vehicle movement, exit-complete confirmation) is a **future concept** — no
+state, AI, or PLC contract exists for it yet.
 
 ## 12. Gotchas
 
@@ -385,4 +381,9 @@ no state, AI, or PLC contract yet and must not be inferred from the UI or the Pa
   `towersightai.camera.capture`. `check-settings --health-check-cameras` uses the system `gst-launch-1.0`
   subprocess, so it can pass even when the in-process GStreamer backend is unavailable.
 - `artifacts/`, `models/`, `tmp/`, `gstshark_*/`, `hailort*.log`, and `.env` are gitignored — never add them.
+- A leftover `operator_ui` process (e.g. a verify-script launch that survived SIGTERM) keeps camera RTSP
+  sessions and starves later inference with RTSP 400. `pgrep -f operator_ui` before diagnosing "inference
+  suddenly fails"; the verify script now force-kills after 10 s.
+- pyhailort: a temporary `Device()` is treated as released before `.control` is used — hold it in a
+  variable and `device.release()` (see `hailo_health.make_subprocess_temp_probe`).
 - Korean UI strings are part of the contract; keep the exact labels tests assert on.
