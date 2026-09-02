@@ -256,7 +256,11 @@ Operator console behavior (developer mode):
   verifies it by reading it back. When a camera is streaming it also uploads a two-second clip from that
   camera. It is diagnostic only and keeps PLC OK blocked.
 - `시스템 점검` runs settings/Hailo/camera/PLC diagnostics off the UI thread; every result stays
-  `safe_to_operate=False`.
+  `safe_to_operate=False`. The page also shows a Hailo device-health panel refreshed every 60 s:
+  PCIe presence, driver version, `/dev/hailo0`, chip responsiveness + temperature, and the AER RxErr
+  counter whose growth precedes a hung device. The same health state is always visible as a `HAILO`
+  pill in the status strip (green/amber/red) and is written to `towersightai.log` under
+  `towersightai.hailo.health` — filter the `실행 로그` page with `hailo-health` to see the history.
 - `실행 로그` tails `artifacts/runtime/towersightai.log` with a substring filter and follow mode.
 - `주차 프로세스 테스트` hosts the driver-stage playback buttons and `차량 진입 시뮬레이션`; all of it is UI-only
   and keeps PLC OK blocked.

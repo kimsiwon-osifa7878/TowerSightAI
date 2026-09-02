@@ -74,6 +74,7 @@ towersightai/
 │   └── preview.py             # health-check pipeline, run_camera_health_check, launch_camera_previews
 ├── inference/
 │   ├── hailo_apps_runtime.py  # ACTIVE: command + env for the Hailo Apps subprocess, VEHICLE/PERSON labels
+│   ├── hailo_health.py        # 60s device health: PCIe/driver/node/chip-response/AER RxErr → log + UI
 │   ├── live_detection.py      # LiveDetectionRunner: multistream run, JSONL tail, fatal-log watch, restart
 │   ├── purpose_tasks.py       # PurposeInferenceRunner + vehicle / lpr_image / person_presence tasks
 │   ├── callback.py            # Hailo buffer callback → normalized JSONL detection events
@@ -239,7 +240,7 @@ driver view (`cover`) stays chromeless cyan/navy.
 
 Workspace pages: `전체 카메라` (landing; camera grid + `이전 AI Detection` toggle), `차량 감지`, `사람 감지`,
 `번호판 인식` (정면 카메라 인식 + 이미지 LPR), `레이더 (LD2410)`, `NAS 연결 확인` (`storage/connection_test.py`),
-`시스템 점검` (DiagnosticsService off-thread), `실행 로그` (runtime log tail + filter), `주차 프로세스 테스트`
+`시스템 점검` (DiagnosticsService off-thread + Hailo 장치 상태 패널), `실행 로그` (runtime log tail + filter), `주차 프로세스 테스트`
 (driver-stage playback + `차량 진입 시뮬레이션`). Camera pages share ONE camera grid
 (`operator_camera_area`) that `_adopt_camera_area` reparents into the active page with an `all` or `front`
 layout. Task run/stop buttons live on the pages, not in the sidebar; `프로그램 종료` sits behind

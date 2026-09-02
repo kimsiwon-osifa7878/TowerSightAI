@@ -62,8 +62,11 @@ run/stop controls (`차량 감지 시작`, `사람 감지 시작`, `정면 카�
 `이전 AI Detection` on the camera page, and the driver-stage buttons plus `차량 진입 시뮬레이션` on the
 user-screen test page). `시스템 점검` runs DiagnosticsService tests (settings, Hailo installation, sample
 image, per-camera frames, PLC simulator, full smoke) off the UI thread with results appended to a page log;
-every result stays `safe_to_operate=False`. `실행 로그` tails `artifacts/runtime/towersightai.log` with a substring
-filter and follow mode.
+every result stays `safe_to_operate=False`, and the page shows a Hailo device-health panel (PCIe/driver/
+device-node/chip-response/temperature/AER RxErr trend) refreshed every 60 s off the UI thread; the same
+state appears as a `HAILO` telemetry pill on every page and is logged under `towersightai.hailo.health`.
+Device health is diagnostic telemetry only and never relaxes final OK. `실행 로그` tails
+`artifacts/runtime/towersightai.log` with a substring filter and follow mode.
 
 `사용자 화면` returns to the driver-facing surface. `프로그램 종료` closes the application and must ask for explicit
 confirmation first; a declined confirmation changes nothing. Neither action changes safety state, calibration

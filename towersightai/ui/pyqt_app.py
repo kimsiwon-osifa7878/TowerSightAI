@@ -24,6 +24,12 @@ from towersightai.inference.purpose_tasks import (
 )
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
 from towersightai.diagnostics import DiagnosticResult, DiagnosticsService, DiagnosticStatus
+from towersightai.inference.hailo_health import (
+    HailoHealthSnapshot,
+    collect_hailo_health,
+    log_hailo_health,
+    make_subprocess_temp_probe,
+)
 from towersightai.runtime_logging import DEFAULT_RUNTIME_LOG, new_run_id
 from towersightai.state_machine.core import ParkingState
 from towersightai.sensors.ld2410 import LD2410Frame, LD2410TCPService
@@ -68,6 +74,7 @@ SIDEBAR_SECTIONS = (
 )
 SIDEBAR_ACTION_LABELS = tuple(label for _section, labels in SIDEBAR_SECTIONS for label in labels)
 LD2410_CONSOLE_MAX_LINES = 500
+HAILO_HEALTH_INTERVAL_SECONDS = 60
 LOG_VIEW_TAIL_BYTES = 64 * 1024
 LOG_VIEW_MAX_LINES = 1200
 NAS_TEST_CLIP_SECONDS = 2.0
@@ -822,6 +829,49 @@ class NasConnectionTestWorker(QObject):
         return path
 
 
+class HailoHealthWorker(QObject):
+    """Collect Hailo device health every HAILO_HEALTH_INTERVAL_SECONDS off the UI thread.
+
+    Diagnostic telemetry only — snapshots inform the operator and the runtime log,
+    never the safety gate.
+    """
+
+    snapshot_ready = pyqtSignal(object)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        interval_seconds: int = HAILO_HEALTH_INTERVAL_SECONDS,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.interval_seconds = max(5, int(interval_seconds))
+        self._running = True
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        temp_probe = make_subprocess_temp_probe(self.settings.hailo_apps_python)
+        previous: HailoHealthSnapshot | None = None
+        while self._running:
+            snapshot = collect_hailo_health(
+                temp_probe=temp_probe,
+                previous_rxerr=previous.rxerr_count if previous is not None else None,
+            )
+            log_hailo_health(snapshot, previous=previous)
+            self.snapshot_ready.emit(snapshot)
+            previous = snapshot
+            for _ in range(self.interval_seconds):
+                if not self._running:
+                    break
+                QThread.sleep(1)
+        self.finished.emit()
+
+
 class DiagnosticsWorker(QObject):
     """Run one DiagnosticsService test off the UI thread. Results never authorize OK."""
 
@@ -949,6 +999,9 @@ class OperatorWindow(QMainWindow):
         self._system_test_threads: list[QThread] = []
         self._system_test_workers: list[QObject] = []
         self._system_test_running = False
+        self._hailo_health_threads: list[QThread] = []
+        self._hailo_health_workers: list[HailoHealthWorker] = []
+        self._hailo_health_snapshot: HailoHealthSnapshot | None = None
         self.clock_label = QLabel()
         self.setWindowTitle("TowerSightAI Operator Console")
         self.setStyleSheet(_stylesheet())
@@ -959,6 +1012,7 @@ class OperatorWindow(QMainWindow):
         if self.settings is not None:
             self._start_camera_capture()
             self._start_raw_data_collection()
+            self._start_hailo_health_monitor()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(1000)
@@ -991,6 +1045,7 @@ class OperatorWindow(QMainWindow):
         self._stop_purpose_inference()
         self._stop_front_camera_lpr()
         self._stop_nas_connection_test()
+        self._stop_hailo_health_monitor()
         for thread in self._detection_threads:
             thread.quit()
             thread.wait(5000)
@@ -1006,6 +1061,9 @@ class OperatorWindow(QMainWindow):
         for thread in self._system_test_threads:
             thread.quit()
             thread.wait(35000)
+        for thread in self._hailo_health_threads:
+            thread.quit()
+            thread.wait(15000)
         if self._ld2410_service is not None:
             self._ld2410_service.stop()
             self._ld2410_service = None
@@ -1448,8 +1506,9 @@ class OperatorWindow(QMainWindow):
         self.camera_summary_label = QLabel()
         self.model_status_label = QLabel("모델 선택: 없음")
         self.ai_detection_label = QLabel("AI 추론 OFF")
+        self.hailo_status_label = QLabel("HAILO 확인 중")
         self.evidence_status_label = QLabel("증거 OFF")
-        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.evidence_status_label, self.clock_label):
+        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.hailo_status_label, self.evidence_status_label, self.clock_label):
             label.setObjectName("telemetryLabel")
             # Runtime inference text can become very long. Ignore its natural
             # width so the hidden operator page cannot enlarge the shared
@@ -1644,6 +1703,11 @@ class OperatorWindow(QMainWindow):
             camera_controls.addWidget(button)
         camera_controls.addStretch(1)
         body.addLayout(camera_controls)
+        self.hailo_health_label = QLabel("Hailo 장치 상태: 수집 대기 중 (60초 주기 자동 갱신)")
+        self.hailo_health_label.setObjectName("pageStatusLabel")
+        self.hailo_health_label.setWordWrap(True)
+        self.hailo_health_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body.addWidget(self.hailo_health_label)
         self.system_test_log = QPlainTextEdit()
         self.system_test_log.setObjectName("testLog")
         self.system_test_log.setReadOnly(True)
@@ -1817,6 +1881,37 @@ class OperatorWindow(QMainWindow):
         self.operator_camera_area.show()
         self.grid.invalidate()
         self.grid.activate()
+
+    def _start_hailo_health_monitor(self) -> None:
+        if self.settings is None:
+            return
+        thread = QThread(self)
+        worker = HailoHealthWorker(self.settings)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.snapshot_ready.connect(self._set_hailo_health)
+        worker.finished.connect(thread.quit)
+        self._hailo_health_threads.append(thread)
+        self._hailo_health_workers.append(worker)
+        thread.start()
+
+    def _stop_hailo_health_monitor(self) -> None:
+        for worker in tuple(self._hailo_health_workers):
+            worker.stop()
+
+    def _set_hailo_health(self, snapshot: HailoHealthSnapshot) -> None:
+        self._hailo_health_snapshot = snapshot
+        if hasattr(self, "hailo_status_label"):
+            self.hailo_status_label.setText(snapshot.pill_text)
+            if self.hailo_status_label.property("hailo") != snapshot.status:
+                self.hailo_status_label.setProperty("hailo", snapshot.status)
+                self.hailo_status_label.style().unpolish(self.hailo_status_label)
+                self.hailo_status_label.style().polish(self.hailo_status_label)
+        if hasattr(self, "hailo_health_label"):
+            stamp = snapshot.checked_at.astimezone().strftime("%H:%M:%S")
+            self.hailo_health_label.setText(
+                f"Hailo 장치 상태 ({stamp} 기준)\n" + "\n".join(snapshot.detail_lines())
+            )
 
     def _run_system_test(self, test_id: str) -> None:
         if not self._operator_unlocked:
@@ -3434,6 +3529,21 @@ def _stylesheet() -> str:
     }
     #statusStrip {
         background: transparent;
+    }
+    #telemetryLabel[hailo="ok"] {
+        color: #A7E9C9;
+        border-color: #2E9E6B;
+        background: #0D2A1D;
+    }
+    #telemetryLabel[hailo="degraded"] {
+        color: #FBEFC9;
+        border-color: #B98A2C;
+        background: #2B230E;
+    }
+    #telemetryLabel[hailo="error"] {
+        color: #FFD9DB;
+        border-color: #B93A44;
+        background: #2A0F13;
     }
     QPushButton {
         min-height: 38px;

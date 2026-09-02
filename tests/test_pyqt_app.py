@@ -2090,3 +2090,65 @@ def test_purpose_run_buttons_use_start_stop_wording(monkeypatch):
     assert vehicle.text() == "차량 감지 중지"
     assert window.purpose_task_buttons[PURPOSE_PERSON_PRESENCE].text() == "사람 감지 시작"
     window.close()
+
+
+def test_hailo_health_snapshot_updates_pill_and_system_panel(monkeypatch):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    from towersightai.inference.hailo_health import HailoHealthSnapshot
+
+    settings = _settings()
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    assert window.hailo_status_label.text() == "HAILO 확인 중"
+
+    window._set_hailo_health(
+        HailoHealthSnapshot(
+            status="ok",
+            summary="정상",
+            pcie_address="0000:02:00.0",
+            driver_loaded=True,
+            driver_version="4.23.0",
+            device_node_exists=True,
+            rxerr_count=0,
+            chip_temperature_c=47.2,
+        )
+    )
+    assert window.hailo_status_label.text() == "HAILO 정상 47°C"
+    assert window.hailo_status_label.property("hailo") == "ok"
+    assert "4.23.0" in window.hailo_health_label.text()
+
+    window._set_hailo_health(
+        HailoHealthSnapshot(
+            status="error",
+            summary="장치가 제어 요청에 응답하지 않습니다",
+            pcie_address="0000:02:00.0",
+            driver_loaded=True,
+            device_node_exists=True,
+            detail="HAILO_DRIVER_OPERATION_FAILED(36) · 콜드 부팅(전원 완전 차단)이 필요할 수 있습니다.",
+        )
+    )
+    assert window.hailo_status_label.text() == "HAILO 오류"
+    assert window.hailo_status_label.property("hailo") == "error"
+    assert "콜드 부팅" in window.hailo_health_label.text()
+    # 건강 스냅샷은 진단 정보일 뿐 안전 게이트를 열지 못한다.
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_hailo_health_worker_starts_only_with_settings(monkeypatch):
+    _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _settings()
+    with_settings = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    assert len(with_settings._hailo_health_workers) == 1
+    with_settings.close()
+
+    without_settings = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    )
+    assert without_settings._hailo_health_workers == []
+    without_settings.close()

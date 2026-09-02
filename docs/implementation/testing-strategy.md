@@ -21,6 +21,9 @@ Run on any developer machine:
 - Purpose-specific Hailo pipeline builders for vehicle detection, LPR image tests, and person-presence detection.
 - Fatal Hailo/GStreamer log handling so stuck `gst-launch` processes do not leave the UI loading indefinitely.
 - Daily raw JSONL schema, 0.5-second person sampling, five-second clear tail, completed-day NAS selection, upload retry, and verified 14-day retention.
+- Hailo device-health snapshots: fake-sysfs collection (missing PCIe device, unloaded driver, hung chip
+  with the cold-boot hint, RxErr growth degradation), pill/panel rendering, and the rule that health
+  output never changes `can_show_final_ok`.
 - NAS connection-check payload contents, `connectiontest` remote path construction, missing-settings handling, and failure reporting through an injected uploader instead of a live SFTP session.
 - LD2410 split/coalesced binary parsing, malformed-frame recovery, past-only 0.5-second timestamp alignment, freshness/expiry, TCP idle timeout, and client reconnection.
 
