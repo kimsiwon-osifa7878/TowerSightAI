@@ -100,3 +100,12 @@ def test_wheel_guides_default_is_a_narrowing_trapezoid():
 def test_unknown_upload_mode_rejected():
     with pytest.raises(ValueError):
         OperatorRuntimeSettings(nas_upload_mode="sometimes")
+
+
+def test_audio_enabled_defaults_true_and_round_trips(tmp_path: Path):
+    assert OperatorRuntimeSettings().audio_enabled is True
+    off = settings_from_payload({"audio_enabled": False})
+    assert off.audio_enabled is False
+    path = tmp_path / "s.json"
+    save_operator_settings(off, path)
+    assert load_operator_settings(path).audio_enabled is False

@@ -167,6 +167,7 @@ class OperatorRuntimeSettings:
     alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
     timers: ProcessTimerSettings = field(default_factory=ProcessTimerSettings)
     nas_upload_mode: str = "scheduled"
+    audio_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.nas_upload_mode not in NAS_UPLOAD_MODES:
@@ -196,6 +197,7 @@ def settings_from_payload(payload: Mapping[str, Any]) -> OperatorRuntimeSettings
     never fail should use load_operator_settings instead.
     """
     nas_upload_mode = payload.get("nas_upload_mode", "scheduled")
+    audio_enabled = payload.get("audio_enabled", True)
     return OperatorRuntimeSettings(
         vehicle_trigger=_build_section(VehicleTriggerSettings, _section(payload, "vehicle_trigger")),
         person_debounce=_build_section(PersonDebounceSettings, _section(payload, "person_debounce")),
@@ -204,6 +206,7 @@ def settings_from_payload(payload: Mapping[str, Any]) -> OperatorRuntimeSettings
         alignment=_build_section(AlignmentSettings, _section(payload, "alignment")),
         timers=_build_section(ProcessTimerSettings, _section(payload, "timers")),
         nas_upload_mode=nas_upload_mode if isinstance(nas_upload_mode, str) else "scheduled",
+        audio_enabled=bool(audio_enabled),
     )
 
 

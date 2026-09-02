@@ -2313,3 +2313,29 @@ def test_camera_surface_guide_overlay_and_plate_line_render():
     surface.set_plate_line(None)
     assert surface._guide_overlay is None
     assert surface._plate_line is None
+
+
+def test_audio_toggle_gates_the_warning_cue(tmp_path: Path, monkeypatch):
+    import towersightai.ui.pyqt_app as pyqt_app
+
+    monkeypatch.setattr(pyqt_app, "OPERATOR_SETTINGS_PATH", tmp_path / "operator-settings.json")
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    played: list[str] = []
+    monkeypatch.setattr(window, "_play_audio_cue", lambda cue: played.append(cue))
+
+    # audio ON by default → cue plays
+    window.process_settings_inputs["audio_enabled"].setChecked(True)
+    window._save_process_settings()
+    window._apply_engine_output(pyqt_app.EngineOutput(public_state=ParkingState.HUMAN_DETECTED, phase="exit_person_warning", audio_cue="exit_warning"))
+    assert played == ["exit_warning"]
+
+    # audio OFF → cue suppressed
+    played.clear()
+    window.process_settings_inputs["audio_enabled"].setChecked(False)
+    window._save_process_settings()
+    assert window.operator_settings.audio_enabled is False
+    window._apply_engine_output(pyqt_app.EngineOutput(public_state=ParkingState.HUMAN_DETECTED, phase="exit_person_warning", audio_cue="exit_warning"))
+    assert played == []
+    window.close()

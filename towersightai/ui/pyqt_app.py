@@ -2079,6 +2079,9 @@ class OperatorWindow(QMainWindow):
         self.process_settings_inputs["nas_upload_mode"] = upload_box
         form.addWidget(QLabel("NAS 업로드 방식"), 5, 4)
         form.addWidget(upload_box, 5, 5)
+        audio_box = QCheckBox("경고음 사용 (사람 감지 시)")
+        self.process_settings_inputs["audio_enabled"] = audio_box
+        form.addWidget(audio_box, 6, 0, 1, 2)
         body.addLayout(form)
 
         self.process_settings_status = QLabel(f"설정 파일: {OPERATOR_SETTINGS_PATH}")
@@ -2122,19 +2125,25 @@ class OperatorWindow(QMainWindow):
         if isinstance(upload_box, QComboBox):
             index = upload_box.findData(settings.nas_upload_mode)
             upload_box.setCurrentIndex(max(0, index))
+        audio_box = self.process_settings_inputs.get("audio_enabled")
+        if isinstance(audio_box, QCheckBox):
+            audio_box.setChecked(settings.audio_enabled)
         self._update_settings_preview_overlays()
 
     def _process_settings_payload(self) -> dict[str, object]:
         payload: dict[str, dict[str, object]] = {}
         for key, widget in self.process_settings_inputs.items():
-            if key == "nas_upload_mode":
+            if key in ("nas_upload_mode", "audio_enabled"):
                 continue
             section, field = key.split(".", 1)
             payload.setdefault(section, {})[field] = widget.value()  # type: ignore[union-attr]
-        upload_box = self.process_settings_inputs.get("nas_upload_mode")
         result: dict[str, object] = dict(payload)
+        upload_box = self.process_settings_inputs.get("nas_upload_mode")
         if isinstance(upload_box, QComboBox):
             result["nas_upload_mode"] = upload_box.currentData()
+        audio_box = self.process_settings_inputs.get("audio_enabled")
+        if isinstance(audio_box, QCheckBox):
+            result["audio_enabled"] = audio_box.isChecked()
         return result
 
     def _save_process_settings(self) -> None:
@@ -2503,7 +2512,7 @@ class OperatorWindow(QMainWindow):
             self._start_periodic_lpr()
         elif output.lpr_control == "stop":
             self._stop_periodic_lpr()
-        if output.audio_cue:
+        if output.audio_cue and self.operator_settings.audio_enabled:
             self._play_audio_cue(output.audio_cue)
 
         phase_text = f"프로세스 {output.phase}"
