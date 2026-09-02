@@ -17,12 +17,22 @@ from towersightai.inference.purpose_tasks import (
     PlateOcrEvent,
     PURPOSE_LPR_IMAGE,
     PURPOSE_PERSON_PRESENCE,
+    PURPOSE_PROCESS_MONITORING,
     PURPOSE_TASK_SPECS,
     PURPOSE_VEHICLE_DETECTION,
     PurposeInferenceRunner,
     build_purpose_process,
 )
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
+from towersightai.plc.adapter import FakePLCAdapter
+from towersightai.process.engine import EngineOutput, ParkingProcessEngine
+from towersightai.process.settings_store import (
+    DEFAULT_SETTINGS_PATH as OPERATOR_SETTINGS_PATH,
+    OperatorRuntimeSettings,
+    load_operator_settings,
+    save_operator_settings,
+    settings_from_payload,
+)
 from towersightai.diagnostics import DiagnosticResult, DiagnosticsService, DiagnosticStatus
 from towersightai.inference.hailo_health import (
     HailoHealthSnapshot,
@@ -56,7 +66,7 @@ PERSON_ALERT_STALE_SECONDS = 3.0
 # Operator mode is the developer console. The sidebar is grouped into sections; every
 # entry either navigates to a workspace page or performs a mode/lifecycle action.
 SIDEBAR_SECTIONS = (
-    ("운영", ("사용자 화면", "주차 프로세스 테스트")),
+    ("운영", ("사용자 화면", "감시 설정", "주차 프로세스 테스트")),
     (
         "진단",
         (
@@ -87,11 +97,14 @@ try:
     from PyQt6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QComboBox,
+        QDoubleSpinBox,
         QFrame,
         QGridLayout,
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QSpinBox,
         QMainWindow,
         QMessageBox,
         QPlainTextEdit,
@@ -124,6 +137,9 @@ class CameraSurface(QFrame):
         self._detections: tuple[DetectionEvent, ...] = ()
         self._frame_size_text = ""
         self._vehicle_simulation = False
+        # (bottom_left_x, bottom_right_x, top_left_x, top_right_x, top_y, stop_y), all normalized
+        self._guide_overlay: tuple[float, float, float, float, float, float] | None = None
+        self._plate_line: float | None = None
         # Pixels reserved at the bottom for an overlay that covers the tile, such as the
         # driver bottom strip. Operator layouts keep this at 0.
         self.bottom_inset = 0
@@ -155,6 +171,24 @@ class CameraSurface(QFrame):
 
     def set_vehicle_simulation(self, enabled: bool) -> None:
         self._vehicle_simulation = enabled
+        self.update()
+
+    def set_guide_overlay(self, guides: tuple[float, float, float, float, float, float] | None) -> None:
+        """Trapezoidal wheel guides on the front camera.
+
+        ``guides`` = (bottom_left_x, bottom_right_x, top_left_x, top_right_x,
+        top_y, stop_y), all normalized. Wide at the bottom, narrow at the top.
+        """
+        if guides == self._guide_overlay:
+            return
+        self._guide_overlay = guides
+        self.update()
+
+    def set_plate_line(self, y_norm: float | None) -> None:
+        """Plate-zone boundary preview. Operator settings page only, never the driver view."""
+        if y_norm == self._plate_line:
+            return
+        self._plate_line = y_norm
         self.update()
 
     def set_display_mode(self, mode: str) -> None:
@@ -257,6 +291,58 @@ class CameraSurface(QFrame):
                 painter.setPen(QPen(vehicle_color, 3))
                 painter.drawRect(vehicle_rect)
                 painter.drawText(vehicle_rect.adjusted(6, 4, -6, -4), Qt.AlignmentFlag.AlignTop, "차량 접근")
+
+        if self._guide_overlay is not None:
+            bottom_left, bottom_right, top_left, top_right, top_y, stop_y = self._guide_overlay
+            guide_color = QColor("#F5A623")
+
+            def guide_point(x_norm: float, y_norm: float) -> tuple[int, int]:
+                return (
+                    image_rect.left() + int(image_rect.width() * x_norm),
+                    image_rect.top() + int(image_rect.height() * y_norm),
+                )
+
+            def guide_x_at(y_norm: float) -> tuple[int, int]:
+                # Interpolate the two trapezoid sides at height y (top_y..1.0).
+                span = max(1e-6, 1.0 - top_y)
+                frac = min(1.0, max(0.0, (1.0 - y_norm) / span))
+                left = bottom_left + (top_left - bottom_left) * frac
+                right = bottom_right + (top_right - bottom_right) * frac
+                return (
+                    image_rect.left() + int(image_rect.width() * left),
+                    image_rect.left() + int(image_rect.width() * right),
+                )
+
+            bl = guide_point(bottom_left, 1.0)
+            br = guide_point(bottom_right, 1.0)
+            tl = guide_point(top_left, top_y)
+            tr = guide_point(top_right, top_y)
+            painter.setPen(QPen(guide_color, 3, Qt.PenStyle.DashLine))
+            painter.drawLine(bl[0], bl[1], tl[0], tl[1])   # left wheel path
+            painter.drawLine(br[0], br[1], tr[0], tr[1])   # right wheel path
+            painter.drawLine(tl[0], tl[1], tr[0], tr[1])   # far (narrow) edge
+            stop_left_x, stop_right_x = guide_x_at(stop_y)
+            stop_line_y = image_rect.top() + int(image_rect.height() * stop_y)
+            painter.setPen(QPen(guide_color, 3))
+            painter.drawLine(stop_left_x, stop_line_y, stop_right_x, stop_line_y)
+            painter.setPen(guide_color)
+            painter.drawText(
+                QRect(stop_left_x + 6, stop_line_y - 26, 160, 22),
+                Qt.AlignmentFlag.AlignVCenter,
+                "정지선",
+            )
+
+        if self._plate_line is not None:
+            line_color = QColor("#38bdf8")
+            plate_y = image_rect.top() + int(image_rect.height() * self._plate_line)
+            painter.setPen(QPen(line_color, 2, Qt.PenStyle.DashDotLine))
+            painter.drawLine(image_rect.left(), plate_y, image_rect.right(), plate_y)
+            painter.setPen(line_color)
+            painter.drawText(
+                QRect(image_rect.left() + 8, plate_y + 4, 300, 22),
+                Qt.AlignmentFlag.AlignVCenter,
+                "차량진입선 (이 선 아래 번호판 = 진입)",
+            )
 
         for detection in _fresh_detections(self._detections):
             frame_size = self._frame.size() if self._frame is not None and not self._frame.isNull() else None
@@ -723,6 +809,57 @@ class FrontCameraLprWorker(QObject):
         self.finished.emit()
 
 
+class PeriodicFrontLprWorker(QObject):
+    """Persistent FastALPR loop for the process engine's 1 Hz plate reading.
+
+    Lives on its own QThread for the whole plate phase: the ONNX model is
+    initialized once (FastAlprSession) instead of per frame. The GUI thread
+    pushes one front-camera frame at a time via the ``process_frame`` slot and
+    gates on the returned signals, so a slow recognition simply skips cycles.
+    """
+
+    attempt_ready = pyqtSignal(object, int, int)  # payload, frame_width, frame_height
+    status_changed = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, output_dir: Path) -> None:
+        super().__init__()
+        self._output_dir = output_dir
+        self._session = None
+        self._session_failed = False
+        self._event_path = output_dir / "attempts.jsonl"
+        self._frame_index = 0
+
+    def process_frame(self, frame: QImage) -> None:
+        if self._session_failed:
+            return
+        if self._session is None:
+            try:
+                from towersightai.cli.fast_alpr_lpr import FastAlprSession
+
+                self.status_changed.emit("번호판 모델 로드 중")
+                self._session = FastAlprSession()
+                self.status_changed.emit("번호판 1초 주기 인식 시작")
+            except Exception as exc:  # noqa: BLE001 - engine degrades to 미인식
+                self._session_failed = True
+                self.failed.emit(f"번호판 모델 로드 실패: {exc}")
+                return
+        try:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            image_path = self._output_dir / f"frame-{stamp}.png"
+            if not frame.save(str(image_path), "PNG"):
+                self.status_changed.emit("번호판 프레임 저장 실패")
+                return
+            payload = self._session.recognize_image(image_path, image_index=self._frame_index)
+            self._frame_index += 1
+            with self._event_path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            self.attempt_ready.emit(payload, frame.width(), frame.height())
+        except Exception as exc:  # noqa: BLE001
+            self.status_changed.emit(f"번호판 인식 오류: {exc}")
+
+
 class NasConnectionTestWorker(QObject):
     """Encode the collected preview frames and write one test payload to the NAS.
 
@@ -924,6 +1061,7 @@ class BoundedContentViewport(QWidget):
 class OperatorWindow(QMainWindow):
     ld2410_frame_ready = pyqtSignal(object, str)
     ld2410_status_ready = pyqtSignal(str, object)
+    periodic_lpr_frame = pyqtSignal(object)
 
     def __init__(self, model: OperatorDisplayModel, settings: Settings | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1002,6 +1140,28 @@ class OperatorWindow(QMainWindow):
         self._hailo_health_threads: list[QThread] = []
         self._hailo_health_workers: list[HailoHealthWorker] = []
         self._hailo_health_snapshot: HailoHealthSnapshot | None = None
+        # --- continuous parking-process engine (auto-started; PLC is simulated) ---
+        self.operator_settings: OperatorRuntimeSettings = load_operator_settings()
+        self.plc_adapter = FakePLCAdapter()
+        self.process_engine: ParkingProcessEngine | None = (
+            ParkingProcessEngine(self.operator_settings) if settings is not None else None
+        )
+        self._engine_enabled = settings is not None
+        self._engine_owns_display = False
+        self._engine_copy_key: str | None = None
+        self._engine_last_phase = "idle_monitoring"
+        self._engine_last_start_attempt = 0.0
+        self._engine_stopped_by_operator = False
+        self._audio_player = None  # lazy AudioAlertPlayer (QtMultimedia optional)
+        self._periodic_lpr_threads: list[QThread] = []
+        self._periodic_lpr_workers: list[PeriodicFrontLprWorker] = []
+        self._periodic_lpr_active = False
+        self._periodic_lpr_inflight = False
+        self._periodic_lpr_last_sent = 0.0
+        self.process_settings_inputs: dict[str, QWidget] = {}
+        if self.process_engine is not None and settings is not None:
+            for camera in settings.active_cameras:
+                self.process_engine.observe_camera_health(camera.id, camera.role, False)
         self.clock_label = QLabel()
         self.setWindowTitle("TowerSightAI Operator Console")
         self.setStyleSheet(_stylesheet())
@@ -1044,6 +1204,7 @@ class OperatorWindow(QMainWindow):
         self._stop_ai_detection()
         self._stop_purpose_inference()
         self._stop_front_camera_lpr()
+        self._shutdown_periodic_lpr()
         self._stop_nas_connection_test()
         self._stop_hailo_health_monitor()
         for thread in self._detection_threads:
@@ -1208,6 +1369,10 @@ class OperatorWindow(QMainWindow):
         self._runtime_camera_status[camera_id] = status
         if self._evidence_coordinator is not None:
             self._evidence_coordinator.update_camera_status(camera_id, status)
+        if self.process_engine is not None:
+            self.process_engine.observe_camera_health(
+                camera_id, tile.role, status.startswith("정상 수신")
+            )
         self._refresh_runtime_health_labels()
         self._refresh_driver_display()
 
@@ -1250,6 +1415,10 @@ class OperatorWindow(QMainWindow):
                     self._detection_event_counts,
                     first_inference_seconds=self._purpose_task_first_inference_seconds,
                 )
+            )
+        if self.process_engine is not None and self._purpose_task_id == PURPOSE_PROCESS_MONITORING:
+            self.process_engine.observe_detections(
+                camera_id, tile.role, detections, datetime.now(timezone.utc)
             )
         self._update_user_person_alert(camera_id, detections)
         self._refresh_user_mode_labels()
@@ -1386,6 +1555,7 @@ class OperatorWindow(QMainWindow):
             primary_alert_role=primary_alert_role,
             masked_plate_text=self._driver_masked_plate,
             simulated=self._driver_simulated,
+            copy_key=self._engine_copy_key if self._engine_owns_display else None,
         )
         if apply_layout is None:
             apply_layout = hasattr(self, "user_view") and self.stack.currentWidget() is self.user_view
@@ -1486,6 +1656,7 @@ class OperatorWindow(QMainWindow):
         self.operator_pages: dict[str, QWidget] = {}
         self._camera_page_layouts: dict[str, str] = {}
         self._register_operator_page("전체 카메라", self._build_cameras_page(), camera_layout="all")
+        self._register_operator_page("감시 설정", self._build_process_settings_page(), camera_layout="front")
         self._register_operator_page("차량 감지", self._build_vehicle_page(), camera_layout="front")
         self._register_operator_page("사람 감지", self._build_person_page(), camera_layout="all")
         self._register_operator_page("번호판 인식", self._build_lpr_page(), camera_layout="front")
@@ -1508,7 +1679,8 @@ class OperatorWindow(QMainWindow):
         self.ai_detection_label = QLabel("AI 추론 OFF")
         self.hailo_status_label = QLabel("HAILO 확인 중")
         self.evidence_status_label = QLabel("증거 OFF")
-        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.hailo_status_label, self.evidence_status_label, self.clock_label):
+        self.process_status_label = QLabel("프로세스 대기")
+        for label in (self.state_label, self.plc_label, self.camera_summary_label, self.model_status_label, self.ai_detection_label, self.hailo_status_label, self.process_status_label, self.evidence_status_label, self.clock_label):
             label.setObjectName("telemetryLabel")
             # Runtime inference text can become very long. Ignore its natural
             # width so the hidden operator page cannot enlarge the shared
@@ -1845,6 +2017,190 @@ class OperatorWindow(QMainWindow):
         # Compatibility alias used by tests and driver-test flows.
         self.driver_test_toggle = self.sidebar_buttons["주차 프로세스 테스트"]
 
+    def _build_process_settings_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "감시 설정",
+            "주차 프로세스 엔진의 임계값·기준선·유도선·NAS 업로드 방식을 설정합니다. 저장 즉시 반영되며 최종 OK 조건은 바뀌지 않습니다.",
+        )
+        save_button = QPushButton("설정 저장")
+        save_button.setProperty("primary", "true")
+        save_button.clicked.connect(self._save_process_settings)
+        controls.addWidget(save_button)
+        revert_button = QPushButton("되돌리기")
+        revert_button.clicked.connect(self._load_process_settings_inputs)
+        controls.addWidget(revert_button)
+        self.engine_toggle_button = QPushButton("프로세스 감시 일시중지")
+        self.engine_toggle_button.setCheckable(True)
+        self.engine_toggle_button.clicked.connect(self._toggle_process_engine)
+        controls.addWidget(self.engine_toggle_button)
+        controls.addStretch(1)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+
+        def add_double(row: int, column: int, key: str, label: str, minimum: float, maximum: float, step: float) -> None:
+            box = QDoubleSpinBox()
+            box.setRange(minimum, maximum)
+            box.setSingleStep(step)
+            box.setDecimals(2)
+            box.valueChanged.connect(self._update_settings_preview_overlays)
+            self.process_settings_inputs[key] = box
+            form.addWidget(QLabel(label), row, column * 2)
+            form.addWidget(box, row, column * 2 + 1)
+
+        def add_int(row: int, column: int, key: str, label: str, minimum: int, maximum: int) -> None:
+            box = QSpinBox()
+            box.setRange(minimum, maximum)
+            self.process_settings_inputs[key] = box
+            form.addWidget(QLabel(label), row, column * 2)
+            form.addWidget(box, row, column * 2 + 1)
+
+        add_double(0, 0, "vehicle_trigger.min_confidence", "차량 감지 임계값", 0.05, 1.0, 0.05)
+        add_int(0, 1, "vehicle_trigger.consecutive_frames", "차량 연속 프레임 수", 1, 30)
+        add_double(0, 2, "vehicle_trigger.release_seconds", "진입 해제(초)", 1.0, 60.0, 1.0)
+        add_int(1, 0, "person_debounce.idle_frames", "사람 연속 감지(대기)", 1, 20)
+        add_int(1, 1, "person_debounce.parked_frames", "사람 연속 감지(하차)", 1, 20)
+        add_double(1, 2, "person_debounce.stale_seconds", "사람 해제 대기(초)", 0.5, 30.0, 0.5)
+        add_double(2, 0, "plate_zone.line_y_norm", "차량진입선 위치", 0.0, 1.0, 0.01)
+        add_int(2, 1, "plate_zone.min_reads_for_vote", "번호판 최소 인식 횟수", 1, 20)
+        add_double(2, 2, "plate_zone.read_interval_seconds", "번호판 인식 주기(초)", 0.2, 10.0, 0.2)
+        add_double(3, 0, "wheel_guides.left_x_norm", "유도선 아래 왼쪽", 0.0, 1.0, 0.01)
+        add_double(3, 1, "wheel_guides.right_x_norm", "유도선 아래 오른쪽", 0.0, 1.0, 0.01)
+        add_double(3, 2, "wheel_guides.top_left_x_norm", "유도선 위 왼쪽", 0.0, 1.0, 0.01)
+        add_double(4, 0, "wheel_guides.top_right_x_norm", "유도선 위 오른쪽", 0.0, 1.0, 0.01)
+        add_double(4, 1, "wheel_guides.top_y_norm", "유도선 위 높이", 0.0, 1.0, 0.01)
+        add_double(4, 2, "wheel_guides.stop_y_norm", "정지선 위치", 0.0, 1.0, 0.01)
+        add_double(5, 0, "timers.exit_clear_seconds", "무인 확인 시간(초)", 1.0, 600.0, 1.0)
+        add_double(5, 1, "timers.machine_operation_seconds", "주차기 작동 가정(초)", 5.0, 3600.0, 5.0)
+        upload_box = QComboBox()
+        upload_box.addItem("예약 (일 단위)", "scheduled")
+        upload_box.addItem("즉시 (이벤트 종료 시)", "immediate")
+        self.process_settings_inputs["nas_upload_mode"] = upload_box
+        form.addWidget(QLabel("NAS 업로드 방식"), 5, 4)
+        form.addWidget(upload_box, 5, 5)
+        body.addLayout(form)
+
+        self.process_settings_status = QLabel(f"설정 파일: {OPERATOR_SETTINGS_PATH}")
+        self.process_settings_status.setObjectName("pageSubtitleLabel")
+        self.process_settings_status.setWordWrap(True)
+        body.addWidget(self.process_settings_status)
+
+        page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
+        page.camera_slot.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(page.camera_slot, 1)
+        self._settings_preview_active = False
+        self._load_process_settings_inputs()
+        return page
+
+    def _load_process_settings_inputs(self) -> None:
+        settings = self.operator_settings
+        values: dict[str, object] = {
+            "vehicle_trigger.min_confidence": settings.vehicle_trigger.min_confidence,
+            "vehicle_trigger.consecutive_frames": settings.vehicle_trigger.consecutive_frames,
+            "vehicle_trigger.release_seconds": settings.vehicle_trigger.release_seconds,
+            "person_debounce.idle_frames": settings.person_debounce.idle_frames,
+            "person_debounce.parked_frames": settings.person_debounce.parked_frames,
+            "person_debounce.stale_seconds": settings.person_debounce.stale_seconds,
+            "plate_zone.line_y_norm": settings.plate_zone.line_y_norm,
+            "plate_zone.min_reads_for_vote": settings.plate_zone.min_reads_for_vote,
+            "plate_zone.read_interval_seconds": settings.plate_zone.read_interval_seconds,
+            "wheel_guides.left_x_norm": settings.wheel_guides.left_x_norm,
+            "wheel_guides.right_x_norm": settings.wheel_guides.right_x_norm,
+            "wheel_guides.top_left_x_norm": settings.wheel_guides.top_left_x_norm,
+            "wheel_guides.top_right_x_norm": settings.wheel_guides.top_right_x_norm,
+            "wheel_guides.top_y_norm": settings.wheel_guides.top_y_norm,
+            "wheel_guides.stop_y_norm": settings.wheel_guides.stop_y_norm,
+            "timers.exit_clear_seconds": settings.timers.exit_clear_seconds,
+            "timers.machine_operation_seconds": settings.timers.machine_operation_seconds,
+        }
+        for key, value in values.items():
+            widget = self.process_settings_inputs.get(key)
+            if widget is not None:
+                widget.setValue(value)  # type: ignore[union-attr]
+        upload_box = self.process_settings_inputs.get("nas_upload_mode")
+        if isinstance(upload_box, QComboBox):
+            index = upload_box.findData(settings.nas_upload_mode)
+            upload_box.setCurrentIndex(max(0, index))
+        self._update_settings_preview_overlays()
+
+    def _process_settings_payload(self) -> dict[str, object]:
+        payload: dict[str, dict[str, object]] = {}
+        for key, widget in self.process_settings_inputs.items():
+            if key == "nas_upload_mode":
+                continue
+            section, field = key.split(".", 1)
+            payload.setdefault(section, {})[field] = widget.value()  # type: ignore[union-attr]
+        upload_box = self.process_settings_inputs.get("nas_upload_mode")
+        result: dict[str, object] = dict(payload)
+        if isinstance(upload_box, QComboBox):
+            result["nas_upload_mode"] = upload_box.currentData()
+        return result
+
+    def _save_process_settings(self) -> None:
+        try:
+            settings = settings_from_payload(self._process_settings_payload())
+        except (ValueError, TypeError) as exc:
+            self.process_settings_status.setText(f"저장 실패 (값 검증 오류): {exc}")
+            return
+        try:
+            save_operator_settings(settings, OPERATOR_SETTINGS_PATH)
+        except OSError as exc:
+            self.process_settings_status.setText(f"저장 실패 (파일 오류): {exc}")
+            return
+        self.operator_settings = settings
+        if self.process_engine is not None:
+            self.process_engine.apply_settings(settings)
+        self.process_settings_status.setText(
+            f"저장 완료: {OPERATOR_SETTINGS_PATH} · 실행 중인 감시에 즉시 적용되었습니다."
+        )
+
+    def _toggle_process_engine(self) -> None:
+        self._engine_stopped_by_operator = not self._engine_stopped_by_operator
+        button = self.engine_toggle_button
+        button.setChecked(self._engine_stopped_by_operator)
+        button.setText(
+            "프로세스 감시 재개" if self._engine_stopped_by_operator else "프로세스 감시 일시중지"
+        )
+        if self._engine_stopped_by_operator:
+            if self._purpose_task_enabled and self._purpose_task_id == PURPOSE_PROCESS_MONITORING:
+                self._stop_purpose_inference()
+            self.warning_label.setText("프로세스 감시를 일시중지했습니다. 최종 OK는 차단됩니다.")
+        else:
+            self._engine_last_start_attempt = 0.0
+            self.warning_label.setText("프로세스 감시를 재개합니다. 최종 OK는 차단됩니다.")
+
+    def _update_settings_preview_overlays(self) -> None:
+        if not getattr(self, "_settings_preview_active", False):
+            return
+        front = self.camera_widgets.get(CameraRole.front)
+        if front is None:
+            return
+        try:
+            value = lambda key: float(self.process_settings_inputs[key].value())  # type: ignore[union-attr] # noqa: E731
+            line_y = value("plate_zone.line_y_norm")
+            guides = (
+                value("wheel_guides.left_x_norm"),
+                value("wheel_guides.right_x_norm"),
+                value("wheel_guides.top_left_x_norm"),
+                value("wheel_guides.top_right_x_norm"),
+                value("wheel_guides.top_y_norm"),
+                value("wheel_guides.stop_y_norm"),
+            )
+        except KeyError:
+            return
+        front.set_plate_line(line_y)
+        front.set_guide_overlay(guides)
+
+    def _set_settings_preview_active(self, active: bool) -> None:
+        self._settings_preview_active = active
+        front = self.camera_widgets.get(CameraRole.front)
+        if active:
+            self._update_settings_preview_overlays()
+        elif front is not None:
+            front.set_plate_line(None)
+            front.set_guide_overlay(None)
+
     def _show_operator_page(self, label: str) -> None:
         page = self.operator_pages[label]
         camera_layout = self._camera_page_layouts.get(label)
@@ -1860,6 +2216,7 @@ class OperatorWindow(QMainWindow):
         for nav_label, button in self.sidebar_buttons.items():
             if button.isCheckable():
                 button.setChecked(nav_label == label)
+        self._set_settings_preview_active(label == "감시 설정")
         if label == "레이더 (LD2410)":
             self._render_ld2410_console()
             self._refresh_ld2410_console_status()
@@ -2069,6 +2426,223 @@ class OperatorWindow(QMainWindow):
             self.ai_detection_label.setText(
                 _purpose_detection_label(self._purpose_task_label, self._detection_camera_ids, self._detection_event_counts, loading_seconds=elapsed)
             )
+        self._tick_process_engine()
+
+    # ------------------------------------------------------------- process engine
+
+    def _tick_process_engine(self) -> None:
+        engine = self.process_engine
+        if engine is None:
+            return
+        self._ensure_process_monitoring()
+        monitoring_running = (
+            self._purpose_task_enabled and self._purpose_task_id == PURPOSE_PROCESS_MONITORING
+        )
+        engine.observe_monitoring_health(
+            running=monitoring_running,
+            recovering=monitoring_running and self._purpose_task_first_inference_seconds is None,
+        )
+        output = engine.tick(datetime.now(timezone.utc))
+        self._apply_engine_output(output)
+        self._pump_periodic_lpr()
+
+    def _ensure_process_monitoring(self) -> None:
+        """Auto-start (and resume after manual tasks) the combined monitoring task."""
+        if (
+            not self._engine_enabled
+            or self._engine_stopped_by_operator
+            or self.settings is None
+            or self._purpose_workers
+            or self._pending_user_purpose_task_id
+            or self._purpose_task_enabled
+            or self._detection_enabled
+        ):
+            return
+        if time.monotonic() - self._engine_last_start_attempt < 10.0:
+            return
+        if not _streaming_camera_ids(self.settings, self._runtime_camera_status):
+            return
+        self._engine_last_start_attempt = time.monotonic()
+        self._start_purpose_inference(PURPOSE_PROCESS_MONITORING)
+
+    def _engine_display_allowed(self) -> bool:
+        """The engine drives the driver display unless a test/simulation owns it."""
+        if self._driver_simulated or self._vehicle_entry_simulation:
+            return False
+        if self._user_mode_state != "idle":
+            return False
+        return self._driver_state_override is None or self._engine_owns_display
+
+    def _apply_engine_output(self, output: EngineOutput) -> None:
+        for request in output.plc_requests:
+            try:
+                self.plc_adapter.send(request.name, dict(request.payload))
+            except Exception:  # noqa: BLE001 - simulated adapter must never break the UI
+                logging.getLogger("towersightai.process.engine").exception("plc send failed")
+        if self._raw_data_manager is not None:
+            for event in output.raw_events:
+                if event.kind == "vehicle_entry":
+                    self._record_raw(
+                        self._raw_data_manager.record_vehicle_entry,
+                        camera_id=event.camera_id or "opposite_side",
+                        simulated=False,
+                        managed=True,
+                    )
+                elif event.kind == "vehicle_session_end":
+                    self._record_raw(
+                        self._raw_data_manager.end_vehicle_session, reason=event.reason
+                    )
+                elif event.kind == "plate":
+                    self._record_raw(
+                        self._raw_data_manager.record_plate,
+                        event.plate_number,
+                        confidence=event.confidence,
+                        simulated=False,
+                    )
+        if output.lpr_control == "start":
+            self._start_periodic_lpr()
+        elif output.lpr_control == "stop":
+            self._stop_periodic_lpr()
+        if output.audio_cue:
+            self._play_audio_cue(output.audio_cue)
+
+        phase_text = f"프로세스 {output.phase}"
+        if output.uncertain_reason:
+            phase_text += f" · {output.uncertain_reason}"
+        if hasattr(self, "process_status_label"):
+            self.process_status_label.setText(phase_text)
+
+        # NAS immediate mode: sync once per cycle, deferred until back in IDLE.
+        if (
+            self.operator_settings.nas_upload_mode == "immediate"
+            and output.phase == "idle_monitoring"
+            and self._engine_last_phase not in ("idle_monitoring",)
+            and self._raw_data_manager is not None
+        ):
+            self._record_raw(self._raw_data_manager.request_current_day_sync)
+        self._engine_last_phase = output.phase
+
+        if self._engine_display_allowed():
+            previous_override = self._driver_state_override
+            previous_copy = self._engine_copy_key
+            previous_plate = self._driver_masked_plate
+            self._driver_state_override = (
+                None if output.public_state is ParkingState.IDLE else output.public_state
+            )
+            self._engine_owns_display = self._driver_state_override is not None
+            self._engine_copy_key = output.copy_key
+            if output.plate_number:
+                self._driver_masked_plate = _masked_plate(output.plate_number)
+            elif previous_override is not None and self._driver_state_override is None:
+                self._driver_masked_plate = ""
+            guides = self.operator_settings.wheel_guides
+            self._set_front_guide_overlay(
+                (
+                    guides.left_x_norm,
+                    guides.right_x_norm,
+                    guides.top_left_x_norm,
+                    guides.top_right_x_norm,
+                    guides.top_y_norm,
+                    guides.stop_y_norm,
+                )
+                if output.show_wheel_guides
+                else None
+            )
+            if output.warning_text:
+                self.warning_label.setText(f"{output.warning_text} 최종 OK는 차단됩니다.")
+            if (
+                previous_override is not self._driver_state_override
+                or previous_copy != self._engine_copy_key
+                or previous_plate != self._driver_masked_plate
+            ):
+                self._refresh_driver_display()
+        elif self._engine_owns_display:
+            # A test/simulation took over; drop our claim and overlays.
+            self._engine_owns_display = False
+            self._engine_copy_key = None
+            self._set_front_guide_overlay(None)
+
+    def _set_front_guide_overlay(self, guides: tuple[float, float, float] | None) -> None:
+        if getattr(self, "_settings_preview_active", False):
+            return  # the 감시 설정 preview owns the front overlays while open
+        for widget in self._camera_surfaces(CameraRole.front):
+            widget.set_guide_overlay(guides)
+
+    def _play_audio_cue(self, cue_id: str) -> None:
+        if self._audio_player is None:
+            from towersightai.ui.audio import AudioAlertPlayer
+
+            self._audio_player = AudioAlertPlayer()
+        self._audio_player.play(cue_id)
+
+    # ------------------------------------------------------------- periodic LPR
+
+    def _start_periodic_lpr(self) -> None:
+        if self._periodic_lpr_active or self.settings is None:
+            return
+        self._periodic_lpr_active = True
+        self._periodic_lpr_inflight = False
+        self._periodic_lpr_last_sent = 0.0
+        if not self._periodic_lpr_workers:
+            output_dir = Path("artifacts/runtime/purpose-ai/process_lpr") / datetime.now(
+                timezone.utc
+            ).strftime("run-%Y%m%d-%H%M%S")
+            thread = QThread(self)
+            worker = PeriodicFrontLprWorker(output_dir)
+            worker.moveToThread(thread)
+            self.periodic_lpr_frame.connect(worker.process_frame)
+            worker.attempt_ready.connect(self._on_periodic_lpr_attempt)
+            worker.status_changed.connect(self._on_periodic_lpr_status)
+            worker.failed.connect(self._on_periodic_lpr_failed)
+            self._periodic_lpr_threads.append(thread)
+            self._periodic_lpr_workers.append(worker)
+            thread.start()
+
+    def _stop_periodic_lpr(self) -> None:
+        self._periodic_lpr_active = False
+        self._periodic_lpr_inflight = False
+
+    def _shutdown_periodic_lpr(self) -> None:
+        self._stop_periodic_lpr()
+        for worker in self._periodic_lpr_workers:
+            try:
+                self.periodic_lpr_frame.disconnect(worker.process_frame)
+            except TypeError:
+                pass
+        self._periodic_lpr_workers.clear()
+        for thread in self._periodic_lpr_threads:
+            thread.quit()
+            thread.wait(10000)
+        self._periodic_lpr_threads.clear()
+
+    def _pump_periodic_lpr(self) -> None:
+        if not self._periodic_lpr_active or self._periodic_lpr_inflight:
+            return
+        interval = self.operator_settings.plate_zone.read_interval_seconds
+        if time.monotonic() - self._periodic_lpr_last_sent < interval:
+            return
+        front_widget = self.camera_widgets.get(CameraRole.front)
+        frame = front_widget.current_frame() if front_widget is not None else None
+        if frame is None:
+            return
+        self._periodic_lpr_inflight = True
+        self._periodic_lpr_last_sent = time.monotonic()
+        self.periodic_lpr_frame.emit(frame)
+
+    def _on_periodic_lpr_attempt(self, payload: object, frame_width: int, frame_height: int) -> None:
+        self._periodic_lpr_inflight = False
+        del frame_width
+        if self.process_engine is not None and isinstance(payload, dict):
+            self.process_engine.observe_lpr_attempt(payload, frame_height)
+
+    def _on_periodic_lpr_status(self, message: str) -> None:
+        if hasattr(self, "process_status_label"):
+            self.process_status_label.setText(f"프로세스 LPR: {message}")
+
+    def _on_periodic_lpr_failed(self, message: str) -> None:
+        self._periodic_lpr_inflight = False
+        self._periodic_lpr_active = False
+        self.warning_label.setText(f"{message} 번호판은 미인식으로 진행됩니다. 최종 OK는 차단됩니다.")
 
     def _show_operator(self) -> None:
         if not self._operator_unlocked:
@@ -2160,6 +2734,11 @@ class OperatorWindow(QMainWindow):
         self._ld2410_connection_state = "client_connected"
         self._ld2410_client_ip = client_ip
         self._ld2410_last_frame_at = frame.received_at
+        if self.process_engine is not None:
+            # Radar is an add-only person source for the engine (never clears).
+            self.process_engine.observe_radar(
+                person_present=frame.target_status != 0, received_at=frame.received_at
+            )
         self._append_ld2410_console_line(_format_ld2410_console_line(frame, client_ip))
         self._refresh_ld2410_console_status()
 
@@ -2890,7 +3469,7 @@ class OperatorWindow(QMainWindow):
                 if camera.role is CameraRole.front and camera.id in streaming:
                     return (camera.id,)
             return ()
-        if task_id == PURPOSE_PERSON_PRESENCE:
+        if task_id in (PURPOSE_PERSON_PRESENCE, PURPOSE_PROCESS_MONITORING):
             return streaming
         return ()
 
@@ -3745,3 +4324,10 @@ def _stylesheet() -> str:
         border: 0;
     }
     """ + DRIVER_STYLESHEET
+
+
+def _masked_plate(plate_number: str) -> str:
+    text = (plate_number or "").strip()
+    if not text or text == "미인식":
+        return text
+    return f"•••• {text[-4:]}"

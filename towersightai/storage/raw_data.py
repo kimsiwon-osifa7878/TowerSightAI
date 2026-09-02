@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -165,6 +166,7 @@ class RawDataManager:
         self._active_ai_tasks: set[str] = set()
         self._sync_lock = threading.Lock()
         self._sync_running = False
+        self._last_current_day_sync = float("-inf")
         self._event_sink: Callable[[Mapping[str, Any]], None] | None = None
         self._ld2410_snapshot_provider = ld2410_snapshot_provider
         self._closed = False
@@ -280,13 +282,21 @@ class RawDataManager:
         camera_id: str,
         confidence: float | None = None,
         simulated: bool = False,
+        managed: bool = False,
         at: datetime | None = None,
     ) -> str:
+        """``managed=True`` marks a process-engine session whose evidence clip stays
+        open until ``vehicle_session_ended`` instead of the fixed post-roll close."""
         if self.vehicle_session_id is None:
             self.vehicle_session_id = uuid.uuid4().hex
             self.record(
                 "vehicle_entered",
-                payload={"camera_id": camera_id, "confidence": confidence, "simulated": simulated},
+                payload={
+                    "camera_id": camera_id,
+                    "confidence": confidence,
+                    "simulated": simulated,
+                    "managed": managed,
+                },
                 at=at,
             )
         return self.vehicle_session_id
@@ -452,6 +462,38 @@ class RawDataManager:
                     self._sync_running = False
 
         threading.Thread(target=run, name="raw-data-nas-sync", daemon=True).start()
+        return True
+
+    def request_current_day_sync(self, *, min_interval_seconds: float = 60.0) -> bool:
+        """Immediate NAS upload of the current day (operator "즉시" upload mode).
+
+        Debounced: at most one run per ``min_interval_seconds``. Uses the same
+        single-flight lock as the scheduled sync. Note ``include_current_day=True``
+        finalizes today's live shard (safe in-process — the writer lock is already
+        held — but it rotates the active shard on every call, hence the debounce).
+        """
+        now = time.monotonic()
+        with self._sync_lock:
+            if self._sync_running:
+                return False
+            if now - self._last_current_day_sync < min_interval_seconds:
+                return False
+            self._sync_running = True
+            self._last_current_day_sync = now
+
+        def run() -> None:
+            try:
+                result = self.sync_completed_days(include_current_day=True)
+                logging.getLogger(__name__).info(
+                    "raw-data immediate sync complete uploaded=%s errors=%s",
+                    result.uploaded_days,
+                    result.errors,
+                )
+            finally:
+                with self._sync_lock:
+                    self._sync_running = False
+
+        threading.Thread(target=run, name="raw-data-nas-sync-now", daemon=True).start()
         return True
 
     def close(self) -> None:

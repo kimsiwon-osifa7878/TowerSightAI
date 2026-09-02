@@ -29,6 +29,37 @@ class ImageInput:
     path: Path
 
 
+class FastAlprSession:
+    """A FastALPR model held for repeated recognitions (e.g. the 1 Hz plate loop).
+
+    ``run_fast_alpr_lpr`` constructs the model per call, which is fine for the
+    one-shot image task but far too slow for periodic reads; this class pays the
+    ONNX init cost once. CPU-only — no Hailo device or RTSP session involved.
+    """
+
+    def __init__(self, *, detector_model: str = DETECTOR_MODEL, ocr_model: str = OCR_MODEL) -> None:
+        from fast_alpr import ALPR
+
+        init_started = time.perf_counter()
+        self._alpr = ALPR(detector_model=detector_model, ocr_model=ocr_model, ocr_device="cpu")
+        self.init_ms = (time.perf_counter() - init_started) * 1000.0
+        LOGGER.info("fast-alpr-session-ready init-ms=%.2f", self.init_ms)
+
+    def recognize_image(self, path: Path, *, image_index: int = 0) -> dict[str, Any]:
+        """Run one recognition; errors become an ``status=error`` attempt payload."""
+        image = ImageInput(index=image_index, path=Path(path))
+        started = time.perf_counter()
+        try:
+            results = self._alpr.predict(str(image.path))
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return _attempt_payload(image=image, results=results, elapsed_ms=elapsed_ms)
+        except Exception as exc:  # noqa: BLE001 - loop must survive any predict failure
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            payload = _error_payload(image=image, elapsed_ms=elapsed_ms, message=str(exc))
+            payload["traceback"] = traceback.format_exc()
+            return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run FastALPR over a directory of plate test images.")
     parser.add_argument("--image-dir", default="tmp/car_number-test", help="Directory containing plate images.")

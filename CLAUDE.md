@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **225 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **276 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -94,11 +94,15 @@ towersightai/
 │   ├── hailo_apps_detection.py# runs INSIDE the Hailo Apps venv (not the project venv)
 │   ├── fast_alpr_lpr.py       # CPU FastALPR ONNX plate detection + OCR
 │   └── event_video_recorder.py# H.264 passthrough MKV segment recorder subprocess
+├── process/
+│   ├── engine.py              # ParkingProcessEngine: continuous inbound cycle (pure Python, injected clock)
+│   └── settings_store.py      # OperatorRuntimeSettings ⇄ data/operator-settings.json (gitignored)
 ├── ui/
-│   ├── pyqt_app.py            # OperatorWindow, workspace pages, camera/detection/purpose/LPR/NAS/health workers (~3.6k lines)
+│   ├── pyqt_app.py            # OperatorWindow, workspace pages, camera/detection/purpose/LPR/NAS/health workers (~4k lines)
 │   ├── driver_view.py         # DriverView, OperatorEntryHotspot (2 s hold), driver stylesheet
-│   └── model.py               # OperatorDisplayModel / DriverDisplayModel + the safety gate
-├── state_machine/core.py      # ParkingState enum + ALLOWED transition map
+│   ├── audio.py               # AudioAlertPlayer: warning tone, silent degrade without QtMultimedia
+│   └── model.py               # OperatorDisplayModel / DriverDisplayModel + the safety gate + copy overrides
+├── state_machine/core.py      # ParkingState enum + ALLOWED transition map (cyclic since the process engine)
 ├── plc/adapter.py             # PLCAdapter Protocol, FakePLCAdapter, SimulatorPLCAdapter
 ├── storage/
 │   ├── raw_data.py            # RawDataManager, PersonWindowSampler, schema v2 JSONL records
@@ -110,7 +114,7 @@ towersightai/
 ├── diagnostics.py             # DiagnosticsService: settings/hailo/image/camera/plc/full smoke
 └── runtime_logging.py         # runtime log config, credential redaction, run IDs, run-status files
 
-tests/          # 225 hardware-free unit/UI/fake-data tests
+tests/          # 276 hardware-free unit/UI/fake-data tests
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
 data/samples/   # sanitized sample images (test-car.png)
 docs/design/    # approved visual contracts (driver prototype, operator console proposals A/B)
@@ -143,9 +147,45 @@ safety-gate object that both the UI and the PLC path consume. Preserve every exi
 
 ### State machine
 
-`state_machine/core.py` only enforces legal transitions (linear `IDLE → … → READY_FOR_OPERATION → AI_STOP`,
-plus `SAFETY_CHECK ↔ HUMAN_DETECTED`); illegal transitions raise `ValueError`. It carries no evidence, no
-timers, and no gating yet. Public PLC/UI states must always map back to the ten design-document names.
+`state_machine/core.py` enforces legal transitions and raises `ValueError` on anything else. Since the
+process engine, `ALLOWED` is cyclic: the happy path is still `IDLE → … → READY_FOR_OPERATION → AI_STOP`,
+but every non-IDLE state carries a conservative abort edge back to `IDLE`, `IDLE → HUMAN_DETECTED` covers
+the idle person watch, `READY_FOR_OPERATION → SAFETY_CHECK` covers a person reappearing after OK-send, and
+`AI_STOP → IDLE` closes the continuous cycle. Public PLC/UI states must always map back to the ten
+design-document names.
+
+### Process engine (the redefined field flow)
+
+`towersightai/process/engine.py` — `ParkingProcessEngine`, the first real consumer of
+`SafetyStateMachine`. Pure Python (no Qt), injected clock, driven by `OperatorWindow`: 1 Hz `tick(now)`
+plus `observe_detections/observe_radar/observe_lpr_attempt/observe_monitoring_health/observe_camera_health`.
+Each tick returns an `EngineOutput` (public state, driver copy key, plate, audio cue, simulated PLC
+requests, raw-event requests, LPR loop control, uncertainty reason). The cycle: IDLE person watch on
+ceiling+front+rear_side (opposite_side is **excluded** in IDLE — it sees outside the open door) →
+opposite_side vehicle trigger (operator-tunable confidence ≥0.6 × ≥5 consecutive frames, release on lost
+evidence) → 1 Hz front-camera FastALPR gated by the 차량진입선 / vehicle-entry line near the top (only
+plate bboxes **below** it count as "entering" and feed the vote) and majority vote → front trapezoidal
+wheel-guide alignment (wide bottom, narrow top for the front-camera perspective; bbox-stability parked
+heuristic, 3D box is future work) →
+parked instruct → 10 s no-person countdown → simulated `vehicle_parked`+plate via `FakePLCAdapter` →
+60 s machine-operation window (person watch now includes opposite_side; warns, never aborts) → IDLE.
+Outbound (출고) was explicitly removed by the owner. Rules the tests pin: every PLC payload carries
+`simulated: True`; uncertainty (monitoring dead, front/rear_side camera NG) aborts any entry back to IDLE
+with a `vehicle_session_end`; the LD2410 radar is an **add-only** person source (it can raise
+person-possible, never clear it); the engine never computes an OK — `can_show_final_ok` stays the only gate.
+
+Hosting facts: the engine's inference is the combined `process_monitoring` purpose task (one Hailo child,
+person+vehicle labels, child min-confidence fixed at 0.2 — operator thresholds are applied in the parent, so
+settings changes never restart the child and the Tapo RTSP session budget holds). It auto-starts when any
+camera streams, pauses via the existing pending-task auto-switch when a manual test task starts, and resumes
+(10 s cooldown) when it stops; the 감시 설정 page's `프로세스 감시 일시중지` disables it. Operator-tunable
+values live in `data/operator-settings.json` (`process/settings_store.py`, atomic writes, corrupt file →
+defaults + warning) — deliberately **not** `.env`. The 1 Hz plate loop is `PeriodicFrontLprWorker` +
+`FastAlprSession` (persistent CPU ONNX model over preview frames; no extra RTSP session). Driver copy for
+engine phases comes from `DRIVER_COPY_OVERRIDES` in `ui/model.py` via `build_driver_display(copy_key=...)`;
+the `alignment_front_guide` key suppresses the birdview-off DANGER rule for `ALIGNMENT_GUIDE` because
+alignment is front-guide-driven (final OK stays blocked by the gate regardless). Warning audio is
+`ui/audio.py` (screen warnings never depend on it).
 
 ### PLC
 
@@ -278,15 +318,21 @@ default lane/stop guides outside calibration mode; error/NG states can never use
   Each `person_sample` embeds the newest frame at or before the sample time: ≤1 s = `fresh`, older buffered =
   `stale`, none = `unavailable`; future frames are never selected.
 
-**All of this is audit/telemetry only.** Archive success, LD2410 values, and media capture must never relax,
-authorize, or influence the safety gate, AI, or the state machine.
+**All of this is audit/telemetry only, with one add-only exception.** Archive success and media capture must
+never relax, authorize, or influence the safety gate, AI, or the state machine. LD2410 values may
+additionally feed the process engine as an **add-only** person signal (raising person-possible/warnings);
+they can never clear a person, accelerate progression, or relax anything. Evidence extensions for the
+engine: a `managed: true` `vehicle_entered` opens a clip that stays open until `vehicle_session_ended`
+(parking start) instead of the fixed 10 s post-roll, and `person_window_closed` now also captures a
+`person_end` snapshot. NAS upload mode `immediate` (operator setting) triggers a debounced current-day
+sync when the engine returns to IDLE; `scheduled` keeps the day-granularity behavior.
 
 ---
 
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 225 passed, hardware-free
+pytest -q                                     # 276 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed

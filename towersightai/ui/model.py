@@ -228,6 +228,40 @@ def build_operator_display(
     )
 
 
+# Driver copy overrides selected by the process engine (keys are its copy_key
+# contract). "alignment_front_guide" additionally means alignment is driven by
+# front-camera wheel guides, not the birdview, so the birdview-off DANGER rule
+# for ALIGNMENT_GUIDE does not apply (final OK stays blocked by the gate anyway).
+DRIVER_COPY_OVERRIDES: dict[str, tuple[str, str, str, str]] = {
+    "idle_person_warning": (
+        "사람 감지",
+        "즉시 밖으로 이동",
+        "주차기 내부에 사람이 감지되었습니다. 밖으로 이동해 주세요.",
+        "!",
+    ),
+    "exit_person_warning": (
+        "사람 감지",
+        "즉시 밖으로 이동",
+        "주차가 시작될 예정이므로 바깥으로 나가 주십시오.",
+        "!",
+    ),
+    "alignment_front_guide": (
+        "위치 조정",
+        "천천히 진입",
+        "천천히 진입해 주십시오. 바퀴를 유도선에 맞추세요.",
+        "↑",
+    ),
+    "parked_instruct": (
+        "주차 위치 도달",
+        "정지",
+        "기어를 P에 놓고 시동을 끈 후 밖으로 나가 주십시오.",
+        "■",
+    ),
+}
+
+FRONT_GUIDE_ALIGNMENT_COPY_KEY = "alignment_front_guide"
+
+
 def build_driver_display(
     source: OperatorDisplayModel,
     *,
@@ -238,6 +272,7 @@ def build_driver_display(
     primary_alert_role: CameraRole | None = None,
     masked_plate_text: str = "",
     simulated: bool = False,
+    copy_key: str | None = None,
 ) -> DriverDisplayModel:
     state = state_override or source.state
     alignment = alignment_override or source.alignment
@@ -259,6 +294,8 @@ def build_driver_display(
         alignment,
         birdview_available=source.birdview_available,
     )
+    if copy_key in DRIVER_COPY_OVERRIDES:
+        stage_label, headline, detail, symbol = DRIVER_COPY_OVERRIDES[copy_key]
     tone = DriverTone.WAIT
     blocking_reason = (
         _warning_for_runtime_camera_health(source, state=state, blocked_roles=blocked)
@@ -278,7 +315,11 @@ def build_driver_display(
         symbol = "!"
         blocking_reason = "필수 카메라 입력 없음 · 주차기 동작 금지"
         can_show_final_ok = False
-    elif not source.birdview_available and state is ParkingState.ALIGNMENT_GUIDE:
+    elif (
+        not source.birdview_available
+        and state is ParkingState.ALIGNMENT_GUIDE
+        and copy_key != FRONT_GUIDE_ALIGNMENT_COPY_KEY
+    ):
         tone = DriverTone.DANGER
         can_show_final_ok = False
     elif state is ParkingState.HUMAN_DETECTED:
@@ -366,17 +407,19 @@ def _driver_required_roles_for_state(
     state: ParkingState,
     visible_roles: tuple[CameraRole, ...],
 ) -> tuple[CameraRole, ...]:
+    # Person watch is OR across cameras: a person on ANY watched camera means a
+    # person inside. The primary cameras are the front and left; the opposite_side
+    # camera sees outside the open door and is only a supplementary (OR) source —
+    # even during machine operation it adds coverage but its absence never
+    # hard-blocks. The ceiling birdview is likewise supplementary for person watch.
+    # So the safety states require only front + left to be healthy; a missing
+    # supplementary camera is degraded coverage, not a hard "필수 카메라 입력 없음".
     if state in {
         ParkingState.SAFETY_CHECK,
         ParkingState.HUMAN_DETECTED,
         ParkingState.READY_FOR_OPERATION,
     }:
-        return (
-            CameraRole.ceiling,
-            CameraRole.front,
-            CameraRole.rear_side,
-            CameraRole.opposite_side,
-        )
+        return (CameraRole.front, CameraRole.rear_side)
     return visible_roles
 
 

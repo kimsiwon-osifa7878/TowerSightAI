@@ -16,17 +16,30 @@ class ParkingState(str, Enum):
     AI_STOP = "AI_STOP"
 
 
+# Every non-IDLE state keeps a conservative abort edge back to IDLE: uncertainty
+# (dead stream, dead inference, lost trigger) must always have a legal retreat.
+# IDLE -> HUMAN_DETECTED covers the idle person watch; AI_STOP -> IDLE closes the
+# continuous cycle (machine operation finished); READY_FOR_OPERATION -> SAFETY_CHECK
+# covers a person reappearing between OK-send and machine start.
 ALLOWED = {
-    ParkingState.IDLE: {ParkingState.VEHICLE_DETECTED},
-    ParkingState.VEHICLE_DETECTED: {ParkingState.PLATE_RECOGNITION},
-    ParkingState.PLATE_RECOGNITION: {ParkingState.VEHICLE_ENTERING},
-    ParkingState.VEHICLE_ENTERING: {ParkingState.ALIGNMENT_GUIDE},
-    ParkingState.ALIGNMENT_GUIDE: {ParkingState.PARKED},
-    ParkingState.PARKED: {ParkingState.SAFETY_CHECK},
-    ParkingState.SAFETY_CHECK: {ParkingState.HUMAN_DETECTED, ParkingState.READY_FOR_OPERATION},
-    ParkingState.HUMAN_DETECTED: {ParkingState.SAFETY_CHECK},
-    ParkingState.READY_FOR_OPERATION: {ParkingState.AI_STOP},
-    ParkingState.AI_STOP: set(),
+    ParkingState.IDLE: {ParkingState.VEHICLE_DETECTED, ParkingState.HUMAN_DETECTED},
+    ParkingState.VEHICLE_DETECTED: {ParkingState.PLATE_RECOGNITION, ParkingState.IDLE},
+    ParkingState.PLATE_RECOGNITION: {ParkingState.VEHICLE_ENTERING, ParkingState.IDLE},
+    ParkingState.VEHICLE_ENTERING: {ParkingState.ALIGNMENT_GUIDE, ParkingState.IDLE},
+    ParkingState.ALIGNMENT_GUIDE: {ParkingState.PARKED, ParkingState.IDLE},
+    ParkingState.PARKED: {ParkingState.SAFETY_CHECK, ParkingState.IDLE},
+    ParkingState.SAFETY_CHECK: {
+        ParkingState.HUMAN_DETECTED,
+        ParkingState.READY_FOR_OPERATION,
+        ParkingState.IDLE,
+    },
+    ParkingState.HUMAN_DETECTED: {ParkingState.SAFETY_CHECK, ParkingState.IDLE},
+    ParkingState.READY_FOR_OPERATION: {
+        ParkingState.AI_STOP,
+        ParkingState.SAFETY_CHECK,
+        ParkingState.IDLE,
+    },
+    ParkingState.AI_STOP: {ParkingState.IDLE},
 }
 
 

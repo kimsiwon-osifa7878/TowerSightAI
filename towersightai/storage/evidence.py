@@ -75,6 +75,7 @@ class EvidenceCoordinator:
         self._fragments: dict[str, deque[_Fragment]] = {camera.id: deque() for camera in cameras}
         self._sessions: dict[str, _Session] = {}
         self._person_session_id: str | None = None
+        self._vehicle_session_id: str | None = None
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._buffer_dirs: set[Path] = set()
         self._recorder_ready: set[str] = set()
@@ -123,18 +124,30 @@ class EvidenceCoordinator:
         if event_type == "vehicle_entered":
             camera_id = str(payload.get("camera_id") or self._front_camera_id() or "front")
             self._capture_snapshots(event_id, "vehicle", (camera_id,), event_at)
-            self._open_session(
-                event_id,
-                "vehicle",
-                (camera_id,),
-                event_at,
-                close_at=event_at + timedelta(seconds=self.config.media_vehicle_post_seconds),
-            )
+            if bool(payload.get("managed")):
+                # Process-engine session: stays open until vehicle_session_ended
+                # (parking start), instead of the legacy fixed post-roll close.
+                self._vehicle_session_id = self._open_session(
+                    event_id, "vehicle", (camera_id,), event_at
+                )
+            else:
+                self._open_session(
+                    event_id,
+                    "vehicle",
+                    (camera_id,),
+                    event_at,
+                    close_at=event_at + timedelta(seconds=self.config.media_vehicle_post_seconds),
+                )
+        elif event_type == "vehicle_session_ended" and self._vehicle_session_id:
+            self._close_session(self._vehicle_session_id, event_at)
+            self._vehicle_session_id = None
         elif event_type == "person_window_started":
             camera_ids = self._healthy_camera_ids()
             self._capture_snapshots(event_id, "person", camera_ids, event_at)
             self._person_session_id = self._open_session(event_id, "person", camera_ids, event_at)
         elif event_type == "person_window_closed" and self._person_session_id:
+            # End-of-window screenshot pairs with the start screenshot for the bundle.
+            self._capture_snapshots(event_id, "person_end", self._healthy_camera_ids(), event_at)
             self._close_session(self._person_session_id, event_at)
             self._person_session_id = None
         elif event_type == "plate_recognized":

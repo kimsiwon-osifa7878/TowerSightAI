@@ -26,6 +26,7 @@ USER_AFTER_PERSON_SCREENSHOT="$OUT_DIR/user-ui-after-person-presence-$STAMP.png"
 LOG_SCREENSHOT="$OUT_DIR/operator-ui-log-$STAMP.png"
 LD2410_SCREENSHOT="$OUT_DIR/operator-ui-ld2410-$STAMP.png"
 DRIVER_TEST_SCREENSHOT="$OUT_DIR/operator-ui-driver-test-$STAMP.png"
+PROCESS_SETTINGS_SCREENSHOT="$OUT_DIR/operator-ui-process-settings-$STAMP.png"
 OPERATOR_BUTTON_SCREENSHOT="$OUT_DIR/operator-ui-from-user-button-$STAMP.png"
 EXIT_CONFIRM_SCREENSHOT="$OUT_DIR/operator-ui-exit-confirm-$STAMP.png"
 LOG_FILE="$OUT_DIR/operator-ui-$STAMP.log"
@@ -158,7 +159,7 @@ if [[ -n "$WINDOW_ID" ]]; then
   gnome-screenshot -f "$SIDEBAR_SCREENSHOT"
   identify "$SIDEBAR_SCREENSHOT"
 
-  click_at 150 261
+  click_at 150 311
   gnome-screenshot -f "$ALL_CAMERAS_SCREENSHOT"
   identify "$ALL_CAMERAS_SCREENSHOT"
 
@@ -167,7 +168,7 @@ if [[ -n "$WINDOW_ID" ]]; then
   identify "$USER_AFTER_ALL_CAMERAS_SCREENSHOT"
 
   enter_operator
-  click_at 150 361
+  click_at 150 411
   gnome-screenshot -f "$PERSON_SCREENSHOT"
   identify "$PERSON_SCREENSHOT"
 
@@ -176,20 +177,24 @@ if [[ -n "$WINDOW_ID" ]]; then
   identify "$USER_AFTER_PERSON_SCREENSHOT"
 
   enter_operator
-  click_at 150 461
+  click_at 150 511
   gnome-screenshot -f "$LD2410_SCREENSHOT"
   identify "$LD2410_SCREENSHOT"
 
-  click_at 150 611
+  click_at 150 661
   gnome-screenshot -f "$LOG_SCREENSHOT"
   identify "$LOG_SCREENSHOT"
 
   click_at 150 179
+  gnome-screenshot -f "$PROCESS_SETTINGS_SCREENSHOT"
+  identify "$PROCESS_SETTINGS_SCREENSHOT"
+
+  click_at 150 229
   gnome-screenshot -f "$DRIVER_TEST_SCREENSHOT"
   identify "$DRIVER_TEST_SCREENSHOT"
 
   # Operator menu exit control. Escape dismisses the confirmation so the app survives.
-  click_at 150 743
+  click_at 150 793
   gnome-screenshot -f "$EXIT_CONFIRM_SCREENSHOT"
   identify "$EXIT_CONFIRM_SCREENSHOT"
   xdotool key --clearmodifiers Escape

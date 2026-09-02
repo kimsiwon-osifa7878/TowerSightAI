@@ -300,3 +300,28 @@ def test_failed_upload_keeps_expired_local_data_for_retry(tmp_path: Path):
     assert result.errors == ("2026-08-01:OSError",)
     assert not result.deleted_days
     assert (tmp_path / "2026-08-01/events.jsonl").is_file()
+
+
+def test_request_current_day_sync_is_debounced(tmp_path: Path):
+    import time as _time
+
+    _write_day(tmp_path, "2026-08-21")
+    uploader = FakeUploader()
+    now = datetime(2026, 8, 21, 12, tzinfo=timezone.utc)
+    manager = RawDataManager(
+        RawStorageConfig(local_dir=tmp_path, retention_days=14, timezone_name="UTC"),
+        ("front",),
+        uploader=uploader,
+        clock=lambda: now,
+    )
+
+    assert manager.request_current_day_sync() is True
+    for _ in range(100):
+        with manager._sync_lock:
+            if not manager._sync_running:
+                break
+        _time.sleep(0.05)
+    assert (tmp_path / "2026-08-21/.nas-upload.json").is_file()
+    # second call inside the debounce window is refused
+    assert manager.request_current_day_sync() is False
+    assert manager.request_current_day_sync(min_interval_seconds=0.0) is True

@@ -4,6 +4,25 @@ This file captures the next implementation work from the current prototype state
 
 The safety rule is unchanged. UI tests, simulations, and EMPTY buttons never authorize PLC OK.
 
+## Process Engine (2026-09 field redefinition — implemented)
+
+The continuous parking-process engine (`towersightai/process/`) now runs the redefined field flow:
+IDLE person watch (birdview+front+left, right excluded) → opposite_side vehicle trigger
+(operator-tunable confidence/streak) → 1 Hz front LPR with plate-zone line + majority vote →
+front wheel-guide alignment → parked instruct → 10 s clear countdown → simulated PLC OK+plate →
+60 s machine-operation window (person watch adds right camera) → back to IDLE. Outbound (출고)
+was explicitly removed by the owner and stays a future concept. Operator-tunable values live in
+`data/operator-settings.json` via the `감시 설정` page, not `.env`.
+
+Follow-ups queued from that work:
+
+- 3D vehicle bounding-box estimation (wheels/bumper via AI or OpenCV) to replace the
+  bbox-stability parked heuristic and drive directional alignment guidance. Plan-only today.
+- Polygon exclusion zone for the opposite_side trigger camera (door-open street traffic).
+- Outbound (출고) flow once a PLC exit signal contract exists.
+- Bundling `artifacts/runtime/purpose-ai/` task logs into the NAS day directory.
+- Replace the parked/alignment heuristics with calibrated geometry once calibration lands.
+
 ## Immediate Priority
 
 1. Stabilize the operator UI shell.

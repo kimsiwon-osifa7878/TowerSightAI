@@ -54,6 +54,13 @@ FATAL_GSTREAMER_PATTERNS = (
 PURPOSE_VEHICLE_DETECTION = "vehicle_detection"
 PURPOSE_LPR_IMAGE = "lpr_image"
 PURPOSE_PERSON_PRESENCE = "person_presence"
+PURPOSE_PROCESS_MONITORING = "process_monitoring"
+
+# The process engine consumes person AND vehicle labels from one Hailo child at a
+# deliberately low child-side confidence: operator-tunable thresholds/debounces are
+# applied in the parent, so settings changes never restart the child (Tapo RTSP
+# session budget allows exactly one inference child alongside the preview).
+PROCESS_MONITORING_MIN_CONFIDENCE = 0.2
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,11 @@ PURPOSE_TASK_SPECS = {
         PURPOSE_PERSON_PRESENCE,
         "사람 감지",
         "정상 수신 중인 카메라에서 Hailo Apps 검출 모델의 person 라벨을 판단합니다.",
+    ),
+    PURPOSE_PROCESS_MONITORING: PurposeTaskSpec(
+        PURPOSE_PROCESS_MONITORING,
+        "프로세스 감시",
+        "주차 프로세스 엔진용: 전 카메라에서 사람+차량 라벨을 동시에 감지합니다.",
     ),
 }
 
@@ -816,6 +828,51 @@ def person_presence_process(
     )
 
 
+def process_monitoring_process(
+    settings: Settings,
+    cameras: tuple[CameraConfig, ...],
+    *,
+    event_dir: Path = DEFAULT_PURPOSE_TASK_DIR / PURPOSE_PROCESS_MONITORING,
+    camera_rotations: dict[str, int] | None = None,
+    min_confidence: float = PROCESS_MONITORING_MIN_CONFIDENCE,
+) -> PurposeInferenceProcess:
+    if not cameras:
+        raise ValueError("At least one camera is required for process monitoring.")
+    hef_path = settings.hailo_person_presence_hef_path
+    postprocess_so = settings.hailo_person_presence_postprocess_so
+    event_dir.mkdir(parents=True, exist_ok=True)
+    event_path = event_dir / "process_monitoring.jsonl"
+    log_path = event_dir / "process_monitoring.gst.log"
+    diagnostic_path = event_dir / "process_monitoring.heartbeat.jsonl"
+    command = hailo_apps_detection_command(
+        settings,
+        cameras,
+        event_path=event_path,
+        hef_path=hef_path,
+        postprocess_so=postprocess_so,
+        min_confidence=min_confidence,
+        allowed_labels=tuple(VEHICLE_LABELS) + tuple(PERSON_LABELS),
+        camera_rotations=camera_rotations,
+        diagnostic_path=diagnostic_path,
+    )
+    env = hailo_apps_runtime_env(settings)
+    return PurposeInferenceProcess(
+        task_id=PURPOSE_PROCESS_MONITORING,
+        label=PURPOSE_TASK_SPECS[PURPOSE_PROCESS_MONITORING].label,
+        command=command,
+        env=env,
+        log_path=log_path,
+        event_path=event_path,
+        model_paths=(hef_path, postprocess_so),
+        camera_ids=tuple(camera.id for camera in cameras),
+        run_id=new_run_id(PURPOSE_PROCESS_MONITORING),
+        status_path=event_dir / "run-status.json",
+        diagnostic_path=diagnostic_path,
+        validate_resource_paths=True,
+        max_consecutive_restarts=3,
+    )
+
+
 def build_purpose_process(
     task_id: str,
     settings: Settings,
@@ -840,6 +897,13 @@ def build_purpose_process(
             settings,
             cameras or tuple(settings.cameras),
             event_dir=event_dir / PURPOSE_PERSON_PRESENCE,
+            camera_rotations=camera_rotations,
+        )
+    if task_id == PURPOSE_PROCESS_MONITORING:
+        return process_monitoring_process(
+            settings,
+            cameras or tuple(settings.cameras),
+            event_dir=event_dir / PURPOSE_PROCESS_MONITORING,
             camera_rotations=camera_rotations,
         )
     raise ValueError(f"Unknown purpose AI task: {task_id}")

@@ -277,7 +277,26 @@ def test_runtime_side_camera_failure_restores_camera_warning():
     assert display.can_show_final_ok is False
 
 
-def test_hidden_side_camera_still_blocks_safety_display():
+def test_primary_side_camera_loss_blocks_safety_display():
+    # The left (rear_side) camera is a primary person-watch camera: losing it
+    # during a safety state is a hard block.
+    settings = _settings()
+    source = build_operator_display(state=ParkingState.SAFETY_CHECK, cameras=settings.cameras)
+
+    display = build_driver_display(
+        source,
+        blocked_roles=[CameraRole.rear_side],
+    )
+
+    assert display.tone is DriverTone.DANGER
+    assert display.headline == "정지"
+    assert display.can_show_final_ok is False
+
+
+def test_opposite_side_camera_loss_is_supplementary_not_a_hard_block():
+    # The right (opposite_side) camera is supplementary (OR): its loss during a
+    # safety state must NOT read as "필수 카메라 입력 없음". Person detection is OR,
+    # so a person on any other watched camera still counts as a person inside.
     settings = _settings()
     source = build_operator_display(state=ParkingState.SAFETY_CHECK, cameras=settings.cameras)
 
@@ -286,9 +305,8 @@ def test_hidden_side_camera_still_blocks_safety_display():
         blocked_roles=[CameraRole.opposite_side],
     )
 
-    assert [role.value for role in display.visible_roles] == ["front", "ceiling"]
-    assert display.tone is DriverTone.DANGER
-    assert display.headline == "정지"
+    assert display.blocking_reason != "필수 카메라 입력 없음 · 주차기 동작 금지"
+    assert display.headline != "정지"
     assert display.can_show_final_ok is False
 
 
@@ -308,3 +326,65 @@ def test_idle_person_alert_keeps_front_only_layout():
     assert display.visible_roles == (CameraRole.front,)
     assert display.headline == "즉시 밖으로 이동"
     assert display.tone is DriverTone.DANGER
+
+
+def test_copy_override_replaces_driver_copy():
+    source = build_operator_display(
+        state=ParkingState.PARKED,
+        cameras=_settings().cameras,
+        healthy_camera_ids=("ceiling", "front", "rear_side", "opposite_side"),
+        stale_camera_ids=(),
+    )
+    display = build_driver_display(source, copy_key="parked_instruct", blocked_roles=())
+    assert display.detail == "기어를 P에 놓고 시동을 끈 후 밖으로 나가 주십시오."
+    assert display.can_show_final_ok is False
+
+
+def test_exit_person_copy_override_is_danger():
+    source = build_operator_display(
+        state=ParkingState.HUMAN_DETECTED,
+        cameras=_settings().cameras,
+        healthy_camera_ids=("ceiling", "front", "rear_side", "opposite_side"),
+        stale_camera_ids=(),
+    )
+    display = build_driver_display(source, copy_key="exit_person_warning", blocked_roles=())
+    assert display.detail == "주차가 시작될 예정이므로 바깥으로 나가 주십시오."
+    assert display.tone is DriverTone.DANGER
+    assert display.can_show_final_ok is False
+
+
+def test_front_guide_alignment_copy_suppresses_birdview_danger():
+    source = build_operator_display(
+        state=ParkingState.ALIGNMENT_GUIDE,
+        cameras=_settings().cameras,
+        healthy_camera_ids=("front", "rear_side", "opposite_side"),
+        stale_camera_ids=(),
+        birdview_available=False,
+    )
+    default = build_driver_display(source, blocked_roles=())
+    assert default.tone is DriverTone.DANGER  # birdview-off alignment stays blocked by default
+    guided = build_driver_display(source, copy_key="alignment_front_guide", blocked_roles=())
+    assert guided.tone is not DriverTone.DANGER
+    assert guided.detail == "천천히 진입해 주십시오. 바퀴를 유도선에 맞추세요."
+    assert guided.can_show_final_ok is False  # gate still blocks final OK
+
+
+def test_person_warning_survives_missing_right_camera_dev_scenario():
+    # Dev/site reality: only front + left are up; the right camera is down. During
+    # the person watch (HUMAN_DETECTED) that must NOT read as "필수 카메라 입력 없음";
+    # the person warning copy shows instead, and final OK stays blocked.
+    source = build_operator_display(
+        state=ParkingState.HUMAN_DETECTED,
+        cameras=_settings().cameras,
+        healthy_camera_ids=("front", "rear_side"),
+        stale_camera_ids=("ceiling", "opposite_side"),
+        birdview_available=False,
+    )
+    display = build_driver_display(
+        source,
+        copy_key="exit_person_warning",
+        blocked_roles=[CameraRole.ceiling, CameraRole.opposite_side],
+    )
+    assert display.blocking_reason != "필수 카메라 입력 없음 · 주차기 동작 금지"
+    assert display.detail == "주차가 시작될 예정이므로 바깥으로 나가 주십시오."
+    assert display.can_show_final_ok is False  # gate still blocks (dead tiles + PLC unknown)

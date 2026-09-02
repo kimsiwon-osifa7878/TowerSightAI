@@ -2152,3 +2152,164 @@ def test_hailo_health_worker_starts_only_with_settings(monkeypatch):
     )
     assert without_settings._hailo_health_workers == []
     without_settings.close()
+
+
+def test_sidebar_contains_process_settings_page():
+    assert "감시 설정" in SIDEBAR_ACTION_LABELS
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    assert "감시 설정" in window.operator_pages
+    window.close()
+
+
+def test_process_settings_save_round_trips_and_applies_to_engine(tmp_path: Path, monkeypatch):
+    import towersightai.ui.pyqt_app as pyqt_app
+
+    monkeypatch.setattr(pyqt_app, "OPERATOR_SETTINGS_PATH", tmp_path / "operator-settings.json")
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    window.process_settings_inputs["vehicle_trigger.min_confidence"].setValue(0.75)
+    window.process_settings_inputs["vehicle_trigger.consecutive_frames"].setValue(7)
+    window._save_process_settings()
+    assert (tmp_path / "operator-settings.json").is_file()
+    assert window.operator_settings.vehicle_trigger.min_confidence == 0.75
+    assert window.process_engine._settings.vehicle_trigger.consecutive_frames == 7
+    assert "저장 완료" in window.process_settings_status.text()
+    window.close()
+
+
+def test_process_settings_invalid_values_are_rejected_without_saving(tmp_path: Path, monkeypatch):
+    import towersightai.ui.pyqt_app as pyqt_app
+
+    monkeypatch.setattr(pyqt_app, "OPERATOR_SETTINGS_PATH", tmp_path / "operator-settings.json")
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    window.process_settings_inputs["wheel_guides.left_x_norm"].setValue(0.9)
+    window.process_settings_inputs["wheel_guides.right_x_norm"].setValue(0.1)
+    window._save_process_settings()
+    assert not (tmp_path / "operator-settings.json").exists()
+    assert "저장 실패" in window.process_settings_status.text()
+    window.close()
+
+
+def test_engine_idle_person_drives_driver_display_and_blocks_final_ok():
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    engine = window.process_engine
+    now = datetime.now(timezone.utc)
+    event = DetectionEvent(
+        camera_id="rear_side",
+        label="person",
+        confidence=0.9,
+        bbox=BoundingBox(0.1, 0.1, 0.2, 0.2),
+        timestamp=now,
+    )
+    for _ in range(2):
+        engine.observe_detections("rear_side", CameraRole.rear_side, (event,), now)
+    window._tick_process_engine()
+    assert window._driver_state_override is ParkingState.HUMAN_DETECTED
+    assert window._engine_owns_display is True
+    display = window.driver_view.display
+    assert display.can_show_final_ok is False
+    assert "프로세스" in window.process_status_label.text()
+    window.close()
+
+
+def test_engine_backs_off_while_simulation_owns_display():
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    window._driver_simulated = True
+    window._driver_state_override = ParkingState.VEHICLE_ENTERING
+    engine = window.process_engine
+    now = datetime.now(timezone.utc)
+    event = DetectionEvent(
+        camera_id="front",
+        label="person",
+        confidence=0.9,
+        bbox=BoundingBox(0.1, 0.1, 0.2, 0.2),
+        timestamp=now,
+    )
+    for _ in range(2):
+        engine.observe_detections("front", CameraRole.front, (event,), now)
+    window._tick_process_engine()
+    assert window._driver_state_override is ParkingState.VEHICLE_ENTERING  # untouched
+    assert window._engine_owns_display is False
+    window.close()
+
+
+def test_process_monitoring_autostart_waits_for_streaming_cameras(monkeypatch):
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    started: list[str] = []
+    monkeypatch.setattr(window, "_start_purpose_inference", lambda task_id: started.append(task_id))
+    window._ensure_process_monitoring()
+    assert started == []  # no streaming cameras yet
+    for camera in window.settings.active_cameras:
+        window._runtime_camera_status[camera.id] = "정상 수신"
+    window._ensure_process_monitoring()
+    assert started == ["process_monitoring"]
+    # cooldown prevents immediate retries
+    window._ensure_process_monitoring()
+    assert started == ["process_monitoring"]
+    window.close()
+
+
+def test_process_monitoring_autostart_respects_manual_tasks_and_operator_stop(monkeypatch):
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    started: list[str] = []
+    monkeypatch.setattr(window, "_start_purpose_inference", lambda task_id: started.append(task_id))
+    for camera in window.settings.active_cameras:
+        window._runtime_camera_status[camera.id] = "정상 수신"
+    window._purpose_task_enabled = True  # a manual task is running
+    window._ensure_process_monitoring()
+    assert started == []
+    window._purpose_task_enabled = False
+    window._engine_stopped_by_operator = True
+    window._ensure_process_monitoring()
+    assert started == []
+    window.close()
+
+
+def test_engine_plc_requests_are_recorded_as_simulated():
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    engine = window.process_engine
+    now = datetime.now(timezone.utc)
+    event = DetectionEvent(
+        camera_id="front",
+        label="person",
+        confidence=0.9,
+        bbox=BoundingBox(0.1, 0.1, 0.2, 0.2),
+        timestamp=now,
+    )
+    for _ in range(2):
+        engine.observe_detections("front", CameraRole.front, (event,), now)
+    window._tick_process_engine()
+    assert window.plc_adapter.events
+    assert all(event.payload.get("simulated") is True for event in window.plc_adapter.events)
+    window.close()
+
+
+def test_camera_surface_guide_overlay_and_plate_line_render():
+    _qt_app()
+    import towersightai.ui.pyqt_app as pyqt_app
+
+    surface = pyqt_app.CameraSurface("정면")
+    surface.resize(400, 260)
+    surface.set_guide_overlay((0.30, 0.70, 0.42, 0.58, 0.45, 0.80))
+    surface.set_plate_line(0.55)
+    image = surface.grab().toImage()
+    assert not image.isNull()
+    surface.set_guide_overlay(None)
+    surface.set_plate_line(None)
+    assert surface._guide_overlay is None
+    assert surface._plate_line is None

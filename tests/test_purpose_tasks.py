@@ -640,3 +640,27 @@ def test_purpose_runner_gives_up_after_restart_limit(tmp_path: Path):
     assert errors
     # The operator message carries the real error line, not pipeline-string noise.
     assert "Bad Request (400)" in errors[0]
+
+
+def test_process_monitoring_process_combines_person_and_vehicle_labels(monkeypatch, tmp_path):
+    from towersightai.inference.purpose_tasks import (
+        PROCESS_MONITORING_MIN_CONFIDENCE,
+        PURPOSE_PROCESS_MONITORING,
+        build_purpose_process,
+    )
+
+    settings = _settings(tmp_path)
+    process = build_purpose_process(
+        PURPOSE_PROCESS_MONITORING,
+        settings,
+        cameras=tuple(settings.cameras),
+        event_dir=tmp_path / "purpose",
+    )
+    assert process.task_id == PURPOSE_PROCESS_MONITORING
+    assert process.label == "프로세스 감시"
+    assert process.max_consecutive_restarts == 3
+    assert len(process.camera_ids) == len(settings.cameras)
+    command = " ".join(process.command)
+    for label in ("car", "truck", "bus", "motorcycle", "person"):
+        assert f"--allowed-label {label}" in command
+    assert f"--min-confidence {PROCESS_MONITORING_MIN_CONFIDENCE}" in command
