@@ -1,3 +1,4 @@
+import os
 import subprocess
 import json
 import sys
@@ -288,7 +289,7 @@ def test_purpose_runner_stops_spinning_gstreamer_on_fatal_hailo_log(tmp_path: Pa
     errors: list[str] = []
     process = PurposeInferenceProcess(
         task_id=PURPOSE_VEHICLE_DETECTION,
-        label="차량 전용 검출",
+        label="차량 감지",
         command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
         env={},
         log_path=tmp_path / "vehicle.gst.log",
@@ -338,7 +339,7 @@ def test_purpose_runner_stops_alive_process_on_pipeline_heartbeat_stall(tmp_path
     diagnostic_path = tmp_path / "person_presence.heartbeat.jsonl"
     process = PurposeInferenceProcess(
         task_id=PURPOSE_PERSON_PRESENCE,
-        label="사람 존재 감지",
+        label="사람 감지",
         command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
         env={},
         log_path=tmp_path / "person_presence.gst.log",
@@ -411,7 +412,7 @@ def test_purpose_runner_stops_alive_process_when_heartbeat_never_starts(tmp_path
     diagnostic_path = tmp_path / "person_presence.heartbeat.jsonl"
     process = PurposeInferenceProcess(
         task_id=PURPOSE_PERSON_PRESENCE,
-        label="사람 존재 감지",
+        label="사람 감지",
         command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
         env={},
         log_path=tmp_path / "person_presence.gst.log",
@@ -456,7 +457,7 @@ def test_purpose_runner_replaces_stalled_process_and_confirms_recovery(tmp_path:
     diagnostic_path = tmp_path / "person_presence.heartbeat.jsonl"
     process = PurposeInferenceProcess(
         task_id=PURPOSE_PERSON_PRESENCE,
-        label="사람 존재 감지",
+        label="사람 감지",
         command=("gst-launch-1.0", "-q", "fakesrc", "!", "fakesink"),
         env={},
         log_path=tmp_path / "person_presence.gst.log",
@@ -550,3 +551,92 @@ def test_read_last_text_line_does_not_require_loading_whole_history(tmp_path: Pa
     path.write_bytes((b"x" * 300_000) + b"\n{\"status\":\"stalled\"}\n")
 
     assert _read_last_text_line(path) == '{"status":"stalled"}'
+
+
+def test_purpose_runner_restarts_after_transient_child_exit(tmp_path: Path):
+    """A child killed by a transient input failure (e.g. RTSP 400) is restarted,
+    and succeeds when the input recovers on the second attempt."""
+    errors: list[str] = []
+    statuses: list[str] = []
+    marker = tmp_path / "first-attempt-done"
+    # First run: fail fast (returncode 1). Second run: stay alive briefly then exit 0.
+    script = (
+        f"if [ ! -e {marker} ]; then touch {marker}; echo 'ERROR rtsp Bad Request (400)'; exit 1; "
+        "else sleep 0.4; exit 0; fi"
+    )
+    process = PurposeInferenceProcess(
+        task_id=PURPOSE_VEHICLE_DETECTION,
+        label="차량 감지",
+        command=("sh", "-c", script),
+        env=dict(os.environ),
+        log_path=tmp_path / "vehicle.gst.log",
+        event_path=tmp_path / "vehicle.jsonl",
+        model_paths=(),
+        camera_ids=("front",),
+        max_consecutive_restarts=3,
+        restart_delay_seconds=0.05,
+    )
+    runner = PurposeInferenceRunner(
+        process,
+        on_events=lambda _events: None,
+        on_error=errors.append,
+        on_status=statuses.append,
+        poll_seconds=0.02,
+    )
+
+    assert runner.run() is True
+    log_text = (tmp_path / "vehicle.gst.log").read_text(encoding="utf-8")
+    assert "PROCESS_RESTART attempt=1 reason=child-exit returncode=1" in log_text
+    assert any("복구 중 (1/3)" in status for status in statuses)
+
+
+def test_purpose_runner_does_not_restart_a_clean_exit(tmp_path: Path):
+    """Finite tasks (image LPR) exit 0 and must never be relaunched."""
+    process = PurposeInferenceProcess(
+        task_id=PURPOSE_LPR_IMAGE,
+        label="번호판 이미지 인식",
+        command=("sh", "-c", "exit 0"),
+        env=dict(os.environ),
+        log_path=tmp_path / "lpr.gst.log",
+        event_path=tmp_path / "lpr.jsonl",
+        model_paths=(),
+        max_consecutive_restarts=3,
+        restart_delay_seconds=0.05,
+    )
+    runner = PurposeInferenceRunner(
+        process,
+        on_events=lambda _events: None,
+        on_error=lambda _msg: None,
+        poll_seconds=0.02,
+    )
+    assert runner.run() is True
+    assert "PROCESS_RESTART" not in (tmp_path / "lpr.gst.log").read_text(encoding="utf-8")
+
+
+def test_purpose_runner_gives_up_after_restart_limit(tmp_path: Path):
+    """A persistently failing child stops after the configured attempts and reports the error lines."""
+    errors: list[str] = []
+    process = PurposeInferenceProcess(
+        task_id=PURPOSE_VEHICLE_DETECTION,
+        label="차량 감지",
+        command=("sh", "-c", "echo 'ERROR GStreamer: Bad Request (400)'; exit 1"),
+        env=dict(os.environ),
+        log_path=tmp_path / "vehicle.gst.log",
+        event_path=tmp_path / "vehicle.jsonl",
+        model_paths=(),
+        camera_ids=("front",),
+        max_consecutive_restarts=2,
+        restart_delay_seconds=0.05,
+    )
+    runner = PurposeInferenceRunner(
+        process,
+        on_events=lambda _events: None,
+        on_error=errors.append,
+        poll_seconds=0.02,
+    )
+    assert runner.run() is True
+    log_text = (tmp_path / "vehicle.gst.log").read_text(encoding="utf-8")
+    assert log_text.count("PROCESS_RESTART") == 2
+    assert errors
+    # The operator message carries the real error line, not pipeline-string noise.
+    assert "Bad Request (400)" in errors[0]

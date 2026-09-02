@@ -227,17 +227,23 @@ One PyQt6 application, two surfaces in a `QStackedWidget`:
   `왼쪽 이동`, `전진`, `후진`, `주차기 밖으로 이동`), compact bottom status strip. No dev buttons, model
   names, paths, or inference counters. Camera priority follows state: front while idle → front + ceiling
   birdview through entry/alignment/safety.
-- **Operator mode** — dark industrial HMI: collapsible scrollable sidebar, dashboard / all-camera /
-  camera-settings layouts, purpose AI controls, LD2410 console, diagnostics, simulations. Entered via the
+- **Operator mode** — the developer console: a sectioned scrollable sidebar (`SIDEBAR_SECTIONS` in
+  `ui/pyqt_app.py`: 운영 / 진단 / 시스템) navigating a `QStackedWidget` of workspace pages. Entered via the
   visible bottom-right `운영자 모드` button (the on-site entry point), the invisible 72×72 px top-right hotspot
   held for 2 s (early release or pointer exit cancels), or `Ctrl+Shift+O`.
 
-Sidebar actions (`SIDEBAR_ACTION_LABELS` in `ui/pyqt_app.py`): `사용자모드`, `전체 카메라`, `카메라 설정`,
-`이전 AI Detection`, `차량 전용 검출`, `번호판 이미지 LPR`, `정면카메라LPR`, `사람 존재 감지`, `LD2410`,
-`차량 진입 시뮬레이션`, `NAS 연결 확인`, `종료`. `종료` closes the application behind `_confirm_shutdown()`;
-`NAS 연결 확인` runs `storage/connection_test.py` against the NAS `connectiontest` folder. Mode, lifecycle, and
-diagnostic controls never touch safety state or PLC output. The menu lives in a `QScrollArea` so new entries
-can never be pushed below the sidebar edge.
+The operator visual system is the approved "패널 HMI" proposal (`docs/design/operator-console-proposals.html`
+B안): panel surfaces `#151B24`/`#232C39` radius 12, amber accent `#F5A623` (`primary="true"` run buttons,
+checked nav), instrument camera tiles drawn in `CameraSurface.paintEvent` only for `contain` mode — the
+driver view (`cover`) stays chromeless cyan/navy.
+
+Workspace pages: `전체 카메라` (landing; camera grid + `이전 AI Detection` toggle), `차량 감지`, `사람 감지`,
+`번호판 인식` (정면 카메라 인식 + 이미지 LPR), `레이더 (LD2410)`, `NAS 연결 확인` (`storage/connection_test.py`),
+`시스템 점검` (DiagnosticsService off-thread), `실행 로그` (runtime log tail + filter), `주차 프로세스 테스트`
+(driver-stage playback + `차량 진입 시뮬레이션`). Camera pages share ONE camera grid
+(`operator_camera_area`) that `_adopt_camera_area` reparents into the active page with an `all` or `front`
+layout. Task run/stop buttons live on the pages, not in the sidebar; `프로그램 종료` sits behind
+`_confirm_shutdown()`. None of these controls touch safety state or PLC output.
 
 Threading: `CameraCaptureWorker`, `LiveDetectionWorker`, `PurposeInferenceWorker`, `FrontCameraLprWorker` each
 run on a `QThread` and communicate by signals. OpenCV and PyQt imports are lazy so headless tests still run.
@@ -320,8 +326,8 @@ or a PLC. Hardware tests must be explicitly marked and skippable. Fixtures stay 
 
 **UI-centered changes** (layout, buttons, status text, camera surfaces, overlays, sidebar, diagnostics) also
 require a real GUI run when an Ubuntu desktop session is available: run `pytest -q`, launch windowed, capture
-the dashboard and sidebar-open screenshots, exercise `전체 카메라` / `사용자 화면 테스트` /
-`차량 진입 시뮬레이션` / `LD2410`, and confirm final OK stays blocked. Store screenshots under
+the dashboard and sidebar-open screenshots, exercise `전체 카메라` / `주차 프로세스 테스트` /
+`차량 진입 시뮬레이션` / `레이더 (LD2410)`, and confirm final OK stays blocked. Store screenshots under
 `tmp/operator-ui-verification/` and never commit them. If no GUI is available, say so explicitly and name the
 blocker (no display session, missing `xdotool`/`gnome-screenshot`, no PyQt/OpenCV runtime). Screenshot
 verification is implementation verification only — never product safety approval.
@@ -367,6 +373,11 @@ no state, AI, or PLC contract yet and must not be inferred from the UI or the Pa
 - `Settings` requires all four cameras even when `BIRDVIEW_MODE=disabled`; use `active_cameras`, not `cameras`,
   when selecting capture/inference targets.
 - `SimulatorPLCAdapter.event_names` has unreachable code after its `return`; clean it up if you touch that file.
+- Tapo cameras allow only two concurrent RTSP sessions per stream. Preview and inference both hold
+  `stream1`, so `RAW_MEDIA_ENABLED=true` requires `CAMERA_N_RECORD_RTSP_URL=...stream2` — an empty record
+  URL makes the evidence recorder take the second `stream1` slot and the inference session dies with
+  `Bad Request (400)`. `PurposeInferenceRunner` retries transient child exits (non-zero, non-fatal) up to
+  `max_consecutive_restarts`, but a persistent three-session conflict is a configuration error.
 - pip `opencv-python` wheels are built without GStreamer, so `cv2.VideoCapture(..., CAP_GSTREAMER)` never
   opens on such installs. `CameraCaptureWorker._open_capture` falls back to a direct FFmpeg RTSP capture for
   every active camera (rotation applied in software); capture state transitions are logged under

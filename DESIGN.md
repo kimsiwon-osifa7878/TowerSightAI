@@ -191,10 +191,15 @@ Render overlays in this order:
 
 ### Operator mode
 
-- Retains all-camera inspection, camera settings, purpose-specific inference controls, diagnostics, simulations, and `EMPTY` slots.
-- Follows the current PyQt dark industrial HMI direction: collapsible sidebar, persistent NG status, dashboard/all-camera layouts, camera settings, and a telemetry strip.
-- Provides a visible `사용자모드` sidebar action for returning to the driver-facing surface.
-- Provides a `종료` sidebar action that closes the application after an explicit confirmation dialog. Cancelling the dialog changes nothing, and neither outcome alters safety state or emits a PLC event.
+- Is the developer console: a sectioned sidebar (운영/진단/시스템) navigating workspace pages for all-camera inspection, vehicle/person detection, plate LPR, LD2410, NAS check, system diagnostics, runtime log, camera settings, and driver-screen test playback.
+- Uses the approved "패널 HMI" visual system (`docs/design/operator-console-proposals.html`, proposal B):
+  ground `#0C0F14`, panels `#151B24` with `#232C39` borders and 12 px radius, amber accent `#F5A623`
+  for active navigation and page run buttons, NG `#E5484D`, streaming `#3DD68C`. Camera tiles are
+  instruments with a name/resolution header bar and a status footer bar; NG tiles carry a red frame and
+  red bars. Telemetry is a row of pill labels. The amber accent is operator-mode only — the driver-facing
+  surface keeps its cyan/navy language.
+- Provides a visible `사용자 화면` sidebar action for returning to the driver-facing surface.
+- Provides a `프로그램 종료` sidebar action that closes the application after an explicit confirmation dialog. Cancelling the dialog changes nothing, and neither outcome alters safety state or emits a PLC event.
 - Provides a `NAS 연결 확인` sidebar action that writes and verifies one test payload under the NAS `connectiontest` folder, including a two-second camera clip when a camera is streaming. The outcome is shown as operator status text only and never alters safety state or emits a PLC event.
 - Keeps the sidebar menu scrollable so a short display can never hide an operator action below the sidebar edge.
 - Owns manual state playback used for UI testing.
@@ -243,7 +248,7 @@ The reviewed prototype is the visual contract for the production PyQt6 user-mode
 - No real RTSP URL, password, PLC secret, local Hailo path, or real plate is present.
 - A short press or aborted hold on the hidden operator hotspot cannot change mode; a completed two-second hold enters operator mode.
 - The visible bottom-right `운영자 모드` button enters operator mode in one press, stays inside the view at every supported size, and never overlaps the instruction panel or the bottom strip.
-- The operator `종료` action requires confirmation and leaves the application running when the confirmation is declined.
+- The operator `프로그램 종료` action requires confirmation and leaves the application running when the confirmation is declined.
 - Operator mode exposes the PyQt-equivalent menu set, can return visibly to user mode, and never implies that AI, camera settings, or PLC output actually ran.
 - The prototype and every simulation remain visibly blocked from final PLC OK.
 - Later PyQt work preserves all existing conservative safety gates and passes the repository UI verification checklist.

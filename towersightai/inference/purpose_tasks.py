@@ -104,17 +104,17 @@ class PurposeTaskSpec:
 PURPOSE_TASK_SPECS = {
     PURPOSE_VEHICLE_DETECTION: PurposeTaskSpec(
         PURPOSE_VEHICLE_DETECTION,
-        "차량 전용 검출",
+        "차량 감지",
         "front 카메라에서 Hailo Apps 검출 모델을 실행하고 차량 라벨만 사용합니다.",
     ),
     PURPOSE_LPR_IMAGE: PurposeTaskSpec(
         PURPOSE_LPR_IMAGE,
-        "번호판 이미지 LPR",
+        "번호판 이미지 인식",
         "tmp/car_number-test 이미지를 FastALPR ONNX 모델로 순차 실행합니다.",
     ),
     PURPOSE_PERSON_PRESENCE: PurposeTaskSpec(
         PURPOSE_PERSON_PRESENCE,
-        "사람 존재 감지",
+        "사람 감지",
         "정상 수신 중인 카메라에서 Hailo Apps 검출 모델의 person 라벨을 판단합니다.",
     ),
 }
@@ -432,13 +432,98 @@ class PurposeInferenceRunner:
                 else:
                     healthy_since = None
                 if self._process.poll() is not None:
+                    exit_code = self._process.returncode
+                    # A transient input failure (e.g. an RTSP session refused with
+                    # Bad Request while the camera is at its concurrent-session limit)
+                    # kills the child outright instead of stalling it. Retry those the
+                    # same way stalls are retried; fatal Hailo conditions and clean
+                    # exits (finite tasks such as image LPR) are never retried.
+                    can_retry = (
+                        self._running
+                        and exit_code != 0
+                        and consecutive_restarts < self.process.max_consecutive_restarts
+                        and not _fatal_log_message(self.process.log_path)
+                    )
+                    if can_retry:
+                        consecutive_restarts += 1
+                        detail = _process_error_message(exit_code, self.process.log_path)
+                        logger.warning(
+                            "ai-process-restart-request run-id=%s task=%s attempt=%s max-attempts=%s reason=child-exit returncode=%s detail=%s",
+                            run_id,
+                            self.process.task_id,
+                            consecutive_restarts,
+                            self.process.max_consecutive_restarts,
+                            exit_code,
+                            redact_sensitive_text(detail),
+                        )
+                        self.on_status(
+                            f"AI 입력 스트림 복구 중 "
+                            f"({consecutive_restarts}/{self.process.max_consecutive_restarts})"
+                        )
+                        self._write_status(
+                            run_id=run_id,
+                            status="recovering",
+                            started_at=started_at,
+                            returncode=exit_code,
+                            duration_seconds=time.monotonic() - started_monotonic,
+                            event_counts=event_counts,
+                            lpr_result_count=lpr_result_count,
+                            error=detail,
+                        )
+                        if self.process.diagnostic_path is not None:
+                            _archive_runtime_file(
+                                self.process.diagnostic_path,
+                                f"{run_id}.restart-{consecutive_restarts}",
+                            )
+                        if not self._wait_before_restart(self.process.restart_delay_seconds):
+                            break
+                        try:
+                            log_fp.write(
+                                f"\nPROCESS_RESTART attempt={consecutive_restarts} "
+                                f"reason=child-exit returncode={exit_code}\n"
+                            )
+                            log_fp.flush()
+                            self._process = subprocess.Popen(
+                                self.process.command,
+                                stdout=log_fp,
+                                stderr=log_fp,
+                                text=True,
+                                env=self.process.env,
+                                start_new_session=True,
+                            )
+                        except OSError as exc:
+                            message = f"failed to restart {self.process.command[0]}: {exc}"
+                            logger.exception(
+                                "ai-process-restart-failed run-id=%s task=%s attempt=%s",
+                                run_id,
+                                self.process.task_id,
+                                consecutive_restarts,
+                            )
+                            self.on_error(message)
+                            terminal_error = True
+                            break
+                        recovery_pending = True
+                        healthy_since = None
+                        diagnostic_launch_monotonic = time.monotonic()
+                        logger.info(
+                            "ai-process-restart run-id=%s task=%s attempt=%s pid=%s",
+                            run_id,
+                            self.process.task_id,
+                            consecutive_restarts,
+                            getattr(self._process, "pid", None),
+                        )
+                        continue
                     if recovery_pending:
-                        message = "AI recovery process exited before all required camera heartbeats became healthy"
+                        detail = redact_sensitive_text(_process_error_message(exit_code, self.process.log_path))
+                        message = (
+                            "AI recovery process exited before all required camera heartbeats became healthy"
+                            + (f": {detail}" if detail else "")
+                        )
                         logger.error(
                             "ai-process-recovery-incomplete run-id=%s task=%s returncode=%s",
                             run_id,
                             self.process.task_id,
-                            self._process.returncode,
+                            exit_code,
                         )
                         self.on_error(message)
                         terminal_error = True
@@ -1090,8 +1175,22 @@ def _redact_rtsp_credentials(text: str) -> str:
     return re.sub(r"(rtsp://)([^@\s/]+)@", r"\1***:***@", text)
 
 
+def _extract_error_lines(log_tail: str, *, limit: int = 3) -> str:
+    """Prefer the actual ERROR lines over pipeline-string noise in operator-facing text."""
+    markers = ("ERROR", "Bad Request", "error", "failed", "Failed")
+    lines = [
+        line.strip()
+        for line in log_tail.splitlines()
+        if any(marker in line for marker in markers) and "PIPELINE_" not in line
+    ]
+    return " · ".join(lines[-limit:])
+
+
 def _process_error_message(returncode: int | None, log_path: Path) -> str:
     log_tail = _read_log_tail(log_path)
+    error_lines = _extract_error_lines(log_tail)
+    if error_lines:
+        return error_lines
     if log_tail:
         return log_tail
     return f"gst-launch exited with {returncode}"
@@ -1103,7 +1202,7 @@ def _fatal_log_message(log_path: Path) -> str:
         return ""
     for pattern in FATAL_GSTREAMER_PATTERNS:
         if pattern in log_tail:
-            return log_tail
+            return _extract_error_lines(log_tail) or log_tail
     return ""
 
 

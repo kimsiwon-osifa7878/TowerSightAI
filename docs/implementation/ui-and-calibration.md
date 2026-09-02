@@ -46,24 +46,26 @@ In disabled birdview mode, the dashboard shows only front and the all-camera lay
 
 ## Sidebar and Feature Slots
 
-The sidebar is a collapsible, vertically scrollable operator control surface. The menu must stay reachable on short displays, so entries live in a scroll area rather than an unbounded column.
+Operator mode is the developer console. The sidebar is a collapsible, vertically scrollable navigation
+surface grouped into sections; every entry either opens a workspace page or performs a mode/lifecycle
+action. Task run/stop controls live inside their pages, not in the sidebar.
 
-Current connected entries:
+Current sections and entries:
 
-- `사용자모드`
-- `전체 카메라`
-- `카메라 설정`
-- `이전 AI Detection`
-- `차량 전용 검출`
-- `번호판 이미지 LPR`
-- `정면카메라LPR`
-- `사람 존재 감지`
-- `LD2410`
-- `차량 진입 시뮬레이션`
-- `NAS 연결 확인`
-- `종료`
+- `운영`: `사용자 화면`, `주차 프로세스 테스트`
+- `진단`: `전체 카메라`, `차량 감지`, `사람 감지`, `번호판 인식`, `레이더 (LD2410)`, `NAS 연결 확인`, `시스템 점검`, `실행 로그`
+- `시스템`: `카메라 설정`, `프로그램 종료`
 
-`사용자모드` returns to the driver-facing surface. `종료` closes the application and must ask for explicit
+Workspace pages share one camera grid: `전체 카메라`, `사람 감지` adopt it in the all-camera layout, and
+`차량 감지`, `번호판 인식` adopt it front-focused. Each page carries a title, purpose text, and its own
+run/stop controls (`차량 감지 시작`, `사람 감지 시작`, `정면 카메라 인식`, `이미지 LPR`, `NAS 연결 확인 실행`,
+`이전 AI Detection` on the camera page, and the driver-stage buttons plus `차량 진입 시뮬레이션` on the
+user-screen test page). `시스템 점검` runs DiagnosticsService tests (settings, Hailo installation, sample
+image, per-camera frames, PLC simulator, full smoke) off the UI thread with results appended to a page log;
+every result stays `safe_to_operate=False`. `실행 로그` tails `artifacts/runtime/towersightai.log` with a substring
+filter and follow mode.
+
+`사용자 화면` returns to the driver-facing surface. `프로그램 종료` closes the application and must ask for explicit
 confirmation first; a declined confirmation changes nothing. Neither action changes safety state, calibration
 state, or PLC output.
 
@@ -79,20 +81,20 @@ connection. The result is diagnostic evidence only and never authorizes final OK
 
 Purpose-specific AI controls should use fixed, known-compatible TAPPAS example model sets:
 
-- `차량 전용 검출`: front camera only, Hailo LPR example `yolov5m_vehicles`.
-- `번호판 이미지 LPR`: image-set test using `tmp/car_number-test` and FastALPR ONNX. It must log per-image inference time and OCR results.
-- `사람 존재 감지`: currently streaming cameras using the TAPPAS person detector path. It must infer only whether a person exists; do not run Re-ID embedding, gallery matching, or same-person tracking.
+- `차량 감지`: front camera only, Hailo LPR example `yolov5m_vehicles`.
+- `번호판 이미지 인식`: image-set test using `tmp/car_number-test` and FastALPR ONNX. It must log per-image inference time and OCR results.
+- `사람 감지`: currently streaming cameras using the TAPPAS person detector path. It must infer only whether a person exists; do not run Re-ID embedding, gallery matching, or same-person tracking.
 
 These controls are for integration diagnosis and staged feature development. They must show running/error/log status in the operator status strip and keep final OK blocked.
 
-The `LD2410` entry opens a read-only serial-style console in the operator workspace. It shows connection state, parsed values, and original HEX for the latest 500 frames. Pause and clear affect presentation only; LD2410 remains raw audit context and cannot alter safety state, PLC state, calibration state, or final OK.
+The `레이더 (LD2410)` entry opens a read-only serial-style console in the operator workspace. It shows connection state, parsed values, and original HEX for the latest 500 frames. Pause and clear affect presentation only; LD2410 remains raw audit context and cannot alter safety state, PLC state, calibration state, or final OK.
 
 ## UI Test and Simulation Behavior
 
 UI test and simulation actions are for implementation verification only.
 
 - Vehicle-entry simulation may draw test overlays and update instruction text.
-- Driver-stage controls live in the operator-only `사용자 화면 테스트` panel.
+- Driver-stage controls live in the operator-only `주차 프로세스 테스트` panel.
 - Fake camera, fake detection, fake PLC, and fake AI-stage actions must be visually marked or described as test-only.
 - Test actions must not send real PLC events.
 - Test actions must not make `can_show_final_ok` true.

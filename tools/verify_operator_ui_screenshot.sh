@@ -23,7 +23,7 @@ ALL_CAMERAS_SCREENSHOT="$OUT_DIR/operator-ui-all-cameras-$STAMP.png"
 USER_AFTER_ALL_CAMERAS_SCREENSHOT="$OUT_DIR/user-ui-after-all-cameras-$STAMP.png"
 PERSON_SCREENSHOT="$OUT_DIR/operator-ui-person-presence-$STAMP.png"
 USER_AFTER_PERSON_SCREENSHOT="$OUT_DIR/user-ui-after-person-presence-$STAMP.png"
-SIMULATION_SCREENSHOT="$OUT_DIR/operator-ui-simulation-$STAMP.png"
+LOG_SCREENSHOT="$OUT_DIR/operator-ui-log-$STAMP.png"
 LD2410_SCREENSHOT="$OUT_DIR/operator-ui-ld2410-$STAMP.png"
 DRIVER_TEST_SCREENSHOT="$OUT_DIR/operator-ui-driver-test-$STAMP.png"
 OPERATOR_BUTTON_SCREENSHOT="$OUT_DIR/operator-ui-from-user-button-$STAMP.png"
@@ -58,6 +58,15 @@ fi
 cleanup() {
   if [[ -n "${APP_PID:-}" ]] && kill -0 "$APP_PID" 2>/dev/null; then
     kill "$APP_PID" 2>/dev/null || true
+    # A leftover UI keeps camera RTSP sessions and starves later inference runs
+    # (per-camera concurrent-session limit), so force-kill if it survives SIGTERM.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$APP_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$APP_PID" 2>/dev/null; then
+      kill -9 "$APP_PID" 2>/dev/null || true
+    fi
     wait "$APP_PID" 2>/dev/null || true
   fi
 }
@@ -149,38 +158,38 @@ if [[ -n "$WINDOW_ID" ]]; then
   gnome-screenshot -f "$SIDEBAR_SCREENSHOT"
   identify "$SIDEBAR_SCREENSHOT"
 
-  click_at 150 147
+  click_at 150 261
   gnome-screenshot -f "$ALL_CAMERAS_SCREENSHOT"
   identify "$ALL_CAMERAS_SCREENSHOT"
 
-  click_at 150 98
+  click_at 150 129
   gnome-screenshot -f "$USER_AFTER_ALL_CAMERAS_SCREENSHOT"
   identify "$USER_AFTER_ALL_CAMERAS_SCREENSHOT"
 
   enter_operator
-  click_at 150 447
+  click_at 150 361
   gnome-screenshot -f "$PERSON_SCREENSHOT"
   identify "$PERSON_SCREENSHOT"
 
-  click_at 150 98
+  click_at 150 129
   gnome-screenshot -f "$USER_AFTER_PERSON_SCREENSHOT"
   identify "$USER_AFTER_PERSON_SCREENSHOT"
 
   enter_operator
-  click_at 150 497
+  click_at 150 461
   gnome-screenshot -f "$LD2410_SCREENSHOT"
   identify "$LD2410_SCREENSHOT"
 
-  click_at 150 547
-  gnome-screenshot -f "$SIMULATION_SCREENSHOT"
-  identify "$SIMULATION_SCREENSHOT"
+  click_at 150 611
+  gnome-screenshot -f "$LOG_SCREENSHOT"
+  identify "$LOG_SCREENSHOT"
 
-  click_at 150 697
+  click_at 150 179
   gnome-screenshot -f "$DRIVER_TEST_SCREENSHOT"
   identify "$DRIVER_TEST_SCREENSHOT"
 
   # Operator menu exit control. Escape dismisses the confirmation so the app survives.
-  click_at 150 647
+  click_at 150 743
   gnome-screenshot -f "$EXIT_CONFIRM_SCREENSHOT"
   identify "$EXIT_CONFIRM_SCREENSHOT"
   xdotool key --clearmodifiers Escape
@@ -191,7 +200,7 @@ if [[ -n "$WINDOW_ID" ]]; then
   fi
 
   # Return to user mode and re-enter operator mode with the visible bottom-right button.
-  click_at 150 97
+  click_at 150 129
   sleep 1
   enter_operator_by_button
   gnome-screenshot -f "$OPERATOR_BUTTON_SCREENSHOT"

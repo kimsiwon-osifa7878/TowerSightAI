@@ -43,7 +43,7 @@ Reference hardware experiments:
 ## Driver Display Direction
 
 - Keep user mode and operator mode as separate surfaces within the same application.
-- User mode keeps two operator entry points: the hidden two-second top-right hold and a visible bottom-right `운영자 모드` service button for on-site use. Operator mode owns the return path (`사용자모드`) and application exit (`종료`, confirmation required) in its menu. These are mode/lifecycle controls only and must never carry diagnostics, change safety state, or emit PLC events.
+- User mode keeps two operator entry points: the hidden two-second top-right hold and a visible bottom-right `운영자 모드` service button for on-site use. Operator mode owns the return path (`사용자 화면`) and application exit (`프로그램 종료`, confirmation required) in its menu. These are mode/lifecycle controls only and must never carry diagnostics, change safety state, or emit PLC events.
 - User mode is the parking-machine display seen by the driver. Prioritize live camera context, ceiling birdview alignment, one current instruction, and the blocking reason.
 - Operator mode owns diagnostics, model details, camera inspection, settings, calibration, and test controls. Do not expose local paths, inference counters, or development state buttons on the driver-facing surface.
 - Use the provided ParkIO concept guide for product flow and visual direction only. It is not a verified safety specification and does not prove that alignment, occupancy, obstacle, exit, or PLC behavior is implemented.
@@ -84,9 +84,9 @@ Required post-implementation checks:
 4. Click `메뉴` and capture the sidebar-open screenshot.
 5. Verify key UI flows by clicking:
    - `전체 카메라`
-   - `사용자 화면 테스트`
-   - `차량 진입 시뮬레이션`
-   - `LD2410`
+   - `주차 프로세스 테스트` (and `차량 진입 시뮬레이션` inside it)
+   - `레이더 (LD2410)`
+   - `실행 로그`
 6. Confirm the UI still keeps final OK blocked for simulation and LD2410 console actions.
 7. Store screenshots under `tmp/operator-ui-verification/` and do not commit them.
 

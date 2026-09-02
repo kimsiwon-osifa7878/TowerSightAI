@@ -101,7 +101,7 @@ Runtime defaults are `~/hailo-apps`, Hailo-8 `yolov8m.hef`, and `libyolo_hailort
 
 ### FastALPR Models
 
-`번호판 이미지 LPR` does **not** use the TAPPAS `tiny_yolov4_license_plates.hef` or `lprnet.hef` pipeline. The current implementation uses [FastALPR](https://github.com/ankandrew/fast-alpr) on the CPU with:
+`번호판 이미지 인식` does **not** use the TAPPAS `tiny_yolov4_license_plates.hef` or `lprnet.hef` pipeline. The current implementation uses [FastALPR](https://github.com/ankandrew/fast-alpr) on the CPU with:
 
 - Detector: `yolo-v9-t-384-license-plate-end2end`
 - OCR: `cct-xs-v2-global-model`
@@ -163,7 +163,10 @@ Important values:
 - `HAILO_PERSON_PRESENCE_*`: person-task HEF and postprocess mapping.
 - `FAST_ALPR_DETECTOR_MODEL`, `FAST_ALPR_OCR_MODEL`: CPU-side plate detector and OCR model selection.
 - `HAILO_NETWORK_NAME`: defaults to `filter_letterbox` for the current YOLO postprocess.
-- `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, preview RTSP URL, optional dedicated H.264 `CAMERA_N_RECORD_RTSP_URL`, optional username/password, and `CAMERA_N_ROTATION_DEGREES`.
+- `CAMERA_1_*` through `CAMERA_4_*`: camera ID, role, preview RTSP URL, dedicated H.264
+  `CAMERA_N_RECORD_RTSP_URL` (point it at `stream2`: preview and AI inference both hold `stream1`
+  sessions, and Tapo refuses a third `stream1` session with RTSP 400), optional username/password,
+  and `CAMERA_N_ROTATION_DEGREES`.
 - `CALIBRATION_PATH`: calibration JSON path.
 - `PLC_ENDPOINT`: PLC or simulator endpoint.
 - `UI_CAMERA_RESOLUTION`: preview/display capture resolution, for example `1920x1080` or `1280x720`.
@@ -231,29 +234,33 @@ operator dashboard; this is the intended on-site entry point. Holding the invisi
 top-right corner for two seconds with a mouse or touch input does the same thing, and releasing early or moving
 outside that area cancels the transition. `Ctrl+Shift+O` remains a service-keyboard fallback.
 
-From operator mode, `사용자모드` in the sidebar returns to the driver display and `종료` closes the application
+From operator mode, `사용자 화면` in the sidebar returns to the driver display and `프로그램 종료` closes the application
 after a confirmation dialog. Declining the confirmation leaves the application running. Neither control changes
 safety state or sends a PLC event.
 
-Dashboard behavior:
+Operator console behavior (developer mode):
 
 - User mode fills the display with state-priority cameras and overlays one large driver action at the top.
-- Driver development controls are available only in the operator sidebar under `사용자 화면 테스트`.
-- With `BIRDVIEW_MODE=disabled`, the dashboard shows the front camera only and `전체 카메라` shows front plus both side cameras; the UI keeps final OK blocked.
-- With `BIRDVIEW_MODE=ceiling`, the ceiling birdview and front camera are shown first, and the vertical birdview tile uses its configured rotation.
-- The sidebar opens from the `메뉴` button.
-- `전체 카메라` switches to the active-camera inspection layout.
-- `이전 AI Detection` starts the previous working multistream launch path for regression isolation.
-- `차량 전용 검출` runs the configured Hailo Apps detector on the front camera and keeps vehicle labels only.
-- `번호판 이미지 LPR` runs the Hailo LPR example models against sanitized images in `tmp/car_number-test`.
-- `사람 존재 감지` runs the configured Hailo Apps detector on currently streaming cameras and keeps `person` only.
-- `LD2410` shows the latest 500 ESP32 frames as parsed values plus original hexadecimal bytes, with connection status and display-only pause/clear controls.
-- `차량 진입 시뮬레이션` is UI-only and keeps PLC OK blocked.
+- The operator sidebar is grouped into `운영` / `진단` / `시스템` sections and navigates to workspace pages;
+  task run/stop controls live inside their pages. It scrolls vertically so every entry stays reachable.
+- `전체 카메라` is the landing page: the active-camera grid with centered, ratio-correct tiles, plus the
+  `이전 AI Detection` regression-isolation toggle.
+- With `BIRDVIEW_MODE=disabled` the grid shows front plus both side cameras; with `BIRDVIEW_MODE=ceiling`
+  the ceiling birdview joins the grid using its configured rotation. Either way final OK stays blocked.
+- `차량 감지` focuses the front camera and runs the configured Hailo Apps detector with vehicle labels only.
+- `사람 감지` runs the detector on currently streaming cameras and keeps `person` only.
+- `번호판 인식` offers `정면 카메라 인식` (front snapshot) and `이미지 LPR` (`tmp/car_number-test`), both FastALPR
+  on CPU, with the latest result shown on the page.
+- `레이더 (LD2410)` shows the latest 500 ESP32 frames as parsed values plus original hexadecimal bytes, with connection status and display-only pause/clear controls.
 - `NAS 연결 확인` writes a test payload to `${SYNOLOGY_NAS_FOLDER}/connectiontest/check-<UTC timestamp>/` and
   verifies it by reading it back. When a camera is streaming it also uploads a two-second clip from that
   camera. It is diagnostic only and keeps PLC OK blocked.
-- `종료` asks for confirmation and then closes the application. It never sends a PLC event.
-- The sidebar scrolls vertically, so every menu entry stays reachable on short displays.
+- `시스템 점검` runs settings/Hailo/camera/PLC diagnostics off the UI thread; every result stays
+  `safe_to_operate=False`.
+- `실행 로그` tails `artifacts/runtime/towersightai.log` with a substring filter and follow mode.
+- `주차 프로세스 테스트` hosts the driver-stage playback buttons and `차량 진입 시뮬레이션`; all of it is UI-only
+  and keeps PLC OK blocked.
+- `프로그램 종료` asks for confirmation and then closes the application. It never sends a PLC event.
 
 Camera preview capture first tries the OpenCV GStreamer backend. When the installed `cv2` was built
 without GStreamer (the pip `opencv-python` wheels are), every active camera falls back to a direct FFmpeg
@@ -268,9 +275,9 @@ Disconnected active cameras remain visible as NG tiles and are not used as infer
 
 Purpose-specific AI buttons use the current Hailo Apps detection resource set and always keep PLC OK blocked:
 
-- `차량 전용 검출`: `HAILO_VEHICLE_DETECTION_HEF_PATH`, defaulting to Hailo-8 `yolov8m.hef`, with vehicle-label filtering.
-- `번호판 이미지 LPR`: CPU-side FastALPR with `yolo-v9-t-384-license-plate-end2end` and `cct-xs-v2-global-model`; it does not use the legacy TAPPAS LPR HEFs.
-- `사람 존재 감지`: `HAILO_PERSON_PRESENCE_HEF_PATH`, defaulting to Hailo-8 `yolov8m.hef`, with `person` filtering; it does not run Re-ID embedding, gallery matching, or same-person tracking.
+- `차량 감지`: `HAILO_VEHICLE_DETECTION_HEF_PATH`, defaulting to Hailo-8 `yolov8m.hef`, with vehicle-label filtering.
+- `번호판 이미지 인식`: CPU-side FastALPR with `yolo-v9-t-384-license-plate-end2end` and `cct-xs-v2-global-model`; it does not use the legacy TAPPAS LPR HEFs.
+- `사람 감지`: `HAILO_PERSON_PRESENCE_HEF_PATH`, defaulting to Hailo-8 `yolov8m.hef`, with `person` filtering; it does not run Re-ID embedding, gallery matching, or same-person tracking.
 
 Logs are written under `artifacts/runtime/purpose-ai/`. These buttons are implementation and integration checks only; they do not authorize PLC OK.
 
@@ -339,9 +346,9 @@ For UI-centered changes, also verify the main button flows directly in the runni
 1. Confirm the first screen is the operator dashboard.
 2. Click `메뉴` and confirm the sidebar opens.
 3. Click `전체 카메라` and confirm the four-camera view appears.
-4. Click `사람 존재 감지` and confirm the status strip shows the purpose AI task.
+4. Click `사람 감지` and confirm the status strip shows the purpose AI task.
 5. Click `차량 진입 시뮬레이션` and confirm it is visibly test-only.
-6. Click `LD2410` and confirm live parsed values plus HEX appear without changing PLC or safety state.
+6. Click `레이더 (LD2410)` and confirm live parsed values plus HEX appear without changing PLC or safety state.
 7. Confirm simulation and LD2410 console actions do not show final OK.
 
 If a GUI session is unavailable, record that the screenshot/button verification was not run and why. UI screenshot verification is not safety approval and never authorizes PLC OK.

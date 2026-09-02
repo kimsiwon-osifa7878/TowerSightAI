@@ -12,7 +12,12 @@ from PyQt6.QtWidgets import QApplication
 
 from towersightai.config.settings import CameraRole, LD2410Config, RawStorageConfig, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
-from towersightai.inference.purpose_tasks import PlateOcrEvent, PURPOSE_LPR_IMAGE
+from towersightai.inference.purpose_tasks import (
+    PlateOcrEvent,
+    PURPOSE_LPR_IMAGE,
+    PURPOSE_PERSON_PRESENCE,
+    PURPOSE_VEHICLE_DETECTION,
+)
 from towersightai.sensors.ld2410 import LD2410Frame
 from towersightai.state_machine.core import ParkingState
 from towersightai.ui.model import AlignmentResult, DriverTone, build_operator_display
@@ -274,9 +279,9 @@ def test_legacy_ai_detection_label_shows_counts_without_model_load_state():
 
 
 def test_purpose_detection_label_shows_task_counts_and_load_time():
-    assert _purpose_detection_label("차량 전용 검출", ("front",), {"front": 2}) == "차량 전용 검출 ON: front(2)"
-    assert "loading 1.5s" in _purpose_detection_label("번호판 이미지 LPR", (), loading_seconds=1.5)
-    assert "first inference 2.4s" in _purpose_detection_label("사람 존재 감지", ("front",), first_inference_seconds=2.4)
+    assert _purpose_detection_label("차량 감지", ("front",), {"front": 2}) == "차량 감지 ON: front(2)"
+    assert "loading 1.5s" in _purpose_detection_label("번호판 이미지 인식", (), loading_seconds=1.5)
+    assert "first inference 2.4s" in _purpose_detection_label("사람 감지", ("front",), first_inference_seconds=2.4)
 
 
 def test_operator_side_panel_width_is_fixed_for_long_detection_status():
@@ -292,7 +297,7 @@ def test_operator_ui_starts_on_user_mode_with_sidebar_closed():
     assert app is not None
     assert window.stack.currentWidget() is window.user_view
     assert window.stack.count() == 3
-    assert window._camera_layout_mode == "dashboard"
+    assert window._camera_layout_mode == "all"
     assert not hasattr(window, "user_mode_buttons")
     assert set(window.driver_test_buttons) == {"실제 상태", "IDLE", "진입", "진입완료", "번호판인식", "주차시작"}
     assert window.driver_test_panel.isHidden() is True
@@ -311,24 +316,24 @@ def test_operator_ui_starts_on_user_mode_with_sidebar_closed():
     assert window.camera_widgets[CameraRole.front].display_mode == "contain"
     assert window.operator_sidebar.isHidden() is True
     assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
-    assert "사용자모드" in {button.text() for button in window.sidebar_buttons.values()}
-    assert "운영 대시보드" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert "운전자 화면" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert "이전 AI Detection" in {button.text() for button in window.sidebar_buttons.values()}
-    assert "차량 전용 검출" in {button.text() for button in window.sidebar_buttons.values()}
-    assert "번호판 이미지 LPR" in {button.text() for button in window.sidebar_buttons.values()}
-    assert "정면카메라LPR" in {button.text() for button in window.sidebar_buttons.values()}
-    assert "사람 존재 감지" in {button.text() for button in window.sidebar_buttons.values()}
-    assert "LD2410" in {button.text() for button in window.sidebar_buttons.values()}
-    assert "AI모델 선택" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert "테스트" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert "AI Detection" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert "Multi-Camera Re-ID" not in {button.text() for button in window.sidebar_buttons.values()}
-    assert "EMPTY" not in {button.text() for button in window.sidebar_buttons.values()}
+    labels = {button.text() for button in window.sidebar_buttons.values()}
+    assert {"사용자 화면", "주차 프로세스 테스트", "전체 카메라", "차량 감지", "사람 감지", "번호판 인식"} <= labels
+    assert {"레이더 (LD2410)", "NAS 연결 확인", "시스템 점검", "실행 로그", "카메라 설정", "프로그램 종료"} <= labels
+    # Task run/stop controls moved into their pages; the sidebar is navigation only.
+    assert "차량 감지 시작" not in labels
+    assert "사람 감지 시작" not in labels
+    assert "번호판 이미지 인식 시작" not in labels
+    assert "정면 카메라 인식" not in labels
+    assert "이전 AI Detection" not in labels
+    assert "차량 진입 시뮬레이션" not in labels
+    assert "EMPTY" not in labels
+    assert window.legacy_ai_detection_button.text() == "이전 AI Detection"
+    assert window.front_lpr_button.text() == "정면 카메라 인식"
+    assert window.vehicle_sim_button.text() == "차량 진입 시뮬레이션"
 
     window.sidebar_toggle_button.click()
     assert window.operator_sidebar.isHidden() is False
-    window.sidebar_buttons["사용자모드"].click()
+    window.sidebar_buttons["사용자 화면"].click()
     assert window.stack.currentWidget() is window.user_view
     assert window.camera_widgets[CameraRole.ceiling].display_mode == "cover"
     assert window.camera_widgets[CameraRole.front].display_mode == "cover"
@@ -355,7 +360,7 @@ def test_disabled_birdview_is_hidden_and_does_not_start_ceiling_capture(monkeypa
     assert window.driver_view.display.visible_roles == (CameraRole.front,)
 
     window._show_operator_dashboard()
-    assert window.grid.count() == 1
+    assert window.grid.count() == 3
     assert window.grid.itemAtPosition(0, 0).widget() is window.camera_widgets[CameraRole.front]
 
     window._show_all_cameras()
@@ -412,14 +417,16 @@ def test_all_cameras_closes_driver_preview_and_shows_four_operator_cameras():
 
     window._unlock_operator()
     window.driver_test_toggle.click()
-    assert window.operator_workspace_stack.currentWidget() is window.driver_preview_host
+    assert window.operator_workspace_stack.currentWidget() is window.operator_pages["주차 프로세스 테스트"]
+    assert window.driver_preview_host.isVisible() is True
 
     window.sidebar_buttons["전체 카메라"].click()
     app.processEvents()
 
     assert window.driver_test_toggle.isChecked() is False
     assert window.driver_test_panel.isHidden() is True
-    assert window.operator_workspace_stack.currentWidget() is window.operator_camera_area
+    assert window.operator_workspace_stack.currentWidget() is window.operator_pages["전체 카메라"]
+    assert window.operator_camera_area.parentWidget() is window.operator_pages["전체 카메라"]
     assert window.grid.count() == 4
     assert {
         window.grid.itemAtPosition(row, column).widget()
@@ -447,7 +454,7 @@ def test_user_mode_restores_after_person_inference_operator_flow(monkeypatch):
     }
 
     window._show_operator_dashboard()
-    window.sidebar_buttons["사람 존재 감지"].click()
+    window.purpose_task_buttons[PURPOSE_PERSON_PRESENCE].click()
     app.processEvents()
     assert window._purpose_task_enabled is True
     assert window._purpose_task_id == "person_presence"
@@ -475,7 +482,7 @@ def test_long_inference_status_does_not_expand_user_mode_after_return():
 
     window._show_operator_dashboard()
     window.ai_detection_label.setText(
-        "사람 존재 감지 ON: ceiling(146), front(266), rear_side(123), "
+        "사람 감지 ON: ceiling(146), front(266), rear_side(123), "
         "opposite_side(1) / first inference 13.9s"
     )
     app.processEvents()
@@ -569,7 +576,8 @@ def test_operator_driver_test_buttons_show_same_ratio_driver_preview(monkeypatch
     window.driver_test_toggle.click()
 
     preview = window.driver_preview
-    assert window.operator_workspace_stack.currentWidget() is window.driver_preview_host
+    assert window.operator_workspace_stack.currentWidget() is window.operator_pages["주차 프로세스 테스트"]
+    assert window.driver_preview_host.isVisible() is True
     assert preview.operator_hotspot.isHidden() is True
     assert abs(preview.width() / preview.height() - 1920 / 1024) < 0.01
 
@@ -1170,7 +1178,7 @@ def test_legacy_ai_detection_button_starts_previous_detection_path(monkeypatch):
     window = OperatorWindow(display, settings=settings)
     window._runtime_camera_status = {"ceiling": "정상 수신", "front": "정상 수신"}
 
-    window.sidebar_buttons["이전 AI Detection"].click()
+    window.legacy_ai_detection_button.click()
 
     assert window._detection_legacy_mode is True
     assert window.legacy_ai_detection_button.isChecked() is True
@@ -1192,7 +1200,7 @@ def test_vehicle_purpose_button_starts_front_only_task(monkeypatch):
     window = OperatorWindow(display, settings=settings)
     window._runtime_camera_status = {"front": "정상 수신", "ceiling": "정상 수신"}
 
-    window.sidebar_buttons["차량 전용 검출"].click()
+    window.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION].click()
 
     assert window._purpose_task_enabled is True
     assert window._purpose_task_id == "vehicle_detection"
@@ -1200,7 +1208,7 @@ def test_vehicle_purpose_button_starts_front_only_task(monkeypatch):
     assert len(window._purpose_workers) == 1
     assert isinstance(window._purpose_workers[0], PurposeInferenceWorker)
     assert window._purpose_workers[0].camera_ids == ("front",)
-    assert window.ai_detection_label.text() == "차량 전용 검출 ON: front(0) / loading 0.0s"
+    assert window.ai_detection_label.text() == "차량 감지 ON: front(0) / loading 0.0s"
     window.close()
 
 
@@ -1212,14 +1220,14 @@ def test_lpr_purpose_button_starts_image_task_without_camera(monkeypatch):
     monkeypatch.setattr(QThread, "start", lambda self: None)
     window = OperatorWindow(display, settings=settings)
 
-    window.sidebar_buttons["번호판 이미지 LPR"].click()
+    window.purpose_task_buttons[PURPOSE_LPR_IMAGE].click()
 
     assert window._purpose_task_enabled is True
     assert window._purpose_task_id == "lpr_image"
     assert window.purpose_task_buttons["lpr_image"].isChecked() is True
     assert len(window._purpose_workers) == 1
     assert window._purpose_workers[0].camera_ids == ()
-    assert window.ai_detection_label.text() == "번호판 이미지 LPR ON / loading 0.0s"
+    assert window.ai_detection_label.text() == "번호판 이미지 인식 ON / loading 0.0s"
     window.close()
 
 
@@ -1282,13 +1290,13 @@ def test_front_camera_lpr_runs_without_stopping_ai_detection(monkeypatch):
     window._detection_enabled = True
     window._detection_workers.append(object())
 
-    window.sidebar_buttons["정면카메라LPR"].click()
+    window.front_lpr_button.click()
 
     assert stopped is False
     assert window._detection_enabled is True
     assert len(window._front_lpr_workers) == 1
     assert window.front_lpr_button.isChecked() is True
-    assert window.front_lpr_button.text() == "정면카메라LPR ON"
+    assert window.front_lpr_button.text() == "정면 카메라 인식 중…"
     window.close()
 
 
@@ -1312,7 +1320,7 @@ def test_front_camera_lpr_runs_while_purpose_worker_exists(monkeypatch):
     window._purpose_task_enabled = True
     window._purpose_task_id = "person_presence"
 
-    window.sidebar_buttons["정면카메라LPR"].click()
+    window.front_lpr_button.click()
 
     assert existing_worker in window._purpose_workers
     assert len(window._front_lpr_workers) == 1
@@ -1328,7 +1336,7 @@ def test_front_camera_lpr_requires_front_frame(monkeypatch):
     monkeypatch.setattr(QThread, "start", lambda self: None)
     window = OperatorWindow(display, settings=settings)
 
-    window.sidebar_buttons["정면카메라LPR"].click()
+    window.front_lpr_button.click()
 
     assert len(window._front_lpr_workers) == 0
     assert window.instruction_label.text() == "정면카메라LPR 실패: 정면 프레임 없음"
@@ -1362,8 +1370,8 @@ def test_front_camera_lpr_duplicate_click_does_not_start_second_worker(monkeypat
     frame.fill(QColor("#ffffff"))
     window.camera_widgets[CameraRole.front].set_frame(frame)
 
-    window.sidebar_buttons["정면카메라LPR"].click()
-    window.sidebar_buttons["정면카메라LPR"].click()
+    window.front_lpr_button.click()
+    window.front_lpr_button.click()
 
     assert len(window._front_lpr_workers) == 1
     assert "실행 중" in window.warning_label.text()
@@ -1379,14 +1387,14 @@ def test_person_presence_purpose_button_uses_streaming_cameras(monkeypatch):
     window = OperatorWindow(display, settings=settings)
     window._runtime_camera_status = {"ceiling": "정상 수신", "front": "정상 수신", "rear_side": "NG: 프레임 지연"}
 
-    window.sidebar_buttons["사람 존재 감지"].click()
+    window.purpose_task_buttons[PURPOSE_PERSON_PRESENCE].click()
 
     assert window._purpose_task_enabled is True
     assert window._purpose_task_id == "person_presence"
     assert window.purpose_task_buttons["person_presence"].isChecked() is True
     assert len(window._purpose_workers) == 1
     assert window._purpose_workers[0].camera_ids == ("ceiling", "front")
-    assert window.ai_detection_label.text() == "사람 존재 감지 ON: ceiling(0), front(0) / loading 0.0s"
+    assert window.ai_detection_label.text() == "사람 감지 ON: ceiling(0), front(0) / loading 0.0s"
     window.close()
 
 
@@ -1396,7 +1404,7 @@ def test_vehicle_entry_simulation_is_ui_only_and_keeps_final_ok_blocked():
     model = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
     window = OperatorWindow(model)
 
-    window.sidebar_buttons["차량 진입 시뮬레이션"].click()
+    window.vehicle_sim_button.click()
 
     assert window._vehicle_entry_simulation is True
     assert "진입 차량 감지" in window.instruction_label.text()
@@ -1416,7 +1424,7 @@ def test_ld2410_console_shows_frames_and_controls_are_display_only():
     window._unlock_operator()
     before_ok = window.model.can_show_final_ok
 
-    window.sidebar_buttons["LD2410"].click()
+    window.sidebar_buttons["레이더 (LD2410)"].click()
     frame = LD2410Frame(
         received_at=datetime.now(timezone.utc),
         data_type=2,
@@ -1488,7 +1496,7 @@ def test_sidebar_user_screen_test_panel_fits_window_after_empty_removal():
     assert last_button.isVisible() is True
     assert last_button.mapTo(window.operator_sidebar, last_button.rect().bottomLeft()).y() <= sidebar_bottom
 
-    window.sidebar_buttons["LD2410"].click()
+    window.sidebar_buttons["레이더 (LD2410)"].click()
     assert window.model.can_show_final_ok is False
     window.close()
 
@@ -1518,7 +1526,7 @@ def test_user_mode_operator_button_sits_bottom_right_and_opens_operator_mode():
     assert window.stack.currentWidget() is window.operator_view
 
     window.sidebar_toggle_button.click()
-    window.sidebar_buttons["사용자모드"].click()
+    window.sidebar_buttons["사용자 화면"].click()
     assert window.stack.currentWidget() is window.user_view
     assert view.operator_button.isVisible() is True
     assert view.operator_button.geometry().right() <= view.width()
@@ -1572,8 +1580,8 @@ def test_operator_menu_exit_button_requires_confirmation_and_keeps_ok_blocked(mo
     window.sidebar_toggle_button.click()
     app.processEvents()
 
-    exit_button = window.sidebar_buttons["종료"]
-    assert exit_button.text() == "종료"
+    exit_button = window.sidebar_buttons["프로그램 종료"]
+    assert exit_button.text() == "프로그램 종료"
     assert exit_button.objectName() == "sidebarButton"
     assert exit_button.property("danger") == "true"
 
@@ -1619,7 +1627,7 @@ def test_sidebar_menu_is_scrollable_so_every_action_stays_reachable():
     assert scroll.horizontalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert scroll.viewport().width() <= OPERATOR_SIDEBAR_WIDTH
 
-    exit_button = window.sidebar_buttons["종료"]
+    exit_button = window.sidebar_buttons["프로그램 종료"]
     scroll.ensureWidgetVisible(exit_button)
     app.processEvents()
     viewport = scroll.viewport()
@@ -1647,7 +1655,7 @@ def test_driver_camera_status_text_is_lifted_above_the_bottom_strip():
     assert front.bottom_inset == 0
 
     window.sidebar_toggle_button.click()
-    window.sidebar_buttons["사용자모드"].click()
+    window.sidebar_buttons["사용자 화면"].click()
     app.processEvents()
     assert front.bottom_inset >= strip_height
     window.close()
@@ -1701,7 +1709,7 @@ def test_nas_connection_test_without_settings_reports_and_keeps_ok_blocked(tmp_p
     )
     _open_operator_menu(window)
 
-    window.sidebar_buttons["NAS 연결 확인"].click()
+    window.nas_test_button.click()
     app.processEvents()
 
     assert window._nas_test_running is False
@@ -1720,11 +1728,11 @@ def test_nas_connection_test_runs_without_camera_and_keeps_ok_blocked(monkeypatc
     )
     _open_operator_menu(window)
 
-    window.sidebar_buttons["NAS 연결 확인"].click()
+    window.nas_test_button.click()
     app.processEvents()
 
     assert window._nas_test_running is True
-    assert window.sidebar_buttons["NAS 연결 확인"].isEnabled() is False
+    assert window.nas_test_button.isEnabled() is False
     assert window._nas_test_camera_id == ""
     assert window._nas_test_timer is None  # no camera, so no frame collection phase
     assert len(window._nas_test_workers) == 1
@@ -1749,7 +1757,7 @@ def test_nas_connection_test_collects_frames_from_a_streaming_camera(monkeypatch
     window.camera_widgets[CameraRole.front].set_frame(frame)
     window._runtime_camera_status["front"] = "정상 수신"
 
-    window.sidebar_buttons["NAS 연결 확인"].click()
+    window.nas_test_button.click()
     app.processEvents()
 
     assert window._nas_test_camera_id == "front"
@@ -1807,7 +1815,7 @@ def test_nas_connection_test_ignores_a_second_click_while_running(monkeypatch, t
     )
     _open_operator_menu(window)
 
-    window.sidebar_buttons["NAS 연결 확인"].click()
+    window.nas_test_button.click()
     app.processEvents()
     window._start_nas_connection_test()
     app.processEvents()
@@ -1873,3 +1881,212 @@ def test_capture_fallback_logs_once_per_worker(caplog):
     fallback_lines = [r for r in caplog.records if "gstreamer-unavailable" in r.message]
     assert len(fallback_lines) == 1
     assert "rear_side" in fallback_lines[0].getMessage()
+
+
+def test_operator_console_pages_navigate_and_share_the_camera_grid():
+    app = _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window.resize(1440, 900)
+    window.show()
+    window._unlock_operator()
+    app.processEvents()
+
+    assert window.operator_workspace_stack.currentWidget() is window.operator_pages["전체 카메라"]
+    assert window._camera_layout_mode == "all"
+
+    window.sidebar_toggle_button.click()
+    for label, expected_mode in (("차량 감지", "front"), ("사람 감지", "all"), ("번호판 인식", "front")):
+        window.sidebar_buttons[label].click()
+        app.processEvents()
+        assert window.operator_workspace_stack.currentWidget() is window.operator_pages[label]
+        assert window.operator_camera_area.parentWidget() is window.operator_pages[label]
+        assert window._camera_layout_mode == expected_mode
+        assert window.sidebar_buttons[label].isChecked() is True
+
+    # Pages without cameras never steal the shared grid.
+    window.sidebar_buttons["NAS 연결 확인"].click()
+    app.processEvents()
+    assert window.operator_camera_area.parentWidget() is window.operator_pages["번호판 인식"]
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_log_page_shows_tail_and_applies_filter(monkeypatch, tmp_path: Path):
+    app = _qt_app()
+    import towersightai.ui.pyqt_app as pyqt_app_module
+
+    log_path = tmp_path / "towersightai.log"
+    log_path.write_text(
+        "2026-09-02 INFO app start\n"
+        "2026-09-02 INFO camera-capture-status camera=front status=streaming\n"
+        "2026-09-02 ERROR nas upload failed\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pyqt_app_module, "DEFAULT_RUNTIME_LOG", log_path)
+
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    window._unlock_operator()
+    window.sidebar_toggle_button.click()
+    window.sidebar_buttons["실행 로그"].click()
+    app.processEvents()
+
+    assert "camera-capture-status" in window.log_view.toPlainText()
+    assert "nas upload failed" in window.log_view.toPlainText()
+
+    window.log_filter_input.setText("ERROR")
+    app.processEvents()
+    filtered = window.log_view.toPlainText()
+    assert "nas upload failed" in filtered
+    assert "camera-capture-status" not in filtered
+    window.close()
+
+
+def test_system_test_button_reports_diagnostic_result_without_authorizing_ok(monkeypatch):
+    app = _qt_app()
+    import towersightai.ui.pyqt_app as pyqt_app_module
+    from towersightai.diagnostics import DiagnosticResult, DiagnosticStatus
+
+    class _FakeService:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def run(self, test_id, *, timeout_seconds=10):
+            return DiagnosticResult(
+                test_id=test_id,
+                label="설정 검증",
+                status=DiagnosticStatus.PASS,
+                summary="네 개 카메라 역할 확인",
+                duration_ms=7,
+            )
+
+    monkeypatch.setattr(pyqt_app_module, "DiagnosticsService", _FakeService)
+
+    settings = _settings()
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    window._unlock_operator()
+    window.sidebar_toggle_button.click()
+    window.sidebar_buttons["시스템 점검"].click()
+    app.processEvents()
+
+    window.system_test_buttons["settings"].click()
+    for _ in range(40):
+        app.processEvents()
+        if not window._system_test_running:
+            break
+        QTest.qWait(25)
+
+    text = window.system_test_log.toPlainText()
+    assert "설정 검증" in text
+    assert "safe_to_operate=False" in text
+    assert window.model.can_show_final_ok is False
+    assert window.system_test_buttons["settings"].isEnabled() is True
+    window.close()
+
+
+def test_camera_surface_contain_mode_centers_the_letterboxed_frame():
+    _qt_app()
+    from towersightai.ui.pyqt_app import CameraSurface
+
+    surface = CameraSurface("정면")
+    surface.resize(400, 300)
+    wide = QImage(640, 120, QImage.Format.Format_RGB888)
+    wide.fill(QColor("#ffffff"))
+    surface.set_frame(wide)
+    surface.set_status("정상 수신")
+    rendered = QImage(surface.size(), QImage.Format.Format_RGB32)
+    rendered.fill(QColor("#000000"))
+    from PyQt6.QtGui import QPainter as _QPainter
+
+    painter = _QPainter(rendered)
+    surface.render(painter)
+    painter.end()
+
+    center_y = surface.height() // 2
+    # A 640x120 frame letterboxed into the tile must appear at the vertical center,
+    # and the band just under the title row must stay background, not image.
+    assert rendered.pixelColor(surface.width() // 2, center_y).red() > 200
+    assert rendered.pixelColor(surface.width() // 2, 60).red() < 100
+
+
+def test_starting_another_purpose_task_auto_switches_instead_of_refusing(monkeypatch, tmp_path: Path):
+    """Clicking a different AI task while one is running stops the old one and
+    starts the new one as soon as the old worker has cleaned up."""
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _settings()
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    window._unlock_operator()
+    window._runtime_camera_status["front"] = "정상 수신"
+    window._runtime_camera_status["rear_side"] = "정상 수신"
+
+    window.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION].click()
+    app.processEvents()
+    assert window._purpose_task_id == PURPOSE_VEHICLE_DETECTION
+    vehicle_thread = window._purpose_threads[0]
+    vehicle_worker = window._purpose_workers[0]
+
+    # Switch request: the old task is asked to stop and the new one is queued, not refused.
+    window.purpose_task_buttons[PURPOSE_PERSON_PRESENCE].click()
+    app.processEvents()
+    assert vehicle_worker._stop_requested is True
+    assert window._pending_user_purpose_task_id == PURPOSE_PERSON_PRESENCE
+    assert "자동 시작" in window.warning_label.text()
+    assert window.purpose_task_buttons[PURPOSE_PERSON_PRESENCE].isChecked() is True
+    assert window.model.can_show_final_ok is False
+
+    # Old worker finishes cleaning up -> the queued task starts automatically.
+    window._cleanup_purpose_worker(vehicle_thread, vehicle_worker)
+    app.processEvents()
+    assert window._pending_user_purpose_task_id == ""
+    assert window._purpose_task_id == PURPOSE_PERSON_PRESENCE
+    assert window._purpose_task_enabled is True
+    assert len(window._purpose_workers) == 1
+    assert window._purpose_workers[0].task_id == PURPOSE_PERSON_PRESENCE
+    window.close()
+
+
+def test_clicking_the_running_purpose_task_still_stops_it(monkeypatch):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _settings()
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    window._unlock_operator()
+    window._runtime_camera_status["front"] = "정상 수신"
+
+    window.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION].click()
+    app.processEvents()
+    worker = window._purpose_workers[0]
+
+    window.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION].click()
+    app.processEvents()
+    assert worker._stop_requested is True
+    assert window._purpose_task_enabled is False
+    assert window._pending_user_purpose_task_id == ""
+    window.close()
+
+
+def test_purpose_run_buttons_use_start_stop_wording(monkeypatch):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _settings()
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    window._unlock_operator()
+    window._runtime_camera_status["front"] = "정상 수신"
+
+    vehicle = window.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION]
+    assert vehicle.text() == "차량 감지 시작"
+    vehicle.click()
+    app.processEvents()
+    assert vehicle.text() == "차량 감지 중지"
+    assert window.purpose_task_buttons[PURPOSE_PERSON_PRESENCE].text() == "사람 감지 시작"
+    window.close()

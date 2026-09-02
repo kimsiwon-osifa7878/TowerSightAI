@@ -1,0 +1,419 @@
+<title>TowerSight 콘솔 시안</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=Gothic+A1:wght@500;700;800&family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  /* 리뷰 페이지 자체는 어두운 스튜디오 벽. 단일 테마 확정 — 모든 색을 명시적으로 칠한다. */
+  html, body { background: #101216; }
+  body {
+    color: #E7EAF0;
+    font-family: "IBM Plex Sans KR", "Noto Sans KR", sans-serif;
+    margin: 0;
+    padding: 48px 24px 96px;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; display: flex; flex-direction: column; gap: 56px; }
+
+  /* ---------- 리뷰 헤더 ---------- */
+  .review-head { display: flex; flex-direction: column; gap: 10px; }
+  .review-head .eyebrow {
+    font-size: 12px; letter-spacing: 3px; color: #8B93A3; font-weight: 600;
+  }
+  .review-head h1 {
+    margin: 0; font-size: 34px; font-weight: 700; letter-spacing: -0.5px; text-wrap: balance;
+  }
+  .review-head p { margin: 0; color: #8B93A3; font-size: 15px; max-width: 62ch; line-height: 1.7; }
+  .review-head b { color: #C7CEDA; font-weight: 600; }
+
+  /* ---------- 공통: 시안 프레임 ---------- */
+  .proposal { display: flex; flex-direction: column; gap: 16px; }
+  .proposal-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .proposal-head .tag {
+    font-family: "JetBrains Mono", monospace; font-size: 13px; font-weight: 600;
+    padding: 4px 10px; border-radius: 999px;
+  }
+  .proposal-head h2 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+  .proposal-head .note { color: #8B93A3; font-size: 14px; }
+  .frame {
+    border: 1px solid #262B35; border-radius: 14px; overflow-x: auto; background: #0B0D11;
+  }
+  .frame > .screen { min-width: 1120px; }
+  .swatches { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .swatch {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: "JetBrains Mono", monospace; font-size: 11.5px; color: #8B93A3;
+  }
+  .swatch i { width: 16px; height: 16px; border-radius: 5px; display: inline-block; border: 1px solid rgba(255,255,255,.14); }
+  .rationale { display: flex; gap: 24px; flex-wrap: wrap; color: #A6AEBC; font-size: 13.5px; }
+  .rationale span::before { content: "— "; color: #565E6D; }
+
+  /* =========================================================
+     시안 A · 관제실 미니멀
+     ground #0A0E15 / ink #DEE5EF / muted #7C8899 / hairline #1B2432 / accent #38BDF8
+     ========================================================= */
+  .a { --bg:#0A0E15; --ink:#DEE5EF; --mut:#7C8899; --hl:#1B2432; --ac:#38BDF8; --ng:#F0506E; --live:#34D399; }
+  .a.screen { background: var(--bg); color: var(--ink); display: grid; grid-template-columns: 236px 1fr; min-height: 640px; }
+
+  .a .side { border-right: 1px solid var(--hl); padding: 22px 0 18px; display: flex; flex-direction: column; }
+  .a .brand { padding: 0 22px 18px; font-weight: 700; font-size: 15px; letter-spacing: .5px; }
+  .a .brand small { display:block; color: var(--mut); font-weight: 500; font-size: 11px; letter-spacing: 2px; margin-top: 3px; }
+  .a .sec { padding: 16px 22px 6px; font-size: 10.5px; letter-spacing: 2.5px; color: #566072; font-weight: 600; }
+  .a .nav { display: flex; flex-direction: column; }
+  .a .nav a {
+    position: relative; color: var(--mut); text-decoration: none; font-size: 14.5px; font-weight: 500;
+    padding: 8px 22px; border-left: 2px solid transparent;
+  }
+  .a .nav a:hover { color: var(--ink); }
+  .a .nav a.on { color: var(--ink); border-left-color: var(--ac); background: linear-gradient(90deg, rgba(56,189,248,.09), transparent 70%); }
+  .a .nav a.danger { color: #E88; }
+  .a .side .foot { margin-top: auto; padding: 14px 22px 0; border-top: 1px solid var(--hl); color: #566072; font-size: 11px; letter-spacing: 1.5px; }
+
+  .a .main { display: flex; flex-direction: column; }
+  .a .top {
+    display: flex; align-items: center; gap: 18px; padding: 16px 26px; border-bottom: 1px solid var(--hl);
+  }
+  .a .ng {
+    font-weight: 800; font-size: 26px; letter-spacing: 1px; color: var(--ng);
+    border: 1px solid rgba(240,80,110,.45); padding: 8px 18px; border-radius: 8px; background: rgba(240,80,110,.08);
+  }
+  .a .top .msgs { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .a .top .m1 { font-size: 17px; font-weight: 600; }
+  .a .top .m2 { font-size: 13px; color: var(--ng); }
+  .a .top .proto {
+    margin-left: auto; font-family: "JetBrains Mono", monospace; font-size: 10.5px; letter-spacing: 1px;
+    color: #566072; border: 1px dashed #2A3546; padding: 5px 10px; border-radius: 6px; white-space: nowrap;
+  }
+
+  .a .page { padding: 20px 26px 22px; display: flex; flex-direction: column; gap: 14px; flex: 1; }
+  .a .page-head { display: flex; align-items: baseline; gap: 14px; }
+  .a .page-head h3 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.2px; }
+  .a .page-head .sub { color: var(--mut); font-size: 12.5px; }
+  .a .page-head .act {
+    margin-left: auto; font-size: 13px; font-weight: 600; color: var(--ac);
+    border: 1px solid rgba(56,189,248,.4); padding: 6px 14px; border-radius: 7px; background: rgba(56,189,248,.07);
+  }
+
+  .a .grid { display: grid; grid-template-columns: 1.7fr 1fr; grid-template-rows: 1fr 1fr; gap: 1px; background: var(--hl); border: 1px solid var(--hl); flex: 1; min-height: 380px; }
+  .a .cam { position: relative; background: #0D131D; overflow: hidden; display: flex; }
+  .a .cam.front { grid-row: 1 / 3; }
+  .a .feed { position: absolute; inset: 0; }
+  .a .feed.live1 { background:
+      radial-gradient(120% 90% at 30% 20%, #223047 0%, transparent 55%),
+      radial-gradient(100% 80% at 80% 85%, #1A2637 0%, transparent 60%),
+      linear-gradient(180deg, #131B29 0%, #0E1521 100%); }
+  .a .feed.live2 { background:
+      radial-gradient(110% 90% at 70% 25%, #263043 0%, transparent 55%),
+      linear-gradient(180deg, #141C2A 0%, #0F1622 100%); }
+  .a .feed::after { content: ""; position: absolute; inset: 0;
+      background-image: linear-gradient(rgba(125,140,160,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(125,140,160,.05) 1px, transparent 1px);
+      background-size: 44px 44px; }
+  .a .cam .name { position: absolute; top: 12px; left: 14px; font-size: 13px; font-weight: 600; color: #C3CBD8; z-index: 2; }
+  .a .cam .res { position: absolute; top: 12px; right: 14px; font-family: "JetBrains Mono", monospace; font-size: 11px; color: #667182; z-index: 2; }
+  .a .cam .st {
+    position: absolute; left: 14px; bottom: 12px; z-index: 2;
+    font-size: 11.5px; font-weight: 600; letter-spacing: .5px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .a .cam .st.live { color: var(--live); }
+  .a .cam .st.live i { width: 7px; height: 7px; border-radius: 50%; background: var(--live); box-shadow: 0 0 8px rgba(52,211,153,.8); }
+  .a .det { position: absolute; border: 2px solid var(--ng); z-index: 2; }
+  .a .det b { position: absolute; top: -20px; left: -2px; font-size: 10.5px; font-weight: 600; color: #fff; background: var(--ng); padding: 2px 6px; white-space: nowrap; }
+  .a .cam.ng { background: #170F14; }
+  .a .cam.ng .scrim { position: absolute; inset: 0; background: repeating-linear-gradient(-45deg, rgba(240,80,110,.05) 0 14px, transparent 14px 28px); }
+  .a .cam.ng .fault { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; z-index: 2; }
+  .a .cam.ng .fault b { font-size: 15px; font-weight: 700; color: #EFA2B2; }
+  .a .cam.ng .fault span { font-size: 11.5px; color: var(--ng); }
+
+  .a .tele { display: flex; align-items: center; padding: 0 26px; border-top: 1px solid var(--hl); height: 44px;
+    font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--mut); }
+  .a .tele span { padding: 0 18px; border-left: 1px solid var(--hl); white-space: nowrap; }
+  .a .tele span:first-child { border-left: 0; padding-left: 0; }
+  .a .tele b { color: #B9C2D0; font-weight: 600; }
+  .a .tele .warn { color: #F5C044; }
+
+  /* =========================================================
+     시안 B · 패널 HMI
+     ground #0C0F14 / panel #151B24 / border #232C39 / ink #E9EDF3 / accent #F5A623
+     ========================================================= */
+  .b { --bg:#0C0F14; --pn:#151B24; --bd:#232C39; --ink:#E9EDF3; --mut:#8792A3; --ac:#F5A623; --ng:#E5484D; --live:#3DD68C; }
+  .b.screen { background: var(--bg); color: var(--ink); display: grid; grid-template-columns: 248px 1fr; gap: 14px; padding: 14px; min-height: 640px; box-sizing: border-box;
+    font-family: "Noto Sans KR", sans-serif; }
+  .b h3, .b .brand, .b .ng, .b .sec { font-family: "Gothic A1", "Noto Sans KR", sans-serif; }
+
+  .b .panel { background: var(--pn); border: 1px solid var(--bd); border-radius: 12px;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.045); }
+
+  .b .side { display: flex; flex-direction: column; padding: 18px 12px 14px; }
+  .b .brand { padding: 0 10px 16px; font-weight: 800; font-size: 15px; }
+  .b .brand small { display: block; color: var(--mut); font-weight: 500; font-size: 11px; letter-spacing: 2px; margin-top: 3px; font-family: "Noto Sans KR", sans-serif; }
+  .b .sec { margin: 12px 10px 6px; font-size: 10.5px; letter-spacing: 2px; color: #5B6575; font-weight: 700; }
+  .b .nav { display: flex; flex-direction: column; gap: 3px; }
+  .b .nav a { color: var(--mut); text-decoration: none; font-size: 14.5px; font-weight: 500; padding: 8px 12px; border-radius: 9px; border: 1px solid transparent; }
+  .b .nav a:hover { background: #1B2330; color: var(--ink); }
+  .b .nav a.on { background: rgba(245,166,35,.12); border-color: rgba(245,166,35,.4); color: #FFD27E; font-weight: 700; }
+  .b .nav a.danger { color: #F09A9E; }
+  .b .side .foot { margin-top: auto; padding: 12px 10px 0; border-top: 1px solid var(--bd); color: #5B6575; font-size: 11px; letter-spacing: 1.2px; }
+
+  .b .main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  .b .top { display: flex; align-items: stretch; gap: 14px; }
+  .b .ng {
+    display: flex; align-items: center; justify-content: center; min-width: 120px;
+    font-size: 30px; font-weight: 800; color: #FFD9DB; background: linear-gradient(180deg, #3A1418, #2A0F13);
+    border: 1px solid rgba(229,72,77,.55); border-radius: 12px;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 0 0 3px rgba(229,72,77,.09);
+  }
+  .b .msgs { flex: 1; padding: 12px 18px; display: flex; flex-direction: column; justify-content: center; gap: 5px; min-width: 0; }
+  .b .msgs .m1 { font-size: 17px; font-weight: 700; }
+  .b .msgs .m2 { font-size: 13px; color: #F09A9E; }
+  .b .proto { display: flex; align-items: center; padding: 0 16px; font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px; letter-spacing: 1px; color: #5B6575; white-space: nowrap; }
+
+  .b .page { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; }
+  .b .page-head { display: flex; align-items: center; gap: 14px; }
+  .b .page-head h3 { margin: 0; font-size: 19px; font-weight: 800; }
+  .b .page-head .sub { color: var(--mut); font-size: 12.5px; }
+  .b .page-head .act { margin-left: auto; font-size: 13.5px; font-weight: 700; color: #14181F;
+    background: linear-gradient(180deg, #FFC163, var(--ac)); padding: 8px 16px; border-radius: 9px;
+    box-shadow: 0 2px 10px rgba(245,166,35,.25); }
+
+  .b .grid { display: grid; grid-template-columns: 1.7fr 1fr; grid-template-rows: 1fr 1fr; gap: 12px; flex: 1; min-height: 360px; }
+  .b .cam { display: flex; flex-direction: column; border: 1px solid var(--bd); border-radius: 10px; overflow: hidden; background: #10161F; }
+  .b .cam.front { grid-row: 1 / 3; }
+  .b .cam .bar { display: flex; align-items: center; gap: 8px; padding: 7px 12px; background: #1A212C; border-bottom: 1px solid var(--bd);
+    font-size: 12.5px; font-weight: 700; }
+  .b .cam .bar .res { margin-left: auto; font-family: "JetBrains Mono", monospace; font-size: 10.5px; font-weight: 400; color: #667182; }
+  .b .cam .body { position: relative; flex: 1; }
+  .b .feed { position: absolute; inset: 0; }
+  .b .feed.live1 { background:
+      radial-gradient(120% 90% at 30% 20%, #22304A 0%, transparent 55%),
+      radial-gradient(100% 80% at 80% 85%, #1B2739 0%, transparent 60%),
+      linear-gradient(180deg, #141C2B 0%, #0F1523 100%); }
+  .b .feed.live2 { background:
+      radial-gradient(110% 90% at 70% 25%, #273246 0%, transparent 55%),
+      linear-gradient(180deg, #151D2C 0%, #101724 100%); }
+  .b .det { position: absolute; border: 2px solid var(--ng); border-radius: 3px; }
+  .b .det b { position: absolute; top: -20px; left: -2px; font-size: 10.5px; font-weight: 700; color: #fff; background: var(--ng); padding: 2px 6px; border-radius: 3px; white-space: nowrap; }
+  .b .cam .ft { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: #131A24; border-top: 1px solid var(--bd); font-size: 11.5px; }
+  .b .cam .ft .live { color: var(--live); font-weight: 700; display: inline-flex; align-items: center; gap: 6px; }
+  .b .cam .ft .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--live); }
+  .b .cam.ngc { border-color: rgba(229,72,77,.5); }
+  .b .cam.ngc .bar { background: #2A161A; border-bottom-color: rgba(229,72,77,.4); }
+  .b .cam.ngc .body { background: #170F13; }
+  .b .cam.ngc .fault { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
+  .b .cam.ngc .fault b { font-size: 14.5px; color: #F3B0B6; }
+  .b .cam.ngc .fault span { font-size: 11.5px; color: var(--ng); }
+  .b .cam.ngc .ft { background: #201216; border-top-color: rgba(229,72,77,.4); color: #F09A9E; font-weight: 700; }
+
+  .b .tele { display: flex; gap: 10px; padding: 10px 14px; flex-wrap: wrap; }
+  .b .tele .pill { display: flex; flex-direction: column; gap: 1px; padding: 6px 14px; background: #10161F;
+    border: 1px solid var(--bd); border-radius: 8px; min-width: 96px; }
+  .b .tele .pill em { font-style: normal; font-size: 9.5px; letter-spacing: 1.5px; color: #5B6575; font-weight: 700; }
+  .b .tele .pill b { font-family: "JetBrains Mono", monospace; font-size: 13px; font-weight: 600; color: #C9D2DE; }
+  .b .tele .pill.alert b { color: #F5C044; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .a .cam .st.live i, .b .cam .ft .live i { animation: pulse 2.2s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .35; } }
+  }
+</style>
+
+<div class="wrap">
+  <header class="review-head">
+    <span class="eyebrow">TOWERSIGHTAI · OPERATOR CONSOLE</span>
+    <h1>운영 콘솔 시안 비교</h1>
+    <p>같은 화면(<b>전체 카메라</b> 페이지, 카메라 2대 수신 · 1대 NG · 사람 검출 오버레이)을 두 가지 방향으로
+    그렸습니다. 메뉴 구성과 안전 규칙은 현재 구현 그대로이고, 달라지는 것은 시각 언어뿐입니다.
+    마음에 드는 쪽(또는 섞고 싶은 요소)을 알려주시면 PyQt에 그대로 옮깁니다.</p>
+  </header>
+
+  <!-- ================= 시안 A ================= -->
+  <section class="proposal">
+    <div class="proposal-head">
+      <span class="tag" style="background:rgba(56,189,248,.12); color:#7DD3FC; border:1px solid rgba(56,189,248,.35);">시안 A</span>
+      <h2>관제실 미니멀</h2>
+      <span class="note">면 분할 대신 헤어라인과 여백 · 액센트는 시안 하나만</span>
+    </div>
+    <div class="frame"><div class="screen a">
+      <aside class="side">
+        <div class="brand">TowerSightAI<small>OPERATOR CONSOLE</small></div>
+        <div class="sec">운영</div>
+        <nav class="nav">
+          <a href="#a">사용자모드</a>
+          <a href="#a">사용자 화면 테스트</a>
+        </nav>
+        <div class="sec">진단</div>
+        <nav class="nav">
+          <a href="#a" class="on">전체 카메라</a>
+          <a href="#a">차량 검출</a>
+          <a href="#a">사람 검출</a>
+          <a href="#a">번호판 LPR</a>
+          <a href="#a">LD2410</a>
+          <a href="#a">NAS 연결 확인</a>
+          <a href="#a">시스템 점검</a>
+          <a href="#a">로그</a>
+        </nav>
+        <div class="sec">시스템</div>
+        <nav class="nav">
+          <a href="#a">카메라 설정</a>
+          <a href="#a" class="danger">종료</a>
+        </nav>
+        <div class="foot">v0.1 · HAILO-8</div>
+      </aside>
+      <div class="main">
+        <div class="top">
+          <span class="ng">NG</span>
+          <div class="msgs">
+            <span class="m1">진입 차량을 대기 중입니다.</span>
+            <span class="m2">카메라 입력 차단: 우측면 · 버드뷰 OFF · 최종 OK 차단</span>
+          </div>
+          <span class="proto">DESIGN PROTOTYPE · PLC OUTPUT BLOCKED</span>
+        </div>
+        <div class="page">
+          <div class="page-head">
+            <h3>전체 카메라</h3>
+            <span class="sub">활성 카메라 실시간 스트리밍 · 최종 OK는 항상 차단됩니다</span>
+            <span class="act">이전 AI Detection</span>
+          </div>
+          <div class="grid">
+            <div class="cam front">
+              <div class="feed live1"></div>
+              <span class="name">정면</span><span class="res">1920×1080</span>
+              <div class="det" style="left:46%; top:44%; width:13%; height:30%;"><b>person 0.87</b></div>
+              <span class="st live"><i></i>정상 수신</span>
+            </div>
+            <div class="cam">
+              <div class="feed live2"></div>
+              <span class="name">좌측면</span><span class="res">1920×1080</span>
+              <div class="det" style="left:64%; top:18%; width:9%; height:26%;"><b>person 0.74</b></div>
+              <span class="st live"><i></i>정상 수신</span>
+            </div>
+            <div class="cam ng">
+              <div class="scrim"></div>
+              <span class="name">우측면</span>
+              <div class="fault"><b>영상 수신 불가</b><span>NG: 카메라 연결 이상</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="tele">
+          <span>STATE <b>IDLE</b></span>
+          <span>PLC <b class="warn">UNKNOWN</b></span>
+          <span>카메라 <b>2/3</b></span>
+          <span>AI <b>사람 검출 · 901ev</b></span>
+          <span>증거 <b>NG 1</b></span>
+          <span style="margin-left:auto; border-left:0;"><b>09-02 12:04</b></span>
+        </div>
+      </div>
+    </div></div>
+    <div class="swatches">
+      <span class="swatch"><i style="background:#0A0E15"></i>#0A0E15 바탕</span>
+      <span class="swatch"><i style="background:#1B2432"></i>#1B2432 헤어라인</span>
+      <span class="swatch"><i style="background:#38BDF8"></i>#38BDF8 액센트</span>
+      <span class="swatch"><i style="background:#F0506E"></i>#F0506E NG</span>
+      <span class="swatch"><i style="background:#34D399"></i>#34D399 수신중</span>
+    </div>
+    <div class="rationale">
+      <span>영상이 주인공: 크롬을 최소화해 카메라 면적이 가장 넓음</span>
+      <span>상태는 색·점멸로만 구분해 시선 이동이 적음</span>
+      <span>텔레메트리는 한 줄 모노스페이스 — 로그와 같은 문법</span>
+    </div>
+  </section>
+
+  <!-- ================= 시안 B ================= -->
+  <section class="proposal">
+    <div class="proposal-head">
+      <span class="tag" style="background:rgba(245,166,35,.12); color:#FFD27E; border:1px solid rgba(245,166,35,.35);">시안 B</span>
+      <h2>패널 HMI</h2>
+      <span class="note">계기판처럼 패널 단위로 묶음 · 산업 장비의 앰버 액센트</span>
+    </div>
+    <div class="frame"><div class="screen b">
+      <aside class="side panel">
+        <div class="brand">TowerSightAI<small>OPERATOR CONSOLE</small></div>
+        <div class="sec">운영</div>
+        <nav class="nav">
+          <a href="#b">사용자모드</a>
+          <a href="#b">사용자 화면 테스트</a>
+        </nav>
+        <div class="sec">진단</div>
+        <nav class="nav">
+          <a href="#b" class="on">전체 카메라</a>
+          <a href="#b">차량 검출</a>
+          <a href="#b">사람 검출</a>
+          <a href="#b">번호판 LPR</a>
+          <a href="#b">LD2410</a>
+          <a href="#b">NAS 연결 확인</a>
+          <a href="#b">시스템 점검</a>
+          <a href="#b">로그</a>
+        </nav>
+        <div class="sec">시스템</div>
+        <nav class="nav">
+          <a href="#b">카메라 설정</a>
+          <a href="#b" class="danger">종료</a>
+        </nav>
+        <div class="foot">v0.1 · HAILO-8</div>
+      </aside>
+      <div class="main">
+        <div class="top">
+          <span class="ng">NG</span>
+          <div class="msgs panel">
+            <span class="m1">진입 차량을 대기 중입니다.</span>
+            <span class="m2">카메라 입력 차단: 우측면 · 버드뷰 OFF · 최종 OK 차단</span>
+          </div>
+          <div class="proto panel">DESIGN PROTOTYPE<br>PLC OUTPUT BLOCKED</div>
+        </div>
+        <div class="page panel">
+          <div class="page-head">
+            <h3>전체 카메라</h3>
+            <span class="sub">활성 카메라 실시간 스트리밍 · 최종 OK는 항상 차단됩니다</span>
+            <span class="act">이전 AI Detection</span>
+          </div>
+          <div class="grid">
+            <div class="cam front">
+              <div class="bar">정면<span class="res">1920×1080 · 15fps</span></div>
+              <div class="body">
+                <div class="feed live1"></div>
+                <div class="det" style="left:46%; top:40%; width:13%; height:32%;"><b>person 0.87</b></div>
+              </div>
+              <div class="ft"><span class="live"><i></i>정상 수신</span></div>
+            </div>
+            <div class="cam">
+              <div class="bar">좌측면<span class="res">1920×1080 · 15fps</span></div>
+              <div class="body">
+                <div class="feed live2"></div>
+                <div class="det" style="left:62%; top:12%; width:10%; height:30%;"><b>person 0.74</b></div>
+              </div>
+              <div class="ft"><span class="live"><i></i>정상 수신</span></div>
+            </div>
+            <div class="cam ngc">
+              <div class="bar">우측면<span class="res">—</span></div>
+              <div class="body"><div class="fault"><b>영상 수신 불가</b><span>NG: 카메라 연결 이상</span></div></div>
+              <div class="ft">재접속 시도 중…</div>
+            </div>
+          </div>
+        </div>
+        <div class="tele panel">
+          <span class="pill"><em>STATE</em><b>IDLE</b></span>
+          <span class="pill alert"><em>PLC</em><b>UNKNOWN</b></span>
+          <span class="pill"><em>카메라</em><b>2 / 3</b></span>
+          <span class="pill"><em>AI</em><b>사람검출 901ev</b></span>
+          <span class="pill"><em>증거</em><b>NG 1</b></span>
+          <span class="pill" style="margin-left:auto;"><em>CLOCK</em><b>09-02 12:04</b></span>
+        </div>
+      </div>
+    </div></div>
+    <div class="swatches">
+      <span class="swatch"><i style="background:#0C0F14"></i>#0C0F14 바탕</span>
+      <span class="swatch"><i style="background:#151B24"></i>#151B24 패널</span>
+      <span class="swatch"><i style="background:#F5A623"></i>#F5A623 액센트</span>
+      <span class="swatch"><i style="background:#E5484D"></i>#E5484D NG</span>
+      <span class="swatch"><i style="background:#3DD68C"></i>#3DD68C 수신중</span>
+    </div>
+    <div class="rationale">
+      <span>패널 경계가 뚜렷해 “어디를 보고 어디를 누르는지”가 명확</span>
+      <span>카메라마다 헤더·푸터 바 — 계기(instrument) 문법이라 NG 타일이 강하게 구분됨</span>
+      <span>텔레메트리는 라벨+값 2줄 알약 — 55인치 원거리 가독에 유리</span>
+    </div>
+  </section>
+
+  <footer style="color:#565E6D; font-size:12.5px; line-height:1.8; max-width:70ch;">
+    두 시안 모두 실제 메뉴·문구·상태 그대로이며, 클릭은 동작하지 않는 정적 목업입니다.
+    선택하시면 색·타이포·간격 토큰을 PyQt 스타일시트로 옮기고 기존 212개 테스트와 GUI 검증을 다시 통과시킵니다.
+  </footer>
+</div>

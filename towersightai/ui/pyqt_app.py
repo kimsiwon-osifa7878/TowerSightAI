@@ -23,7 +23,8 @@ from towersightai.inference.purpose_tasks import (
     build_purpose_process,
 )
 from towersightai.cli.fast_alpr_lpr import run_fast_alpr_lpr
-from towersightai.runtime_logging import new_run_id
+from towersightai.diagnostics import DiagnosticResult, DiagnosticsService, DiagnosticStatus
+from towersightai.runtime_logging import DEFAULT_RUNTIME_LOG, new_run_id
 from towersightai.state_machine.core import ParkingState
 from towersightai.sensors.ld2410 import LD2410Frame, LD2410TCPService
 from towersightai.storage.connection_test import NasConnectionTestResult, run_nas_connection_test
@@ -46,34 +47,44 @@ DETECTION_TTL_SECONDS = 1.0
 FIRST_INFERENCE_TIMEOUT_SECONDS = 30.0
 PERSON_ALERT_STREAK_THRESHOLD = 2
 PERSON_ALERT_STALE_SECONDS = 3.0
-SIDEBAR_ACTION_LABELS = (
-    "사용자모드",
-    "전체 카메라",
-    "카메라 설정",
-    "이전 AI Detection",
-    "차량 전용 검출",
-    "번호판 이미지 LPR",
-    "정면카메라LPR",
-    "사람 존재 감지",
-    "LD2410",
-    "차량 진입 시뮬레이션",
-    "NAS 연결 확인",
-    "종료",
+# Operator mode is the developer console. The sidebar is grouped into sections; every
+# entry either navigates to a workspace page or performs a mode/lifecycle action.
+SIDEBAR_SECTIONS = (
+    ("운영", ("사용자 화면", "주차 프로세스 테스트")),
+    (
+        "진단",
+        (
+            "전체 카메라",
+            "차량 감지",
+            "사람 감지",
+            "번호판 인식",
+            "레이더 (LD2410)",
+            "NAS 연결 확인",
+            "시스템 점검",
+            "실행 로그",
+        ),
+    ),
+    ("시스템", ("카메라 설정", "프로그램 종료")),
 )
+SIDEBAR_ACTION_LABELS = tuple(label for _section, labels in SIDEBAR_SECTIONS for label in labels)
 LD2410_CONSOLE_MAX_LINES = 500
+LOG_VIEW_TAIL_BYTES = 64 * 1024
+LOG_VIEW_MAX_LINES = 1200
 NAS_TEST_CLIP_SECONDS = 2.0
 NAS_TEST_CLIP_FPS = 10
 NAS_TEST_DIR = Path("artifacts/runtime/nas-connection-test")
 
 try:
     from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QColor, QImage, QPainter, QPen
+    from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen
     from PyQt6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QFrame,
         QGridLayout,
         QHBoxLayout,
         QLabel,
+        QLineEdit,
         QMainWindow,
         QMessageBox,
         QPlainTextEdit,
@@ -152,13 +163,42 @@ class CameraSurface(QFrame):
         self.bottom_inset = inset
         self.update()
 
+    # Proposal-B instrument chrome (operator "contain" tiles only).
+    HEADER_BAR_HEIGHT = 30
+    FOOTER_BAR_HEIGHT = 26
+
+    @property
+    def _instrument(self) -> bool:
+        """Operator tiles draw header/footer bars; driver-view (cover) tiles stay chromeless."""
+        return self.display_mode == "contain"
+
     def paintEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
         super().paintEvent(event)
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#101418"))
-        content = self.rect().adjusted(10, 10, -10, -10)
-        painter.setPen(QPen(QColor("#4b5563"), 2))
-        painter.drawRect(content)
+        is_ng = self.status.startswith("NG")
+        if self._instrument:
+            painter.fillRect(self.rect(), QColor("#10161F"))
+            frame_color = QColor("#8A3A40") if is_ng else QColor("#232C39")
+            painter.setPen(QPen(frame_color, 2))
+            painter.drawRect(self.rect().adjusted(1, 1, -1, -1))
+            header = QRect(1, 1, self.width() - 2, self.HEADER_BAR_HEIGHT)
+            footer = QRect(1, self.height() - self.FOOTER_BAR_HEIGHT - 1, self.width() - 2, self.FOOTER_BAR_HEIGHT)
+            painter.fillRect(header, QColor("#2A161A") if is_ng else QColor("#1A212C"))
+            painter.fillRect(footer, QColor("#201216") if is_ng else QColor("#131A24"))
+            painter.setPen(QPen(frame_color, 1))
+            painter.drawLine(header.left(), header.bottom() + 1, header.right(), header.bottom() + 1)
+            painter.drawLine(footer.left(), footer.top() - 1, footer.right(), footer.top() - 1)
+            content = QRect(
+                1,
+                header.bottom() + 2,
+                self.width() - 2,
+                self.height() - self.HEADER_BAR_HEIGHT - self.FOOTER_BAR_HEIGHT - 4,
+            )
+        else:
+            painter.fillRect(self.rect(), QColor("#0d1119"))
+            content = self.rect().adjusted(10, 10, -10, -10)
+            painter.setPen(QPen(QColor("#2a3850"), 2))
+            painter.drawRect(content)
 
         width = content.width()
         height = content.height()
@@ -174,7 +214,9 @@ class CameraSurface(QFrame):
             else:
                 scaled_size = display_frame.size()
                 scaled_size.scale(content.size(), Qt.AspectRatioMode.KeepAspectRatio)
-                image_rect = content
+                # Copy the rect: aliasing `content` here used to anchor the image to the
+                # tile's top-left and corrupt every later overlay that reads `content`.
+                image_rect = QRect(content)
                 image_rect.setSize(scaled_size)
                 image_rect.moveCenter(content.center())
                 painter.drawImage(image_rect, display_frame)
@@ -223,23 +265,48 @@ class CameraSurface(QFrame):
             painter.setPen(color)
             painter.drawText(label_rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter, text)
 
-        if self.status.startswith("NG"):
+        if is_ng:
             painter.fillRect(image_rect, QColor(91, 8, 18, 132))
             painter.setPen(QPen(QColor("#ffffff"), 2))
             fault_text = "영상 수신 불가" if self._frame is None or self._frame.isNull() else "카메라 입력 확인 필요"
             painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, fault_text)
 
-        painter.setPen(QColor("#e5e7eb"))
-        painter.drawText(content.adjusted(12, 10, -12, -10), Qt.AlignmentFlag.AlignTop, self.title)
-        if self._frame_size_text:
-            painter.setPen(QColor("#cbd5e1"))
-            painter.drawText(content.adjusted(-140, 10, -12, -10), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, self._frame_size_text)
-        painter.setPen(QColor("#f87171" if self.status.startswith("NG") else "#86efac"))
-        painter.drawText(
-            content.adjusted(12, -32, -12, -8 - self.bottom_inset),
-            Qt.AlignmentFlag.AlignBottom,
-            self.status,
-        )
+        if self._instrument:
+            title_font = QFont(painter.font())
+            title_font.setBold(True)
+            painter.setFont(title_font)
+            header_text = QRect(13, 1, self.width() - 26, self.HEADER_BAR_HEIGHT)
+            painter.setPen(QColor("#F3B0B6") if is_ng else QColor("#E9EDF3"))
+            painter.drawText(header_text, Qt.AlignmentFlag.AlignVCenter, self.title)
+            if self._frame_size_text:
+                painter.setPen(QColor("#667182"))
+                painter.drawText(
+                    header_text,
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                    self._frame_size_text,
+                )
+            footer_text = QRect(13, self.height() - self.FOOTER_BAR_HEIGHT - 1, self.width() - 26, self.FOOTER_BAR_HEIGHT)
+            status_color = QColor("#F09A9E") if is_ng else QColor("#3DD68C")
+            if not is_ng and self.status == "정상 수신":
+                painter.setBrush(status_color)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(footer_text.left(), footer_text.center().y() - 3, 7, 7)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                footer_text = footer_text.adjusted(13, 0, 0, 0)
+            painter.setPen(status_color)
+            painter.drawText(footer_text, Qt.AlignmentFlag.AlignVCenter, self.status)
+        else:
+            painter.setPen(QColor("#e5e7eb"))
+            painter.drawText(content.adjusted(12, 10, -12, -10), Qt.AlignmentFlag.AlignTop, self.title)
+            if self._frame_size_text:
+                painter.setPen(QColor("#cbd5e1"))
+                painter.drawText(content.adjusted(-140, 10, -12, -10), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, self._frame_size_text)
+            painter.setPen(QColor("#f87171" if is_ng else "#86efac"))
+            painter.drawText(
+                content.adjusted(12, -32, -12, -8 - self.bottom_inset),
+                Qt.AlignmentFlag.AlignBottom,
+                self.status,
+            )
 
 
 class CameraCaptureWorker(QObject):
@@ -755,6 +822,35 @@ class NasConnectionTestWorker(QObject):
         return path
 
 
+class DiagnosticsWorker(QObject):
+    """Run one DiagnosticsService test off the UI thread. Results never authorize OK."""
+
+    result_ready = pyqtSignal(object)
+    finished = pyqtSignal()
+
+    def __init__(self, settings: Settings, test_id: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.test_id = test_id
+
+    def run(self) -> None:
+        try:
+            service = DiagnosticsService(self.settings)
+            result = service.run(self.test_id, timeout_seconds=30)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must report, not crash the UI.
+            logging.getLogger("towersightai.diagnostics").exception(
+                "diagnostics-worker-crashed test=%s", self.test_id
+            )
+            result = DiagnosticResult(
+                test_id=self.test_id,
+                label=self.test_id,
+                status=DiagnosticStatus.FAIL,
+                summary=f"진단 실행 실패: {exc}",
+            )
+        self.result_ready.emit(result)
+        self.finished.emit()
+
+
 class BoundedContentViewport(QWidget):
     """Center the UI canvas while allowing the top-level window to be fullscreen."""
 
@@ -841,7 +937,7 @@ class OperatorWindow(QMainWindow):
         self._ld2410_status_details: dict[str, object] = {}
         self._ld2410_last_frame_at: datetime | None = None
         self._ld2410_client_ip = ""
-        self._camera_layout_mode = "dashboard"
+        self._camera_layout_mode = "all"
         self._camera_rotations: dict[str, int] = {
             camera.id: camera.rotation_degrees
             for camera in settings.cameras
@@ -850,6 +946,9 @@ class OperatorWindow(QMainWindow):
         self.sidebar_buttons: dict[str, QPushButton] = {}
         self.purpose_task_buttons: dict[str, QPushButton] = {}
         self.camera_rotation_buttons: dict[str, QPushButton] = {}
+        self._system_test_threads: list[QThread] = []
+        self._system_test_workers: list[QObject] = []
+        self._system_test_running = False
         self.clock_label = QLabel()
         self.setWindowTitle("TowerSightAI Operator Console")
         self.setStyleSheet(_stylesheet())
@@ -904,6 +1003,9 @@ class OperatorWindow(QMainWindow):
         for thread in self._nas_test_threads:
             thread.quit()
             thread.wait(10000)
+        for thread in self._system_test_threads:
+            thread.quit()
+            thread.wait(35000)
         if self._ld2410_service is not None:
             self._ld2410_service.stop()
             self._ld2410_service = None
@@ -1265,64 +1367,6 @@ class OperatorWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 10, 10)
         outer.setSpacing(10)
 
-        self.operator_sidebar = QWidget()
-        self.operator_sidebar.setObjectName("sidePanel")
-        self.operator_sidebar.setFixedWidth(OPERATOR_SIDEBAR_WIDTH)
-        self.operator_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        sidebar_frame = QVBoxLayout(self.operator_sidebar)
-        sidebar_frame.setContentsMargins(14, 14, 14, 14)
-        sidebar_frame.setSpacing(8)
-        title = QLabel("운영 메뉴")
-        title.setObjectName("testTitleLabel")
-        sidebar_frame.addWidget(title)
-
-        # The menu grows as features land. Keep it scrollable so a short display can
-        # never hide an operator action below the sidebar edge.
-        self.sidebar_scroll = QScrollArea()
-        self.sidebar_scroll.setObjectName("sidebarScroll")
-        self.sidebar_scroll.setWidgetResizable(True)
-        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        sidebar_content = QWidget()
-        sidebar_content.setObjectName("sidebarScrollContent")
-        sidebar_layout = QVBoxLayout(sidebar_content)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(6)
-        self.sidebar_scroll.setWidget(sidebar_content)
-        sidebar_frame.addWidget(self.sidebar_scroll, 1)
-        self._add_sidebar_buttons(sidebar_layout)
-        self.driver_test_toggle = QPushButton("사용자 화면 테스트")
-        self.driver_test_toggle.setObjectName("sidebarButton")
-        self.driver_test_toggle.setCheckable(True)
-        self.driver_test_toggle.clicked.connect(self._toggle_driver_test_panel)
-        sidebar_layout.addWidget(self.driver_test_toggle)
-        self.driver_test_panel = QFrame()
-        self.driver_test_panel.setObjectName("driverTestPanel")
-        driver_test_layout = QGridLayout(self.driver_test_panel)
-        driver_test_layout.setContentsMargins(6, 6, 6, 6)
-        driver_test_layout.setSpacing(5)
-        self.driver_test_buttons: dict[str, QPushButton] = {}
-        for index, (label, handler) in enumerate(
-            (
-                ("실제 상태", self._clear_user_test_state),
-                ("IDLE", self._user_idle),
-                ("진입", self._user_entry),
-                ("진입완료", self._user_entry_complete),
-                ("번호판인식", self._user_plate_recognition),
-                ("주차시작", self._user_parking_started),
-            )
-        ):
-            button = QPushButton(label)
-            button.setObjectName("smallModeButton")
-            button.clicked.connect(handler)
-            self.driver_test_buttons[label] = button
-            driver_test_layout.addWidget(button, index // 2, index % 2)
-        self.driver_test_panel.setVisible(False)
-        sidebar_layout.addWidget(self.driver_test_panel)
-        sidebar_layout.addStretch(1)
-        self.operator_sidebar.setVisible(False)
-        outer.addWidget(self.operator_sidebar)
-
         main = QWidget()
         main_layout = QVBoxLayout(main)
         main_layout.setContentsMargins(10, 10, 0, 0)
@@ -1359,6 +1403,8 @@ class OperatorWindow(QMainWindow):
         self.warning_label.setWordWrap(True)
         header_text.addWidget(self.warning_label)
 
+        # Shared camera grid. Exactly one workspace page hosts it at a time; page
+        # activation adopts it with the layout mode that fits the page's purpose.
         self.grid = QGridLayout()
         self.grid.setSpacing(8)
         self.operator_camera_area = QWidget()
@@ -1377,11 +1423,19 @@ class OperatorWindow(QMainWindow):
         )
         self.driver_preview_host = DriverPreviewHost(self.driver_preview)
         self.ld2410_console_view = self._build_ld2410_console_view()
+
         self.operator_workspace_stack = QStackedWidget()
-        self.operator_workspace_stack.addWidget(self.operator_camera_area)
-        self.operator_workspace_stack.addWidget(self.driver_preview_host)
-        self.operator_workspace_stack.addWidget(self.ld2410_console_view)
-        self.operator_workspace_stack.setCurrentWidget(self.operator_camera_area)
+        self.operator_pages: dict[str, QWidget] = {}
+        self._camera_page_layouts: dict[str, str] = {}
+        self._register_operator_page("전체 카메라", self._build_cameras_page(), camera_layout="all")
+        self._register_operator_page("차량 감지", self._build_vehicle_page(), camera_layout="front")
+        self._register_operator_page("사람 감지", self._build_person_page(), camera_layout="all")
+        self._register_operator_page("번호판 인식", self._build_lpr_page(), camera_layout="front")
+        self._register_operator_page("레이더 (LD2410)", self.ld2410_console_view)
+        self._register_operator_page("NAS 연결 확인", self._build_nas_page())
+        self._register_operator_page("시스템 점검", self._build_system_page())
+        self._register_operator_page("실행 로그", self._build_log_page())
+        self._register_operator_page("주차 프로세스 테스트", self._build_driver_test_page())
         main_layout.addWidget(self.operator_workspace_stack, 1)
 
         status_bar = QWidget()
@@ -1405,8 +1459,251 @@ class OperatorWindow(QMainWindow):
             status_layout.addWidget(label)
         main_layout.addWidget(status_bar)
 
-        self._set_camera_layout("dashboard")
+        # The sidebar navigates to pages, so it is built after they are registered.
+        outer.insertWidget(0, self._build_operator_sidebar())
+        self._show_operator_page("전체 카메라")
         return root
+
+    def _build_operator_sidebar(self) -> QWidget:
+        self.operator_sidebar = QWidget()
+        self.operator_sidebar.setObjectName("sidePanel")
+        self.operator_sidebar.setFixedWidth(OPERATOR_SIDEBAR_WIDTH)
+        self.operator_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        sidebar_frame = QVBoxLayout(self.operator_sidebar)
+        sidebar_frame.setContentsMargins(14, 14, 14, 14)
+        sidebar_frame.setSpacing(8)
+        title = QLabel("운영 메뉴")
+        title.setObjectName("testTitleLabel")
+        sidebar_frame.addWidget(title)
+
+        # The menu grows as features land. Keep it scrollable so a short display can
+        # never hide an operator action below the sidebar edge.
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("sidebarScroll")
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar_content = QWidget()
+        sidebar_content.setObjectName("sidebarScrollContent")
+        sidebar_layout = QVBoxLayout(sidebar_content)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(6)
+        self.sidebar_scroll.setWidget(sidebar_content)
+        sidebar_frame.addWidget(self.sidebar_scroll, 1)
+        self._add_sidebar_buttons(sidebar_layout)
+        sidebar_layout.addStretch(1)
+        self.operator_sidebar.setVisible(False)
+        return self.operator_sidebar
+
+    def _register_operator_page(self, label: str, page: QWidget, *, camera_layout: str | None = None) -> None:
+        self.operator_pages[label] = page
+        if camera_layout is not None:
+            self._camera_page_layouts[label] = camera_layout
+        self.operator_workspace_stack.addWidget(page)
+
+    @staticmethod
+    def _page_scaffold(title: str, subtitle: str) -> tuple[QWidget, QVBoxLayout, QHBoxLayout]:
+        """Common page shell: a proposal-B panel with title row, control-bar row, and body."""
+        page = QWidget()
+        page.setObjectName("operatorPage")
+        page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        body = QVBoxLayout(page)
+        body.setContentsMargins(16, 14, 16, 16)
+        body.setSpacing(10)
+        title_label = QLabel(title)
+        title_label.setObjectName("pageTitleLabel")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("pageSubtitleLabel")
+        subtitle_label.setWordWrap(True)
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        head.addWidget(title_label)
+        head.addWidget(subtitle_label, 1)
+        body.addLayout(head)
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        body.addLayout(controls)
+        return page, body, controls
+
+    def _build_cameras_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "전체 카메라", "활성 카메라 실시간 스트리밍 · 최종 OK는 항상 차단됩니다."
+        )
+        self.legacy_ai_detection_button = QPushButton("이전 AI Detection")
+        self.legacy_ai_detection_button.setProperty("primary", "true")
+        self.legacy_ai_detection_button.setCheckable(True)
+        self.legacy_ai_detection_button.clicked.connect(self._toggle_legacy_ai_detection)
+        controls.addWidget(self.legacy_ai_detection_button)
+        controls.addStretch(1)
+        page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
+        page.camera_slot.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(page.camera_slot, 1)
+        return page
+
+    def _build_vehicle_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "차량 감지", "front 카메라에서 Hailo 검출 모델을 실행하고 차량 라벨만 표시합니다."
+        )
+        button = QPushButton("차량 감지 시작")
+        button.setProperty("primary", "true")
+        button.setCheckable(True)
+        self.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION] = button
+        button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_VEHICLE_DETECTION))
+        controls.addWidget(button)
+        controls.addStretch(1)
+        page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
+        page.camera_slot.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(page.camera_slot, 1)
+        return page
+
+    def _build_person_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "사람 감지", "정상 수신 중인 카메라에서 person 라벨만 판단합니다. 감지 박스는 각 카메라 타일에 표시됩니다."
+        )
+        button = QPushButton("사람 감지 시작")
+        button.setProperty("primary", "true")
+        button.setCheckable(True)
+        self.purpose_task_buttons[PURPOSE_PERSON_PRESENCE] = button
+        button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_PERSON_PRESENCE))
+        controls.addWidget(button)
+        controls.addStretch(1)
+        page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
+        page.camera_slot.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(page.camera_slot, 1)
+        return page
+
+    def _build_lpr_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "번호판 인식", "FastALPR(CPU)로 번호판을 인식합니다. 결과는 상단 안내와 아래 결과줄에 표시됩니다."
+        )
+        self.front_lpr_button = QPushButton("정면 카메라 인식")
+        self.front_lpr_button.setProperty("primary", "true")
+        self.front_lpr_button.setCheckable(True)
+        self.front_lpr_button.clicked.connect(self._toggle_front_camera_lpr)
+        controls.addWidget(self.front_lpr_button)
+        image_button = QPushButton("번호판 이미지 인식 시작")
+        image_button.setProperty("primary", "true")
+        image_button.setCheckable(True)
+        self.purpose_task_buttons[PURPOSE_LPR_IMAGE] = image_button
+        image_button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_LPR_IMAGE))
+        controls.addWidget(image_button)
+        controls.addStretch(1)
+        self.lpr_result_label = QLabel("LPR 결과 없음")
+        self.lpr_result_label.setObjectName("pageStatusLabel")
+        self.lpr_result_label.setWordWrap(True)
+        body.addWidget(self.lpr_result_label)
+        page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
+        page.camera_slot.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(page.camera_slot, 1)
+        return page
+
+    def _build_nas_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "NAS 연결 확인",
+            "connectiontest 폴더에 검증 페이로드를 기록하고 SHA-256으로 재확인합니다. 카메라 수신 중이면 2초 영상을 함께 올립니다.",
+        )
+        self.nas_test_button = QPushButton("NAS 연결 확인 실행")
+        self.nas_test_button.setProperty("primary", "true")
+        self.nas_test_button.clicked.connect(self._start_nas_connection_test)
+        controls.addWidget(self.nas_test_button)
+        controls.addStretch(1)
+        self.nas_result_label = QLabel("아직 실행하지 않았습니다.")
+        self.nas_result_label.setObjectName("pageStatusLabel")
+        self.nas_result_label.setWordWrap(True)
+        body.addWidget(self.nas_result_label)
+        self.nas_history = QPlainTextEdit()
+        self.nas_history.setObjectName("testLog")
+        self.nas_history.setReadOnly(True)
+        self.nas_history.setPlaceholderText("실행 이력이 여기에 기록됩니다. 진단 전용이며 최종 OK를 허용하지 않습니다.")
+        body.addWidget(self.nas_history, 1)
+        return page
+
+    def _build_system_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "시스템 점검", "설정·Hailo·카메라·PLC 진단을 실행합니다. 모든 결과는 safe_to_operate=False 입니다."
+        )
+        self.system_test_buttons: dict[str, QPushButton] = {}
+        for test_id, label in (
+            ("settings", "설정 검증"),
+            ("hailo_installation", "Hailo 설치 점검"),
+            ("hailo_image_smoke", "Hailo 샘플 이미지"),
+            ("plc_simulator", "PLC 시뮬레이터"),
+            ("full_hardware_smoke", "전체 스모크"),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _checked=False, test_id=test_id: self._run_system_test(test_id))
+            self.system_test_buttons[test_id] = button
+            controls.addWidget(button)
+        controls.addStretch(1)
+        camera_controls = QHBoxLayout()
+        camera_controls.setSpacing(8)
+        for index, tile in enumerate(self.model.camera_tiles, start=1):
+            button = QPushButton(f"카메라 {index} ({tile.title})")
+            button.clicked.connect(lambda _checked=False, test_id=f"camera_{index}": self._run_system_test(test_id))
+            self.system_test_buttons[f"camera_{index}"] = button
+            camera_controls.addWidget(button)
+        camera_controls.addStretch(1)
+        body.addLayout(camera_controls)
+        self.system_test_log = QPlainTextEdit()
+        self.system_test_log.setObjectName("testLog")
+        self.system_test_log.setReadOnly(True)
+        self.system_test_log.setPlaceholderText("진단 결과가 여기에 기록됩니다. 통과해도 안전 승인이 아닙니다.")
+        body.addWidget(self.system_test_log, 1)
+        return page
+
+    def _build_log_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "실행 로그", f"{DEFAULT_RUNTIME_LOG} 마지막 {LOG_VIEW_TAIL_BYTES // 1024}KB를 표시합니다. RTSP 자격증명은 기록 시 마스킹됩니다."
+        )
+        self.log_filter_input = QLineEdit()
+        self.log_filter_input.setObjectName("logFilterInput")
+        self.log_filter_input.setPlaceholderText("필터 (예: camera-capture, ERROR, nas)")
+        self.log_filter_input.textChanged.connect(lambda _text="": self._refresh_log_view())
+        controls.addWidget(self.log_filter_input, 1)
+        self.log_follow_checkbox = QCheckBox("맨 아래 따라가기")
+        self.log_follow_checkbox.setChecked(True)
+        controls.addWidget(self.log_follow_checkbox)
+        refresh = QPushButton("새로고침")
+        refresh.setFixedWidth(110)
+        refresh.clicked.connect(lambda _checked=False: self._refresh_log_view())
+        controls.addWidget(refresh)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("testLog")
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.log_view.document().setMaximumBlockCount(LOG_VIEW_MAX_LINES)
+        self.log_view.setPlaceholderText("로그 파일이 아직 없습니다.")
+        body.addWidget(self.log_view, 1)
+        return page
+
+    def _build_driver_test_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "주차 프로세스 테스트", "주차기 실행 프로세스를 단계별로 재현합니다. 모든 단계는 테스트 전용이며 PLC OK를 허용하지 않습니다."
+        )
+        self.driver_test_buttons: dict[str, QPushButton] = {}
+        for label, handler in (
+            ("실제 상태", self._clear_user_test_state),
+            ("IDLE", self._user_idle),
+            ("진입", self._user_entry),
+            ("진입완료", self._user_entry_complete),
+            ("번호판인식", self._user_plate_recognition),
+            ("주차시작", self._user_parking_started),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("smallModeButton")
+            button.clicked.connect(handler)
+            self.driver_test_buttons[label] = button
+            controls.addWidget(button)
+        self.vehicle_sim_button = QPushButton("차량 진입 시뮬레이션")
+        self.vehicle_sim_button.setObjectName("smallModeButton")
+        self.vehicle_sim_button.clicked.connect(self._simulate_vehicle_entry)
+        controls.addWidget(self.vehicle_sim_button)
+        controls.addStretch(1)
+        # Kept for compatibility with existing show/hide expectations.
+        self.driver_test_panel = QFrame()
+        self.driver_test_panel.setVisible(False)
+        body.addWidget(self.driver_preview_host, 1)
+        return page
 
     def _build_ld2410_console_view(self) -> QWidget:
         root = QWidget()
@@ -1458,50 +1755,138 @@ class OperatorWindow(QMainWindow):
         return root
 
     def _add_sidebar_buttons(self, layout: QVBoxLayout) -> None:
-        for label in SIDEBAR_ACTION_LABELS:
-            button = QPushButton(label)
-            button.setObjectName("sidebarButton")
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            if label == "사용자모드":
-                button.clicked.connect(self._show_user_mode)
-            elif label == "전체 카메라":
-                button.clicked.connect(self._show_all_cameras)
-            elif label == "카메라 설정":
-                button.clicked.connect(self._show_camera_settings)
-            elif label == "이전 AI Detection":
-                self.legacy_ai_detection_button = button
-                button.setCheckable(True)
-                button.clicked.connect(self._toggle_legacy_ai_detection)
-            elif label == "차량 전용 검출":
-                button.setCheckable(True)
-                self.purpose_task_buttons[PURPOSE_VEHICLE_DETECTION] = button
-                button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_VEHICLE_DETECTION))
-            elif label == "번호판 이미지 LPR":
-                button.setCheckable(True)
-                self.purpose_task_buttons[PURPOSE_LPR_IMAGE] = button
-                button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_LPR_IMAGE))
-            elif label == "정면카메라LPR":
-                self.front_lpr_button = button
-                button.setCheckable(True)
-                button.clicked.connect(self._toggle_front_camera_lpr)
-            elif label == "사람 존재 감지":
-                button.setCheckable(True)
-                self.purpose_task_buttons[PURPOSE_PERSON_PRESENCE] = button
-                button.clicked.connect(lambda _checked=False: self._toggle_purpose_inference(PURPOSE_PERSON_PRESENCE))
-            elif label == "LD2410":
-                button.clicked.connect(self._show_ld2410_console)
-            elif label == "차량 진입 시뮬레이션":
-                button.clicked.connect(self._simulate_vehicle_entry)
-            elif label == "NAS 연결 확인":
-                self.nas_test_button = button
-                button.clicked.connect(self._start_nas_connection_test)
-            elif label == "종료":
-                button.setProperty("danger", "true")
-                button.clicked.connect(self._request_shutdown)
+        page_labels = set(self.operator_pages)
+        for section_title, labels in SIDEBAR_SECTIONS:
+            section = QLabel(section_title)
+            section.setObjectName("sidebarSectionLabel")
+            layout.addWidget(section)
+            for label in labels:
+                button = QPushButton(label)
+                button.setObjectName("sidebarButton")
+                button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                if label in page_labels:
+                    button.setCheckable(True)
+                    button.clicked.connect(lambda _checked=False, label=label: self._show_operator_page(label))
+                elif label == "사용자 화면":
+                    button.clicked.connect(self._show_user_mode)
+                elif label == "카메라 설정":
+                    button.clicked.connect(self._show_camera_settings)
+                elif label == "프로그램 종료":
+                    button.setProperty("danger", "true")
+                    button.clicked.connect(self._request_shutdown)
+                else:
+                    raise ValueError(f"Unsupported sidebar action: {label}")
+                self.sidebar_buttons[label] = button
+                layout.addWidget(button)
+        # Compatibility alias used by tests and driver-test flows.
+        self.driver_test_toggle = self.sidebar_buttons["주차 프로세스 테스트"]
+
+    def _show_operator_page(self, label: str) -> None:
+        page = self.operator_pages[label]
+        camera_layout = self._camera_page_layouts.get(label)
+        self.setUpdatesEnabled(False)
+        try:
+            if hasattr(self, "operator_view"):  # not yet assigned during _build
+                self.stack.setCurrentWidget(self.operator_view)
+            if camera_layout is not None:
+                self._adopt_camera_area(page, camera_layout)
+            self.operator_workspace_stack.setCurrentWidget(page)
+        finally:
+            self.setUpdatesEnabled(True)
+        for nav_label, button in self.sidebar_buttons.items():
+            if button.isCheckable():
+                button.setChecked(nav_label == label)
+        if label == "레이더 (LD2410)":
+            self._render_ld2410_console()
+            self._refresh_ld2410_console_status()
+        elif label == "실행 로그":
+            self._refresh_log_view()
+        elif label == "주차 프로세스 테스트":
+            self._refresh_driver_display(apply_layout=False)
+            self.driver_preview.restore_presentation()
+        self.update()
+
+    def _adopt_camera_area(self, page: QWidget, layout_mode: str) -> None:
+        """Move the shared camera grid into the page and apply its layout mode."""
+        slot = getattr(page, "camera_slot", None)
+        if slot is None:
+            return
+        if self.operator_camera_area.parentWidget() is not page:
+            slot.addWidget(self.operator_camera_area)
+        self._set_camera_layout(layout_mode)
+        self.operator_camera_area.show()
+        self.grid.invalidate()
+        self.grid.activate()
+
+    def _run_system_test(self, test_id: str) -> None:
+        if not self._operator_unlocked:
+            return
+        if self._system_test_running:
+            self.warning_label.setText("이미 진단이 실행 중입니다. 완료 후 다시 시도해 주세요.")
+            return
+        if self.settings is None:
+            self.system_test_log.appendPlainText("[SKIP] 설정이 없어 진단을 실행할 수 없습니다.")
+            return
+        self._system_test_running = True
+        for button in self.system_test_buttons.values():
+            button.setEnabled(False)
+        label = self.system_test_buttons[test_id].text()
+        self.system_test_log.appendPlainText(f"[실행] {label} ...")
+        thread = QThread(self)
+        worker = DiagnosticsWorker(self.settings, test_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result_ready.connect(self._set_system_test_result)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(lambda worker=worker, thread=thread: self._cleanup_system_test_worker(thread, worker))
+        self._system_test_threads.append(thread)
+        self._system_test_workers.append(worker)
+        thread.start()
+
+    def _set_system_test_result(self, result: DiagnosticResult) -> None:
+        line = (
+            f"[{result.status.value}] {result.label} — {result.summary}"
+            f" ({result.duration_ms}ms) · safe_to_operate={result.safe_to_operate}"
+        )
+        self.system_test_log.appendPlainText(line)
+        if result.detail:
+            self.system_test_log.appendPlainText(f"    {result.detail}")
+
+    def _cleanup_system_test_worker(self, thread: QThread, worker: QObject) -> None:
+        if thread in self._system_test_threads:
+            self._system_test_threads.remove(thread)
+        if worker in self._system_test_workers:
+            self._system_test_workers.remove(worker)
+        if not self._system_test_workers:
+            self._system_test_running = False
+            for button in self.system_test_buttons.values():
+                button.setEnabled(True)
+
+    def _refresh_log_view(self) -> None:
+        if not hasattr(self, "log_view"):
+            return
+        log_path = DEFAULT_RUNTIME_LOG
+        try:
+            size = log_path.stat().st_size
+            with log_path.open("rb") as fp:
+                if size > LOG_VIEW_TAIL_BYTES:
+                    fp.seek(size - LOG_VIEW_TAIL_BYTES)
+                    fp.readline()  # drop the partial first line
+                text = fp.read().decode("utf-8", errors="replace")
+        except OSError:
+            self.log_view.setPlainText("")
+            return
+        needle = self.log_filter_input.text().strip()
+        if needle:
+            text = "\n".join(line for line in text.splitlines() if needle.lower() in line.lower())
+        if text != self.log_view.toPlainText():
+            scrollbar = self.log_view.verticalScrollBar()
+            keep_position = scrollbar.value()
+            self.log_view.setPlainText(text)
+            if self.log_follow_checkbox.isChecked():
+                scrollbar.setValue(scrollbar.maximum())
             else:
-                raise ValueError(f"Unsupported sidebar action: {label}")
-            self.sidebar_buttons[label] = button
-            layout.addWidget(button)
+                scrollbar.setValue(min(keep_position, scrollbar.maximum()))
 
     def _build_settings_view(self) -> QWidget:
         root = QWidget()
@@ -1553,6 +1938,12 @@ class OperatorWindow(QMainWindow):
         text = datetime.now().strftime("%m-%d %H:%M:%S")
         self.clock_label.setText(text)
         self._refresh_ld2410_console_status()
+        if (
+            hasattr(self, "log_view")
+            and self.stack.currentWidget() is self.operator_view
+            and self.operator_workspace_stack.currentWidget() is self.operator_pages.get("실행 로그")
+        ):
+            self._refresh_log_view()
         if self._evidence_coordinator is not None:
             self.evidence_status_label.setText(self._evidence_coordinator.status_summary)
         if self._last_person_detection_at is not None and time.monotonic() - self._last_person_detection_at >= PERSON_ALERT_STALE_SECONDS:
@@ -1587,7 +1978,7 @@ class OperatorWindow(QMainWindow):
     def _show_operator(self) -> None:
         if not self._operator_unlocked:
             return
-        self._activate_operator_layout(self._camera_layout_mode)
+        self._show_operator_page("전체 카메라")
 
     def _show_user_mode(self) -> None:
         self._operator_unlocked = False
@@ -1606,33 +1997,16 @@ class OperatorWindow(QMainWindow):
 
     def _show_operator_dashboard(self) -> None:
         self._operator_unlocked = True
-        self._set_driver_test_preview(False)
-        self._activate_operator_layout("dashboard")
+        self._show_operator_page("전체 카메라")
 
     def _show_all_cameras(self) -> None:
         self._operator_unlocked = True
-        self._set_driver_test_preview(False)
-        self._activate_operator_layout("all")
+        self._show_operator_page("전체 카메라")
 
     def _show_ld2410_console(self) -> None:
         if not self._operator_unlocked:
             return
-        self._set_driver_test_preview(False)
-        self.stack.setCurrentWidget(self.operator_view)
-        self.operator_workspace_stack.setCurrentWidget(self.ld2410_console_view)
-        self._render_ld2410_console()
-        self._refresh_ld2410_console_status()
-
-    def _activate_operator_layout(self, mode: str) -> None:
-        self.setUpdatesEnabled(False)
-        try:
-            self.stack.setCurrentWidget(self.operator_view)
-            self._set_camera_layout(mode)
-            self.grid.invalidate()
-            self.grid.activate()
-        finally:
-            self.setUpdatesEnabled(True)
-        self.update()
+        self._show_operator_page("레이더 (LD2410)")
 
     def _show_camera_settings(self) -> None:
         if not self._operator_unlocked:
@@ -1666,17 +2040,14 @@ class OperatorWindow(QMainWindow):
         self.operator_sidebar.setVisible(not self.operator_sidebar.isVisible())
 
     def _toggle_driver_test_panel(self, checked: bool = False) -> None:
-        self._set_driver_test_preview(checked)
-        if checked:
-            self._refresh_driver_display(apply_layout=False)
-            self.driver_preview.restore_presentation()
+        del checked
+        self._show_operator_page("주차 프로세스 테스트")
 
     def _set_driver_test_preview(self, enabled: bool) -> None:
-        self.driver_test_toggle.setChecked(enabled)
-        self.driver_test_panel.setVisible(enabled)
-        self.operator_workspace_stack.setCurrentWidget(
-            self.driver_preview_host if enabled else self.operator_camera_area
-        )
+        if enabled:
+            self._show_operator_page("주차 프로세스 테스트")
+        elif self.operator_workspace_stack.currentWidget() is self.operator_pages["주차 프로세스 테스트"]:
+            self._show_operator_page("전체 카메라")
 
     def _clear_user_test_state(self) -> None:
         self._driver_state_override = None
@@ -1980,44 +2351,40 @@ class OperatorWindow(QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.hide()
-        if not self.model.birdview_available and mode == "all":
+        if mode == "front":
+            layout = ((CameraRole.front, 0, 0, 1, 1),)
+        elif not self.model.birdview_available:
             layout = (
                 (CameraRole.front, 0, 0, 2, 1),
                 (CameraRole.rear_side, 0, 1, 1, 1),
                 (CameraRole.opposite_side, 1, 1, 1, 1),
             )
-        elif not self.model.birdview_available:
-            layout = ((CameraRole.front, 0, 0, 1, 1),)
-        elif mode == "all":
+        else:
             layout = (
                 (CameraRole.ceiling, 0, 0, 1, 1),
                 (CameraRole.front, 0, 1, 1, 1),
                 (CameraRole.rear_side, 1, 0, 1, 1),
                 (CameraRole.opposite_side, 1, 1, 1, 1),
             )
-        else:
-            layout = (
-                (CameraRole.ceiling, 0, 0, 1, 1),
-                (CameraRole.front, 0, 1, 1, 1),
-            )
         for role, row, col, row_span, col_span in layout:
             widget = self.camera_widgets[role]
-            if mode == "dashboard" and role is CameraRole.ceiling:
-                widget.setMinimumSize(320, 520)
-                widget.setMaximumWidth(520)
-            else:
-                widget.setMinimumSize(360, 220)
-                widget.setMaximumWidth(16777215)
+            # Keep tile minimums small so a resized window reflows instead of overflowing;
+            # the paint path letterboxes each frame centered, so ratios stay honest.
+            widget.setMinimumSize(240, 140)
+            widget.setMaximumWidth(16777215)
             self.grid.addWidget(widget, row, col, row_span, col_span)
             widget.show()
-        if not self.model.birdview_available:
+        if mode == "front":
+            self.grid.setColumnStretch(0, 1)
+            self.grid.setColumnStretch(1, 0)
+        elif not self.model.birdview_available:
             self.grid.setColumnStretch(0, 3)
-            self.grid.setColumnStretch(1, 2 if mode == "all" else 0)
+            self.grid.setColumnStretch(1, 2)
         else:
-            self.grid.setColumnStretch(0, 2 if mode == "dashboard" else 1)
-            self.grid.setColumnStretch(1, 5 if mode == "dashboard" else 1)
-        for row in range(2):
-            self.grid.setRowStretch(row, 1 if mode == "all" or row == 0 else 0)
+            self.grid.setColumnStretch(0, 1)
+            self.grid.setColumnStretch(1, 1)
+        self.grid.setRowStretch(0, 1)
+        self.grid.setRowStretch(1, 0 if mode == "front" else 1)
 
     def _toggle_ai_detection(self, checked: bool = False) -> None:
         del checked
@@ -2186,6 +2553,8 @@ class OperatorWindow(QMainWindow):
                 )
             self.instruction_label.setText(f"정면카메라LPR: {last4}")
             self.warning_label.setText(f"정면카메라LPR 완료. 로그: {payload.get('log_path')}. 최종 OK는 차단됩니다.")
+            if hasattr(self, "lpr_result_label"):
+                self.lpr_result_label.setText(f"정면 카메라 인식: •••• {last4}" if last4 else "정면 카메라 인식: 결과 없음")
             self._driver_masked_plate = f"•••• {last4}" if last4 else ""
             self.user_plate_label.setText(f"번호판: {last4}")
             self._refresh_driver_display()
@@ -2304,6 +2673,8 @@ class OperatorWindow(QMainWindow):
 
     def _set_nas_test_status(self, message: str) -> None:
         self.warning_label.setText(f"{message}. 진단 전용이며 최종 OK는 차단됩니다.")
+        if hasattr(self, "nas_result_label"):
+            self.nas_result_label.setText(message)
 
     def _set_nas_test_result(self, result: NasConnectionTestResult) -> None:
         clip = f" · {self._nas_test_camera_id} 영상 {len(self._nas_test_frames)}프레임" if self._nas_test_frames else ""
@@ -2313,6 +2684,10 @@ class OperatorWindow(QMainWindow):
         else:
             self.instruction_label.setText("NAS 연결 확인 실패")
             self._set_nas_test_status(f"{result.summary} · {result.error}")
+        if hasattr(self, "nas_history"):
+            stamp = datetime.now().strftime("%H:%M:%S")
+            outcome = f"성공 {result.remote_dir}" if result.ok else f"실패 {result.error}"
+            self.nas_history.appendPlainText(f"[{stamp}] {outcome} · {result.summary}{clip}")
         self._nas_test_frames = []
         self._nas_test_widget = None
 
@@ -2341,8 +2716,16 @@ class OperatorWindow(QMainWindow):
             self.warning_label.setText("설정이 없어 목적별 AI 추론을 시작할 수 없습니다.")
             return
         if self._purpose_workers:
-            self._set_purpose_buttons_checked(False)
-            self.warning_label.setText("목적별 AI 추론 종료 처리 중입니다. 잠시 후 다시 시도해 주세요.")
+            # 다른 추론이 실행(또는 종료) 중이면 자동으로 중지시키고, 종료가 완료되는 즉시
+            # 요청된 추론을 시작한다(_cleanup_purpose_worker가 대기 작업을 이어받는다).
+            previous = self._purpose_task_label or "기존 AI 추론"
+            requested = PURPOSE_TASK_SPECS[task_id]
+            self._pending_user_purpose_task_id = task_id
+            self._stop_purpose_inference()
+            self._set_purpose_buttons_checked(True, task_id=task_id)
+            self.warning_label.setText(
+                f"{previous} 중지 중입니다. 종료되면 {requested.label} 추론을 자동 시작합니다. 최종 OK는 차단됩니다."
+            )
             return
         if self._detection_enabled:
             self._stop_ai_detection()
@@ -2452,7 +2835,7 @@ class OperatorWindow(QMainWindow):
         if not events:
             self._purpose_lpr_results = ()
             self.instruction_label.setText("번호판 인식 실패: 결과 없음")
-            self.warning_label.setText("번호판 이미지 LPR 결과가 없습니다. 최종 OK는 차단됩니다.")
+            self.warning_label.setText("번호판 이미지 인식 결과가 없습니다. 최종 OK는 차단됩니다.")
             return
         merged = self._purpose_lpr_results + tuple(events)
         self._purpose_lpr_results = tuple(sorted(merged, key=lambda event: event.timestamp, reverse=True))
@@ -2468,7 +2851,11 @@ class OperatorWindow(QMainWindow):
                 )
         suffix = f" 외 {len(self._purpose_lpr_results) - 1}건" if len(self._purpose_lpr_results) > 1 else ""
         self.instruction_label.setText(f"번호판 인식: {latest.plate_number}{suffix}")
-        self.warning_label.setText("번호판 이미지 LPR 결과입니다. 최종 OK는 차단됩니다.")
+        self.warning_label.setText("번호판 이미지 인식 결과입니다. 최종 OK는 차단됩니다.")
+        if hasattr(self, "lpr_result_label"):
+            self.lpr_result_label.setText(
+                f"이미지 인식: {latest.plate_number} (conf {latest.confidence:.2f}){suffix}"
+            )
 
     def _set_purpose_status(self, target_id: str, message: str) -> None:
         if "실행 중" in message:
@@ -2548,14 +2935,15 @@ class OperatorWindow(QMainWindow):
     def _set_purpose_button_texts(self) -> None:
         for task_id, button in self.purpose_task_buttons.items():
             label = PURPOSE_TASK_SPECS[task_id].label
-            button.setText(f"{label} ON" if self._purpose_task_enabled and self._purpose_task_id == task_id else label)
+            running = self._purpose_task_enabled and self._purpose_task_id == task_id
+            button.setText(f"{label} 중지" if running else f"{label} 시작")
 
     def _set_front_lpr_button_text(self) -> None:
         button = getattr(self, "front_lpr_button", None)
         if button is None:
             return
         button.setChecked(self._front_lpr_enabled)
-        button.setText("정면카메라LPR ON" if self._front_lpr_enabled else "정면카메라LPR")
+        button.setText("정면 카메라 인식 중…" if self._front_lpr_enabled else "정면 카메라 인식")
 
     def _cleanup_detection_worker(self, thread: QThread, worker: LiveDetectionWorker) -> None:
         if thread in self._detection_threads:
@@ -2953,157 +3341,225 @@ def launch_from_settings(settings: Settings, model: OperatorDisplayModel) -> int
 
 
 def _stylesheet() -> str:
+    # 시안 B「패널 HMI」 토큰:
+    #   바탕 #0C0F14 · 패널 #151B24 · 경계 #232C39 · 본문 #E9EDF3 · 보조 #8792A3
+    #   액센트(앰버) #F5A623 · NG #E5484D · 수신중 #3DD68C
+    # 사용자(드라이버) 화면의 시안/네이비 언어는 DESIGN.md에 따라 그대로 유지한다.
     return """
     QMainWindow, QWidget {
-        background: #0b0f14;
-        color: #e5e7eb;
+        background: #0C0F14;
+        color: #E9EDF3;
         font-family: "Noto Sans CJK KR", "Noto Sans", sans-serif;
         letter-spacing: 0px;
     }
     #sidePanel {
-        background: #151a21;
-        border: 1px solid #374151;
+        background: #151B24;
+        border: 1px solid #232C39;
+        border-radius: 12px;
+    }
+    #operatorPage {
+        background: #151B24;
+        border: 1px solid #232C39;
+        border-radius: 12px;
     }
     #safetyLabel {
         min-height: 96px;
-        font-size: 54px;
+        font-size: 52px;
         font-weight: 800;
-        border: 2px solid #ef4444;
-        background: #3f1115;
-        color: #fee2e2;
+        color: #FFD9DB;
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3A1418, stop:1 #2A0F13);
+        border: 1px solid #B93A44;
+        border-radius: 12px;
     }
     #safetyLabel[status="ready"] {
-        border-color: #22c55e;
-        background: #10351f;
-        color: #dcfce7;
+        color: #D8F7E4;
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #123726, stop:1 #0D2A1D);
+        border-color: #2E9E6B;
     }
     #safetyLabel[status="wait"] {
-        border-color: #facc15;
-        background: #3f3410;
-        color: #fef9c3;
+        color: #FBEFC9;
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3A2F12, stop:1 #2B230E);
+        border-color: #B98A2C;
     }
     #instructionLabel {
-        font-size: 32px;
+        font-size: 28px;
         font-weight: 700;
         line-height: 1.25;
-        padding: 12px;
-        border: 1px solid #4b5563;
+        padding: 10px 16px;
+        background: #151B24;
+        border: 1px solid #232C39;
+        border-radius: 12px;
+    }
+    #warningLabel {
+        font-size: 19px;
+        font-weight: 600;
+        color: #F09A9E;
+        padding: 7px 16px;
+        background: #1C1216;
+        border: 1px solid #4A2229;
+        border-radius: 10px;
     }
     #userInstructionLabel {
         font-size: 34px;
         font-weight: 800;
         line-height: 1.25;
         padding: 10px;
-        border: 1px solid #4b5563;
+        border: 1px solid #232C39;
     }
     #userWarningLabel {
         font-size: 22px;
         font-weight: 700;
-        color: #fecaca;
+        color: #F09A9E;
         padding: 8px;
-        border: 1px solid #7f1d1d;
-        background: #241316;
+        border: 1px solid #4A2229;
+        background: #1C1216;
     }
     #userPlateLabel {
         min-width: 190px;
         font-size: 30px;
         font-weight: 800;
         padding: 10px;
-        border: 1px solid #4b5563;
-        background: #101820;
-    }
-    #warningLabel {
-        font-size: 22px;
-        font-weight: 600;
-        color: #fecaca;
-        padding: 10px;
-        border: 1px solid #7f1d1d;
-        background: #241316;
+        border: 1px solid #232C39;
+        background: #10161F;
     }
     #telemetryLabel {
-        font-size: 18px;
+        font-size: 15px;
         font-family: "DejaVu Sans Mono", monospace;
-        padding: 8px;
-        border-bottom: 1px solid #293241;
+        font-weight: 600;
+        color: #C9D2DE;
+        padding: 7px 12px;
+        background: #10161F;
+        border: 1px solid #232C39;
+        border-radius: 8px;
     }
-    #ld2410ConnectionLabel {
-        min-width: 190px;
-        font-size: 18px;
-        font-weight: 800;
-        padding: 8px 12px;
-        border: 1px solid #4b5563;
-        background: #111827;
-    }
-    #ld2410ConnectionLabel[status="connected"] {
-        color: #cffafe;
-        border-color: #0891b2;
-        background: #123142;
-    }
-    #ld2410ConnectionLabel[status="waiting"] {
-        color: #fef3c7;
-        border-color: #d97706;
-        background: #3b2a10;
-    }
-    #ld2410ConnectionLabel[status="error"] {
-        color: #fee2e2;
-        border-color: #ef4444;
-        background: #3f1115;
-    }
-    #ld2410ConnectionLabel[status="disabled"] {
-        color: #9ca3af;
-        border-color: #4b5563;
-        background: #111827;
-    }
-    #ld2410SafetyNote {
-        font-size: 17px;
-        font-weight: 700;
-        color: #fef3c7;
-        padding: 8px;
-        border: 1px solid #92400e;
-        background: #2a2112;
-    }
-    #testTitleLabel {
-        font-size: 26px;
-        font-weight: 800;
-        padding: 8px;
+    #statusStrip {
+        background: transparent;
     }
     QPushButton {
         min-height: 38px;
-        font-size: 17px;
+        font-size: 16px;
         font-weight: 700;
-        background: #1f2937;
-        color: #e5e7eb;
-        border: 1px solid #4b5563;
-        padding: 8px;
+        color: #C7D0DD;
+        background: #1A212C;
+        border: 1px solid #2B3646;
+        border-radius: 9px;
+        padding: 8px 14px;
+    }
+    QPushButton:hover {
+        background: #212A38;
+        border-color: #39465C;
+        color: #E9EDF3;
+    }
+    QPushButton:pressed {
+        background: #161D28;
+    }
+    QPushButton:checked {
+        background: rgba(245, 166, 35, 0.14);
+        border-color: rgba(245, 166, 35, 0.55);
+        color: #FFD27E;
     }
     QPushButton:disabled {
-        color: #6b7280;
-        background: #111827;
+        color: #5B6575;
+        background: #131922;
+        border-color: #1D2632;
+    }
+    QPushButton[primary="true"] {
+        color: #14181F;
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FFC163, stop:1 #F5A623);
+        border: 1px solid #D18A15;
+    }
+    QPushButton[primary="true"]:hover {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FFCE82, stop:1 #FFB23B);
+    }
+    QPushButton[primary="true"]:checked {
+        color: #FFD27E;
+        background: rgba(245, 166, 35, 0.16);
+        border: 1px solid rgba(245, 166, 35, 0.65);
+    }
+    QPushButton[primary="true"]:disabled {
+        color: #5B6575;
+        background: #131922;
+        border-color: #1D2632;
     }
     #smallModeButton {
         min-height: 30px;
         font-size: 14px;
-        padding: 4px 8px;
+        padding: 4px 10px;
     }
     #smallModeButton[active="true"] {
-        border-color: #38bdf8;
-        background: #123142;
-        color: #e0f2fe;
+        background: rgba(245, 166, 35, 0.14);
+        border-color: rgba(245, 166, 35, 0.55);
+        color: #FFD27E;
     }
     #sidebarButton {
-        min-height: 32px;
-        font-size: 16px;
-        padding: 5px 8px;
+        min-height: 34px;
+        font-size: 15px;
+        font-weight: 500;
         text-align: left;
+        color: #8792A3;
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 9px;
+        padding: 6px 12px;
+    }
+    #sidebarButton:hover {
+        background: #1B2330;
+        border-color: transparent;
+        color: #E9EDF3;
+    }
+    #sidebarButton:checked {
+        background: rgba(245, 166, 35, 0.12);
+        border: 1px solid rgba(245, 166, 35, 0.4);
+        color: #FFD27E;
+        font-weight: 700;
     }
     #sidebarButton[danger="true"] {
-        background: #2a1417;
-        color: #fecdd3;
-        border: 1px solid #9f1239;
+        color: #F09A9E;
+        background: transparent;
+        border: 1px solid transparent;
     }
     #sidebarButton[danger="true"]:hover {
-        background: #3b191e;
-        border-color: #e11d48;
+        background: #241318;
+        border-color: #4A2229;
+        color: #FDC7CB;
+    }
+    #sidebarSectionLabel {
+        color: #5B6575;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 2px;
+        padding: 10px 6px 2px 6px;
+        border-top: 1px solid #1B2330;
+    }
+    #pageTitleLabel {
+        font-size: 21px;
+        font-weight: 800;
+        color: #F1F5F9;
+    }
+    #pageSubtitleLabel {
+        font-size: 13px;
+        color: #8792A3;
+    }
+    #pageStatusLabel {
+        font-size: 15px;
+        color: #C9D2DE;
+        background: #10161F;
+        border: 1px solid #232C39;
+        border-radius: 8px;
+        padding: 6px 12px;
+    }
+    #logFilterInput {
+        min-height: 30px;
+        font-size: 14px;
+        padding: 3px 10px;
+        color: #E9EDF3;
+        background: #10161F;
+        border: 1px solid #232C39;
+        border-radius: 8px;
+    }
+    QCheckBox {
+        font-size: 14px;
+        color: #C7D0DD;
     }
     #sidebarScroll, #sidebarScrollContent {
         background: transparent;
@@ -3115,7 +3571,7 @@ def _stylesheet() -> str:
         margin: 0;
     }
     #sidebarScroll QScrollBar::handle:vertical {
-        background: #374151;
+        background: #2B3646;
         min-height: 28px;
         border-radius: 4px;
     }
@@ -3123,12 +3579,56 @@ def _stylesheet() -> str:
     #sidebarScroll QScrollBar::sub-line:vertical {
         height: 0;
     }
+    #ld2410ConnectionLabel {
+        min-width: 190px;
+        font-size: 17px;
+        font-weight: 800;
+        padding: 8px 12px;
+        border: 1px solid #232C39;
+        border-radius: 8px;
+        background: #10161F;
+    }
+    #ld2410ConnectionLabel[status="connected"] {
+        color: #FFD27E;
+        border-color: rgba(245, 166, 35, 0.5);
+        background: rgba(245, 166, 35, 0.1);
+    }
+    #ld2410ConnectionLabel[status="waiting"] {
+        color: #FBEFC9;
+        border-color: #B98A2C;
+        background: #2B230E;
+    }
+    #ld2410ConnectionLabel[status="error"] {
+        color: #FFD9DB;
+        border-color: #B93A44;
+        background: #2A0F13;
+    }
+    #ld2410ConnectionLabel[status="disabled"] {
+        color: #8792A3;
+        border-color: #232C39;
+        background: #10161F;
+    }
+    #ld2410SafetyNote {
+        font-size: 16px;
+        font-weight: 700;
+        color: #FBEFC9;
+        padding: 8px 12px;
+        border: 1px solid #6B5119;
+        border-radius: 8px;
+        background: #241D0C;
+    }
+    #testTitleLabel {
+        font-size: 24px;
+        font-weight: 800;
+        padding: 6px;
+    }
     #testLog {
-        font-size: 15px;
+        font-size: 14px;
         font-family: "DejaVu Sans Mono", monospace;
-        background: #090d12;
-        color: #d1d5db;
-        border: 1px solid #374151;
+        background: #0B1017;
+        color: #C9D2DE;
+        border: 1px solid #232C39;
+        border-radius: 8px;
     }
     #testListScroll {
         background: transparent;
