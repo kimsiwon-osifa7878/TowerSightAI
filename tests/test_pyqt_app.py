@@ -1815,3 +1815,61 @@ def test_nas_connection_test_ignores_a_second_click_while_running(monkeypatch, t
     assert len(window._nas_test_workers) == 1
     assert "이미 실행 중" in window.warning_label.text()
     window.close()
+
+
+class _FakeCapture:
+    def __init__(self, opened: bool) -> None:
+        self._opened = opened
+        self.released = False
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def release(self) -> None:
+        self.released = True
+
+
+class _FakeCv2NoGstreamer:
+    """cv2 stand-in whose GStreamer backend never opens (pip opencv-python wheel)."""
+
+    CAP_GSTREAMER = 1800
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def VideoCapture(self, *args):  # noqa: N802 - mimics the cv2 API.
+        self.calls.append(args)
+        if len(args) == 2 and args[1] == self.CAP_GSTREAMER:
+            return _FakeCapture(opened=False)
+        return _FakeCapture(opened=True)
+
+
+def test_capture_falls_back_to_ffmpeg_rtsp_for_every_camera_without_gstreamer():
+    _qt_app()
+    settings = _settings()
+    fake_cv2 = _FakeCv2NoGstreamer()
+    from towersightai.ui.pyqt_app import CameraCaptureWorker
+
+    for camera_id in ("front", "rear_side", "opposite_side", "ceiling"):
+        worker = CameraCaptureWorker(settings, camera_id)
+        capture, using_gstreamer = worker._open_capture(fake_cv2)
+        assert using_gstreamer is False
+        assert capture.isOpened() is True
+        # The fallback must target the camera's own RTSP URL, not an empty device.
+        assert fake_cv2.calls[-1] == (worker.camera.rtsp_url,)
+
+
+def test_capture_fallback_logs_once_per_worker(caplog):
+    _qt_app()
+    settings = _settings()
+    fake_cv2 = _FakeCv2NoGstreamer()
+    from towersightai.ui.pyqt_app import CameraCaptureWorker
+
+    worker = CameraCaptureWorker(settings, "rear_side")
+    with caplog.at_level("WARNING", logger="towersightai.camera.capture"):
+        worker._open_capture(fake_cv2)
+        worker._open_capture(fake_cv2)
+
+    fallback_lines = [r for r in caplog.records if "gstreamer-unavailable" in r.message]
+    assert len(fallback_lines) == 1
+    assert "rear_side" in fallback_lines[0].getMessage()

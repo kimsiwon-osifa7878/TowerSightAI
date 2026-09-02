@@ -367,5 +367,10 @@ no state, AI, or PLC contract yet and must not be inferred from the UI or the Pa
 - `Settings` requires all four cameras even when `BIRDVIEW_MODE=disabled`; use `active_cameras`, not `cameras`,
   when selecting capture/inference targets.
 - `SimulatorPLCAdapter.event_names` has unreachable code after its `return`; clean it up if you touch that file.
+- pip `opencv-python` wheels are built without GStreamer, so `cv2.VideoCapture(..., CAP_GSTREAMER)` never
+  opens on such installs. `CameraCaptureWorker._open_capture` falls back to a direct FFmpeg RTSP capture for
+  every active camera (rotation applied in software); capture state transitions are logged under
+  `towersightai.camera.capture`. `check-settings --health-check-cameras` uses the system `gst-launch-1.0`
+  subprocess, so it can pass even when the in-process GStreamer backend is unavailable.
 - `artifacts/`, `models/`, `tmp/`, `gstshark_*/`, `hailort*.log`, and `.env` are gitignored — never add them.
 - Korean UI strings are part of the contract; keep the exact labels tests assert on.

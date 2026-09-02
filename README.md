@@ -255,6 +255,13 @@ Dashboard behavior:
 - `종료` asks for confirmation and then closes the application. It never sends a PLC event.
 - The sidebar scrolls vertically, so every menu entry stays reachable on short displays.
 
+Camera preview capture first tries the OpenCV GStreamer backend. When the installed `cv2` was built
+without GStreamer (the pip `opencv-python` wheels are), every active camera falls back to a direct FFmpeg
+RTSP capture; the configured rotation is applied in software on that path. The fallback and each per-camera
+capture state transition are logged under `towersightai.camera.capture` in
+`artifacts/runtime/towersightai.log`, so a camera that never opens is now visible in the log as
+`camera-capture-status ... status=open-failed`.
+
 Disconnected active cameras remain visible as NG tiles and are not used as inference targets. A disabled birdview is not counted as a failed active camera, but is shown separately as `버드뷰 OFF` and always blocks final OK. Currently connected streams are selected from runtime camera status, not from static `.env` presence.
 
 ## Purpose AI Checks

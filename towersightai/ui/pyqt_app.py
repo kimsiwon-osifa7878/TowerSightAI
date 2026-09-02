@@ -253,34 +253,56 @@ class CameraCaptureWorker(QObject):
         self.camera = next(camera for camera in settings.cameras if camera.id == camera_id)
         self.rotation_degrees = rotation_degrees
         self._running = True
+        self._gstreamer_fallback_logged = False
 
     def stop(self) -> None:
         self._running = False
 
     def run(self) -> None:
+        logger = logging.getLogger("towersightai.camera.capture")
         try:
             import cv2  # type: ignore[import-not-found]
         except ImportError:
+            logger.error("camera-capture-opencv-missing camera=%s", self.camera.id)
             self.status_changed.emit(self.camera.id, "NG: OpenCV 미설치")
             self.finished.emit()
             return
 
+        last_logged_status = ""
+
+        def log_status(status: str, *, backend: str = "") -> None:
+            nonlocal last_logged_status
+            if status == last_logged_status:
+                return
+            last_logged_status = status
+            logger.info(
+                "camera-capture-status camera=%s status=%s backend=%s",
+                self.camera.id,
+                status,
+                backend or "-",
+            )
+
         while self._running:
             capture, using_gstreamer = self._open_capture(cv2)
+            backend = "gstreamer" if using_gstreamer else "ffmpeg-fallback"
             if not capture.isOpened():
                 capture.release()
+                log_status("open-failed", backend=backend)
                 self.status_changed.emit(self.camera.id, "NG: 카메라 연결 이상")
                 QThread.sleep(1)
                 continue
 
+            log_status("streaming", backend=backend)
             self.status_changed.emit(self.camera.id, "정상 수신")
             missed_frames = 0
             while self._running:
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     missed_frames += 1
+                    log_status("frame-stall", backend=backend)
                     self.status_changed.emit(self.camera.id, "NG: 프레임 지연")
                     if missed_frames >= 10:
+                        log_status("reconnecting", backend=backend)
                         break
                     QThread.msleep(100)
                     continue
@@ -299,6 +321,7 @@ class CameraCaptureWorker(QObject):
                 image_format = QImage.Format.Format_RGBA8888 if channels == 4 else QImage.Format.Format_RGB888
                 image = QImage(frame.data, width, height, channels * width, image_format).copy()
                 self.frame_ready.emit(self.camera.id, image)
+                log_status("streaming", backend=backend)
                 self.status_changed.emit(self.camera.id, "정상 수신")
             capture.release()
         self.finished.emit()
@@ -312,11 +335,18 @@ class CameraCaptureWorker(QObject):
         capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         using_gstreamer = capture.isOpened()
         if not using_gstreamer:
+            # cv2 builds without GStreamer (pip opencv-python wheels) cannot open the
+            # preview pipeline at all. Fall back to a direct FFmpeg RTSP capture for every
+            # active camera; run() applies the configured rotation and BGR->RGB on this
+            # path. A failed fallback still surfaces as an NG tile and blocks final OK.
             capture.release()
-            if self.camera.role is CameraRole.front:
-                capture = cv2.VideoCapture(self.camera.rtsp_url)
-            else:
-                capture = cv2.VideoCapture()
+            if not self._gstreamer_fallback_logged:
+                self._gstreamer_fallback_logged = True
+                logging.getLogger("towersightai.camera.capture").warning(
+                    "camera-capture-gstreamer-unavailable camera=%s falling back to FFmpeg RTSP",
+                    self.camera.id,
+                )
+            capture = cv2.VideoCapture(self.camera.rtsp_url)
         return capture, using_gstreamer
 
 
