@@ -19,9 +19,11 @@
 | | 개발기 | 현장기 |
 |---|---|---|
 | 호스트/계정 | `erumtni@erumtni-NucBox-G3` | `erumtni2@pakrio-shinantower` |
-| 역할 | 개발·검증 (실카메라 2대 + Hailo-8 연결됨) | 실제 주차기 설치 현장 |
+| 하드웨어 | (개발용) | **GMKtec GMK-G3 (Intel N100 미니PC)** + Hailo-8 M.2 |
+| 역할 | 개발·검증 (실카메라 2대 + Hailo-8 연결됨) | 실제 주차기 설치 현장 (원격 관리 — 물리 접근 제한적) |
 | 카메라 IP | front .244, 좌측면 .193 (우측면 .191 미접속) | front .235, 좌측면 .239, 우측면 .211 |
 | ceiling | placeholder (BIRDVIEW_MODE=disabled) | placeholder — .239를 복제해 둔 상태(§5 참고) |
+| Hailo M.2 링크 | 정상 | **불안정 — Gen3 가능인데 Gen1로 강등, 유휴 중 행 재발(§5)** |
 
 - 두 장비 모두: 프로젝트 `.venv`(Python 3.12) + Hailo Apps venv(`~/hailo-apps/venv_hailo_apps`),
   리소스는 `/usr/local/hailo/resources`, HailoRT 4.23.0 + TAPPAS Core 5.1.0.
@@ -85,11 +87,30 @@
 ## 5. 미해결 항목 (다음 세션이 이어받을 것)
 
 즉시(현장):
-- [ ] **Hailo 칩 하드웨어 행 복구**: 콜드 부팅(전원 완전 차단 30초) + M.2 재장착. 배경: 8/31부터
-  포트 0000:00:1d.0에 AER RxErr 누적(11건) 후 유휴 중 칩 사망(`Failed reading device BARs`).
-  복구 후 판정: `hailortcli fw-control identify` + RxErr 카운트가 늘지 않는지(HAILO 알약/
-  `sudo dmesg | grep -c RxErr`). 재발 시 BIOS에서 해당 M.2 슬롯 PCIe Gen3→Gen2. ASPM은 이미
-  꺼져 있어 무관, CPU 과열 이벤트도 없음.
+- [ ] **Hailo 칩 하드웨어 행 — 물리 링크 문제로 확정 (재발 중)**. 장비: GMKtec GMK-G3(N100).
+  증상: 노드(`/dev/hailo0`)·드라이버(4.23.0)·lspci 다 정상인데 칩이 제어 요청에 무응답
+  (`HAILO_DRIVER_OPERATION_FAILED(36)`, open `/dev/hailo0` **error 5=EIO**, `identify`가 `[-]`).
+  근본 원인: **PCIe 링크 불안정**. `LnkCap 8GT/s(Gen3) x2`인데 `LnkSta 2.5GT/s(Gen1) x2`로 **3단계
+  강등** + 상위 포트(0000:00:1d.0) **AER RxErr 누적(8/31 11건 → 9/2 12건)**, 재열거 복구 후 **약
+  47분 만에 재발**. 온도 정상, ASPM은 `not supported`라 무관 → 소프트웨어/전원관리/속도 문제 아님.
+  **속도 하향(Gen2)은 레버 아님**(이미 Gen1인데도 에러).
+  - 복구 전 반드시 증거 저장: `~/hailo-hang-<ts>/` 번들(00~09), 특히 `01-pcie-aer.txt`(RxErr·LnkSta)는
+    복구하면 초기화됨. 판독은 `ls -d ~/hailo-hang-*/ | tail -1` 후 [2]RxErr/[3]LnkSta/[5]identify.
+  - **원격 복구(물리 접근 없이)**: ① PCIe 재열거 —
+    `pkill -f operator_ui; pkill -f hailortcli` 후
+    `sudo modprobe -r hailo_pci; echo 1|sudo tee /sys/bus/pci/devices/0000:02:00.0/remove; sleep 2;
+    echo 1|sudo tee /sys/bus/pci/rescan; sudo modprobe hailo_pci; hailortcli fw-control identify`
+    (이전에 통함, 임시). ② `reboot` — **9/2 재발 때 reboot만으로 회복됨**(identify 정상, LnkSta가
+    Gen1→**8GT/s Gen3** 복귀; width `x2 (downgraded)`는 슬롯이 원래 x2 배선이라 정상). warm reboot로도
+    링크가 다시 트레이닝될 수 있음이 확인됨 — 원격에서 우선 시도할 값어치 있음.
+  - **근본 해결(현장 방문 시, 여전히 필요)**: reboot는 그때그때 복구일 뿐 링크가 한 번 Gen1까지
+    무너진 이력이 있으므로 물리 대책이 근본임. 완전 전원 차단(코드 분리 30초) → **M.2 재장착 + 접점
+    청소**, 중간 라이저/연장 케이블 있으면 재체결·교체(RxErr 1순위 용의자). 그래도 재발 → 다른 M.2
+    슬롯/모듈 교체.
+  - **재발 조기경보 = RxErr 추세**. reboot/재열거로 AER 카운터가 0으로 초기화되니, 이후
+    `cat /sys/bus/pci/devices/0000:00:1d.0/aer_dev_correctable | grep RxErr` 와 `LnkSta`(8GT/s 유지
+    여부)를 주기적으로 확인. RxErr가 다시 오르거나 LnkSta가 2.5GT/s로 떨어지면 곧 행 → 현장 방문 예약.
+  - health 모니터(`towersightai.hailo.health`)는 이 상태를 정확히 error로 잡고 있음(소프트웨어는 정상).
 - [ ] 현장 `.env`에 `CAMERA_N_RECORD_RTSP_URL` 4줄(stream2) 추가 — 안내는 완료, 적용 확인 필요.
 - [ ] 현장 `CAMERA_1_RTSP_URL`(ceiling placeholder)이 좌측면 실IP(.239) 복제 상태 — 접속 불가
   주소(`192.0.2.10`)로 교체 권고했으나 미확인.
