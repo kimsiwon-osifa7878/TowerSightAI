@@ -19,3 +19,7 @@ data/field-media/*
 data/calibration/intrinsics/
 data/calibration/checkerboard/
 data/analysis/
+
+# 차량 감지 검증 랩 (vehicle_box_test/) — 코드만 추적, 내려받은 현장 미디어/산출물은 제외
+vehicle_box_test/data/
+vehicle_box_test/out/

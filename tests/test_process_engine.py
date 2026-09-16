@@ -272,21 +272,87 @@ def test_machine_operating_never_aborts_but_warns():
     assert out.public_state is ParkingState.IDLE
 
 
-def test_plate_timeout_yields_unrecognized():
-    engine = _engine()
-    now = _drive_to_plate_reading(engine, T0)
-    # keep entry evidence alive with right-side vehicle, but no plate reads
+def _drive_plate_phase(engine, now, seconds, *, front_car=True, moving=True):
+    """Hold the entry alive for ``seconds``; optionally park a car in the front camera."""
     current = now
-    while (current - now).total_seconds() <= 31:
+    out = None
+    step = 0
+    while (current - now).total_seconds() <= seconds:
         current += timedelta(seconds=1)
+        step += 1
         engine.observe_detections(
             "cam-right", CameraRole.opposite_side, (_event("car", 0.8, at=current),), current
         )
+        if front_car:
+            offset = 0.2 if moving and step % 2 else 0.0
+            engine.observe_detections(
+                "cam-front",
+                CameraRole.front,
+                (_event("car", 0.9, at=current, x=0.3 + offset),),
+                current,
+            )
         out = engine.tick(current)
         if out.public_state is not ParkingState.PLATE_RECOGNITION:
             break
+    return current, out
+
+
+def test_plate_timeout_runs_from_the_front_cameras_first_sight():
+    """The read window must start when the car reaches the front camera, not at the
+    opposite_side trigger: field data 2026-09-16 had entries whose car arrived 20-80 s late."""
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    # 25 s with no front vehicle at all: the read timeout has not even started.
+    current, out = _drive_plate_phase(engine, now, 25, front_car=False)
+    assert out.public_state is ParkingState.PLATE_RECOGNITION
+    # The car finally arrives; the 30 s read window starts here.
+    current, out = _drive_plate_phase(engine, current, 25)
+    assert out.public_state is ParkingState.PLATE_RECOGNITION
+    current, out = _drive_plate_phase(engine, current, 10)
     assert out.public_state is ParkingState.VEHICLE_ENTERING
     assert out.plate_number == UNRECOGNIZED_PLATE
+
+
+def test_plate_phase_gives_up_when_the_car_never_reaches_the_front_camera():
+    """A false trigger on traffic outside the open door must still resolve, via the arrival cap."""
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    _current, out = _drive_plate_phase(engine, now, 62, front_car=False)
+    assert out.public_state is ParkingState.VEHICLE_ENTERING
+    assert out.plate_number == UNRECOGNIZED_PLATE
+
+
+def test_stationary_front_car_does_not_end_the_vote_before_the_reader_had_a_chance():
+    """Field data 2026-09-16: 5 of 9 entries ended after 1-2 reads because the car was already
+    stationary in front. The reader now gets min_read_seconds before that short-circuit."""
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    current, out = _drive_plate_phase(engine, now, 6, moving=False)
+    assert out.public_state is ParkingState.PLATE_RECOGNITION  # would have decided immediately before
+    # A read landing lets the stationary car end the vote right away.
+    engine.observe_lpr_attempt(*_lpr_attempt("12가3456", center_y=800))
+    _current, out = _drive_plate_phase(engine, current, 2, moving=False)
+    assert out.public_state is ParkingState.VEHICLE_ENTERING
+    assert out.plate_number == "12가3456"
+
+
+def test_decided_plate_carries_the_winning_frame_and_box_for_the_crop():
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    attempt, height = _lpr_attempt("12가3456", center_y=800, confidence=0.7)
+    attempt["source_image"] = "/tmp/frames/frame-a.png"
+    engine.observe_lpr_attempt(attempt, height)
+    best, height = _lpr_attempt("12가3456", center_y=810, confidence=0.95)
+    best["source_image"] = "/tmp/frames/frame-b.png"
+    engine.observe_lpr_attempt(best, height)
+    third, height = _lpr_attempt("12가3456", center_y=805, confidence=0.6)
+    third["source_image"] = "/tmp/frames/frame-c.png"
+    engine.observe_lpr_attempt(third, height)  # min_reads_for_vote = 3
+    out = engine.tick(now + timedelta(seconds=1))
+    plate_event = next(event for event in out.raw_events if event.kind == "plate")
+    assert plate_event.plate_number == "12가3456"
+    assert plate_event.source_image_path == "/tmp/frames/frame-b.png"  # highest-confidence read
+    assert plate_event.bbox == {"x1": 100.0, "y1": 790.0, "x2": 300.0, "y2": 830.0}
 
 
 def test_plate_majority_vote():
@@ -352,10 +418,18 @@ def test_unrecognized_plate_is_recorded_instead_of_silence():
     now = _drive_to_plate_reading(engine, T0)
     current = now
     plate_events = []
-    while (current - now).total_seconds() <= 31:
+    step = 0
+    while (current - now).total_seconds() <= 40:
         current += timedelta(seconds=1)
+        step += 1
         engine.observe_detections(
             "cam-right", CameraRole.opposite_side, (_event("car", 0.8, at=current),), current
+        )
+        engine.observe_detections(
+            "cam-front",
+            CameraRole.front,
+            (_event("car", 0.9, at=current, x=0.3 + (0.2 if step % 2 else 0.0)),),
+            current,
         )
         out = engine.tick(current)
         plate_events.extend(event for event in out.raw_events if event.kind == "plate")

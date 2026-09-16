@@ -70,6 +70,16 @@ class PlcRequest:
 
 
 @dataclass(frozen=True)
+class _PlateRead:
+    """One accepted 1 Hz read, kept with its frame so the winner can be cropped for evidence."""
+
+    plate: str
+    confidence: float
+    source_image_path: str = ""
+    bbox: Mapping[str, float] | None = None
+
+
+@dataclass(frozen=True)
 class RawEventRequest:
     kind: str  # "vehicle_entry" | "vehicle_session_end" | "plate" | "plate_attempt"
     camera_id: str = ""
@@ -85,6 +95,8 @@ class RawEventRequest:
     # an explicit result instead of silence.
     recognized: bool = True
     reads: int = 0
+    # Winning read's frame + plate box, so the evidence layer can store the plate crop.
+    source_image_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,7 +165,10 @@ class ParkingProcessEngine:
         self._front_vehicle_at: datetime | None = None
         self._front_stable_since: datetime | None = None
 
-        self._plate_reads: list[tuple[str, float]] = []
+        self._plate_reads: list[_PlateRead] = []
+        # When the front camera first reported a vehicle during plate reading. The read timeout
+        # runs from here, not from the opposite_side trigger.
+        self._plate_front_seen_at: datetime | None = None
         self._plate_started_at: datetime | None = None
         self._plate_number = ""
         self._plate_confidence: float | None = None
@@ -234,6 +249,8 @@ class ParkingProcessEngine:
                 self._front_vehicle_at = received_at
                 if self._phase in ("entry_trigger_confirmed", "entry_plate_reading"):
                     self._entry_last_evidence_at = received_at
+                if self._phase == "entry_plate_reading" and self._plate_front_seen_at is None:
+                    self._plate_front_seen_at = received_at
 
     def observe_lpr_attempt(self, attempt: Mapping[str, object], frame_height: int) -> None:
         """Collect a plate read when its bbox center sits below the configured line."""
@@ -267,7 +284,8 @@ class ParkingProcessEngine:
             # Above the 차량진입선: the plate is outside the machine, so it never feeds the vote.
             self._queue_plate_attempt(plate, confidence, accepted=False, reason="above_entry_line", bbox=normalized)
             return
-        self._plate_reads.append((plate, confidence))
+        source = str(attempt.get("source_image") or "")
+        self._plate_reads.append(_PlateRead(plate, confidence, source, normalized))
         self._queue_plate_attempt(plate, confidence, accepted=True, reason="", bbox=normalized)
         self._entry_last_evidence_at = self._now or self._entry_last_evidence_at
 
@@ -355,6 +373,7 @@ class ParkingProcessEngine:
         self._plate_reads = []
         self._plate_number = ""
         self._plate_confidence = None
+        self._plate_front_seen_at = None
         self._queue_raw(RawEventRequest(kind="vehicle_entry", camera_id=self._trigger_camera_id))
         _LOGGER.info(
             "process-engine entry confirmed camera=%s streak=%d threshold=%.2f",
@@ -386,22 +405,38 @@ class ParkingProcessEngine:
             decided = True
         elif len(self._plate_reads) >= zone.min_reads_for_vote and self._has_majority():
             decided = True
-        elif (
-            self._plate_started_at is not None
-            and (now - self._plate_started_at).total_seconds() > zone.read_timeout_seconds
-        ):
+        elif self._plate_read_deadline_passed(now, zone):
             decided = True
-        elif self._front_vehicle_stable(now):
-            decided = True  # vehicle already arrived and stopped; stop waiting for reads
+        elif self._front_vehicle_stable(now) and self._plate_read_minimum_met(now, zone):
+            decided = True  # vehicle arrived and stopped, and the reader had its chance
         if decided:
             self._decide_plate()
             self._pending_lpr = "stop"
             self._transition("entering", ParkingState.VEHICLE_ENTERING, now)
 
+    def _plate_read_deadline_passed(self, now: datetime, zone) -> bool:  # noqa: ANN001 - settings dataclass
+        """Timeout from the front camera's first sight of the car, with a hard cap from the
+        trigger for a car that never arrives (false trigger on traffic outside the open door)."""
+        if self._plate_front_seen_at is not None:
+            return (now - self._plate_front_seen_at).total_seconds() > zone.read_timeout_seconds
+        if self._plate_started_at is None:
+            return False
+        return (now - self._plate_started_at).total_seconds() > zone.arrival_timeout_seconds
+
+    def _plate_read_minimum_met(self, now: datetime, zone) -> bool:  # noqa: ANN001 - settings dataclass
+        """A stationary car may only end the vote once a read landed or the reader has had
+        ``min_read_seconds`` in front of the car."""
+        if self._plate_reads:
+            return True
+        reference = self._plate_front_seen_at or self._plate_started_at
+        if reference is None:
+            return False
+        return (now - reference).total_seconds() >= zone.min_read_seconds
+
     def _has_majority(self) -> bool:
         counts: dict[str, int] = {}
-        for plate, _confidence in self._plate_reads:
-            counts[plate] = counts.get(plate, 0) + 1
+        for read in self._plate_reads:
+            counts[read.plate] = counts.get(read.plate, 0) + 1
         if not counts:
             return False
         top = max(counts.values())
@@ -410,9 +445,9 @@ class ParkingProcessEngine:
     def _decide_plate(self, *, reason: str = "vote") -> None:
         """Close the plate vote. Both outcomes are recorded: a recognized plate and 미인식 alike,
         so every entry leaves an explicit raw result instead of silence."""
-        counts: dict[str, list[float]] = {}
-        for plate, confidence in self._plate_reads:
-            counts.setdefault(plate, []).append(confidence)
+        counts: dict[str, list[_PlateRead]] = {}
+        for read in self._plate_reads:
+            counts.setdefault(read.plate, []).append(read)
         reads = len(self._plate_reads)
         if not counts:
             self._plate_number = UNRECOGNIZED_PLATE
@@ -428,13 +463,14 @@ class ParkingProcessEngine:
                 )
             )
         else:
-            def rank(item: tuple[str, list[float]]) -> tuple[int, float]:
-                _plate, confidences = item
-                return (len(confidences), sum(confidences) / len(confidences))
+            def rank(item: tuple[str, list[_PlateRead]]) -> tuple[int, float]:
+                _plate, group = item
+                return (len(group), sum(r.confidence for r in group) / len(group))
 
-            plate, confidences = max(counts.items(), key=rank)
+            plate, group = max(counts.items(), key=rank)
+            best = max(group, key=lambda r: r.confidence)
             self._plate_number = plate
-            self._plate_confidence = sum(confidences) / len(confidences)
+            self._plate_confidence = sum(r.confidence for r in group) / len(group)
             self._queue_raw(
                 RawEventRequest(
                     kind="plate",
@@ -443,6 +479,9 @@ class ParkingProcessEngine:
                     recognized=True,
                     reads=reads,
                     reason=reason,
+                    # Frame + box of the clearest winning read → plate image and crop evidence.
+                    source_image_path=best.source_image_path,
+                    bbox=best.bbox,
                 )
             )
         _LOGGER.info(
@@ -538,6 +577,7 @@ class ParkingProcessEngine:
         self._entry_last_evidence_at = None
         self._plate_reads = []
         self._plate_started_at = None
+        self._plate_front_seen_at = None
         self._front_stable_since = None
         self._front_vehicle_center = None
         self._front_vehicle_at = None

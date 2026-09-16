@@ -352,3 +352,45 @@ def test_radar_snapshots_use_the_live_clock_not_the_backdated_window_time(tmp_pa
     assert len(snapshots) == 1 and snapshots[0]["captured_at"] == now
     # The clip still starts from the backdated moment so the pre-roll covers the real onset.
     assert coordinator._sessions == {} or all(s.started_at == backdated for s in coordinator._sessions.values())
+
+
+def test_engine_plate_result_with_a_source_frame_stores_image_and_crop(tmp_path: Path, monkeypatch):
+    """The engine's automatic entries now carry the winning read's frame and box, so they get the
+    same plate image + crop evidence the manual LPR task always produced."""
+    monkeypatch.setattr(EvidenceCoordinator, "_start_recorder", lambda self, camera: None)
+    artifacts: list[dict] = []
+    now = datetime(2026, 9, 16, 4, 30, 0, tzinfo=timezone.utc)
+    from PyQt6.QtGui import QColor, QImage
+
+    source = tmp_path / "frame-1.png"
+    image = QImage(120, 60, QImage.Format.Format_RGB32)
+    image.fill(QColor("white"))
+    assert image.save(str(source), "PNG")
+    coordinator = EvidenceCoordinator(
+        RawStorageConfig(local_dir=tmp_path / "raw", timezone_name="UTC", media_enabled=True),
+        [_camera()],
+        artifact_callback=lambda **item: artifacts.append(item),
+        failure_callback=lambda **item: None,
+        clock=lambda: now,
+    )
+    coordinator.update_camera_status("front", "정상 수신")
+    coordinator.handle_raw_event(
+        {
+            "event_id": "plate-1",
+            "event_type": "plate_recognized",
+            "recorded_at": now.isoformat(),
+            "payload": {
+                "camera_id": "front",
+                "plate_number": "12가3456",
+                "recognized": True,
+                "source_image_path": str(source),
+                "plate_bbox": {"x1": 10, "y1": 10, "x2": 90, "y2": 45},
+            },
+        }
+    )
+    coordinator.close()
+    kinds = {item["kind"] for item in artifacts}
+    assert kinds == {"plate_image", "plate_crop"}
+    crop = next(item for item in artifacts if item["kind"] == "plate_crop")
+    assert "-plate-crop-front.jpg" in crop["relative_path"]
+    assert crop["metadata"]["bbox"] == {"x1": 10, "y1": 10, "x2": 90, "y2": 45}

@@ -75,7 +75,15 @@ class PlateZoneSettings:
     min_reads_for_vote: int = 3
     read_interval_seconds: float = 1.0
     max_reads: int = 10
+    # Counted from the moment the FRONT camera first sees the vehicle, not from the
+    # opposite_side trigger: the car needs time to drive into the front camera's view.
     read_timeout_seconds: float = 30.0
+    # A stationary car in front no longer ends the vote immediately — the 1 Hz reader gets at
+    # least this long first. Field data 2026-09-16: 5 of 9 entries gave up after 1-2 reads.
+    min_read_seconds: float = 10.0
+    # Hard cap from the trigger when the front camera never sees a vehicle (false trigger from
+    # outside the open door).
+    arrival_timeout_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.line_y_norm <= 1.0:
@@ -88,6 +96,10 @@ class PlateZoneSettings:
             raise ValueError("plate_zone.max_reads must be >= min_reads_for_vote")
         if self.read_timeout_seconds <= 0:
             raise ValueError("plate_zone.read_timeout_seconds must be > 0")
+        if self.min_read_seconds < 0:
+            raise ValueError("plate_zone.min_read_seconds must be >= 0")
+        if self.arrival_timeout_seconds <= 0:
+            raise ValueError("plate_zone.arrival_timeout_seconds must be > 0")
 
 
 @dataclass(frozen=True)

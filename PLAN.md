@@ -27,9 +27,26 @@ Follow-ups queued from that work:
   multi-camera cross-check, Kalman smoothing, ±5 cm target incl. moving, origin = pallet
   centre. Drawing defaults live in `VehicleEnvelopeConfig` (`VEHICLE_BOX_*`). Field photos and
   videos for offline work go to `data/field-media/{front,rear_side,opposite_side}/`
-  (per-camera folders, no filename prefix, gitignored). Stage 1: dev-bench (1:18 model)
-  intrinsics + pallet extrinsics + silhouette method comparison + offline accuracy report,
-  then the same offline report on real field media once collected.
+  (per-camera folders, no filename prefix, gitignored).
+
+  **Stage 1 first pass ran 2026-09-16 in `vehicle_box_test/`** — a lab folder deliberately kept
+  out of `towersightai/` (owner's rule: verify the hypothesis there, only then update the app).
+  See `vehicle_box_test/README.md` (how to run) and `vehicle_box_test/CONTEXT.md` (intent,
+  findings). What it does: pulls the vehicle-bearing media out of the NAS archive by reading the
+  event shards, extracts clip frames, builds per-camera median backgrounds, fits the ground
+  homography from the turntable disc (Ø6100) + rails (2106) + pallet (5350×2200) with **no
+  checkerboard**, extracts the vehicle silhouette by Lab-space background subtraction (no Hailo),
+  lifts the tyre-contact line to world mm, and writes the verdict **into the image** — dimensions
+  when it works, a Korean failure reason when it does not — plus `out/report.html`.
+  Result: 18 of 173 measurable images judged; ground rectangle + front/rear ends + wheel lines
+  only, **no 3D cuboid yet**. Blockers found, each with a known cause: the diagonal camera's pose
+  recovery disagrees with the ground by 16 % (fisheye — this is the number that proves the
+  checkerboard intrinsics are actually required); the front camera only sees ground over the far
+  ~1.5 m so it cannot see a parked car's contact line; evidence clips (stream2) have a different
+  FOV from snapshots (stream1) so the calibration does not transfer; one diagonal camera alone
+  cannot measure width; `rear_side` is still uncalibrated.
+  Next: calibrate `rear_side` → measure C310 intrinsics on the existing 카메라 캘리브레이션 page →
+  undistort → pose → cuboid + height → report accuracy against the ±5 cm target.
   Stage 2: `vehicle_box` stage module returning PASS/WAIT/RETRY/NG/ERROR, operator page with
   overlay, size-limit check. Stage 3: replace the bbox-stability parked heuristic and drive
   directional alignment guidance. Calibration UI gates everything (unreviewed → final OK blocked).

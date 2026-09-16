@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **396 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **400 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -133,6 +133,7 @@ towersightai/
 
 tests/          # 344 hardware-free unit/UI/fake-data tests
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
+vehicle_box_test/  # 3D vehicle-box LAB (not a pytest suite, not imported by towersightai/)
 data/samples/   # sanitized sample images (test-car.png)
 docs/design/    # approved visual contracts (driver prototype, operator console proposals A/B)
 artifacts/      # runtime logs, detections, raw JSONL/media  (gitignored)
@@ -143,6 +144,17 @@ There is **no `ai_stages/` module yet**. `calibration/` holds only checkerboard 
 measurement tooling; there is still no site (extrinsics) calibration, no calibration validity check, and no
 calibration UI beyond the 카메라 캘리브레이션 measurement page. `data/field-media/{front,rear_side,opposite_side}/`
 (per-camera folders, gitignored) is where real site photos/videos for the 3D vehicle-box work are collected.
+
+`vehicle_box_test/` is the **3D vehicle-box lab**, not a test suite — `pytest` never runs it and
+`towersightai/` never imports it (the owner's rule is: prove the hypothesis in the lab, only then
+change the app). It pulls vehicle-bearing media out of the NAS archive read-only, fits a ground
+homography from the site's real dimensions (turntable Ø6100, rails 2106, pallet 5350×2200) **without
+a checkerboard**, extracts the vehicle silhouette with Lab-space background subtraction (no Hailo),
+and writes the verdict into each image — dimensions when it works, a **Korean failure reason** when
+it does not — plus a local `out/report.html`. Read `vehicle_box_test/README.md` (how to run) and
+`vehicle_box_test/CONTEXT.md` (intent, what the first pass proved and what it blocked on) before
+touching it. Its `data/` and `out/` are gitignored and contain **readable licence plates — never
+publish or share them**. It needs Pillow (Korean text on images); `towersightai/` does not.
 
 ---
 
@@ -184,7 +196,12 @@ requests, raw-event requests, LPR loop control, uncertainty reason). The cycle: 
 ceiling+front+rear_side (opposite_side is **excluded** in IDLE — it sees outside the open door) →
 opposite_side vehicle trigger (operator-tunable confidence ≥0.6 × ≥5 consecutive frames, release on lost
 evidence) → 1 Hz front-camera FastALPR gated by the 차량진입선 / vehicle-entry line near the top (only
-plate bboxes **below** it count as "entering" and feed the vote) and majority vote → front trapezoidal
+plate bboxes **below** it count as "entering" and feed the vote) and majority vote. The read window runs
+`read_timeout_seconds` from the **front camera's first sight of the car** (not the opposite_side trigger),
+capped by `arrival_timeout_seconds` when the car never arrives, and a stationary car only ends the vote
+once a read landed or `min_read_seconds` passed — field data 2026-09-16 recognized 1 of 9 entries because
+the vote ended after 1-2 reads or timed out before the car reached the front camera. The winning read
+carries its frame path and box so the entry gets `plate_image` + `plate_crop` evidence → front trapezoidal
 wheel-guide alignment (wide bottom, narrow top for the front-camera perspective; bbox-stability parked
 heuristic, 3D box is future work) →
 parked instruct → 10 s no-person countdown → simulated `vehicle_parked`+plate via `FakePLCAdapter` →
@@ -238,7 +255,9 @@ vehicle limits L5205 × W2000 (2100 with mirrors) × H1550/1850, wheel track ≤
 mapping (`VEHICLE_BOX_FRONT_LEFT_CAMERA=rear_side`, `VEHICLE_BOX_REAR_RIGHT_CAMERA=opposite_side`). Defaults
 come from the 구로 신안타워 approval drawing (`refers/…승인도…pdf` J001); `VehicleEnvelopeConfig` rejects limits
 that exceed the bay and non-side or duplicate camera roles. This is the site geometry for the planned 3D
-vehicle-box stage (INTENT.md §4 확정안) — no estimation code exists yet.
+vehicle-box stage (INTENT.md §4 확정안) — **no estimation code exists in `towersightai/` yet**; the
+offline experiments live in `vehicle_box_test/` and reuse `VehicleEnvelopeConfig` for the same numbers
+(plus the turntable Ø6100 from drawing J002, which has no `.env` key).
 
 `BIRDVIEW_MODE`: `ceiling` (default when absent) or `disabled`. `disabled` drops the ceiling camera from
 `Settings.active_cameras`, hides its UI surfaces, and **permanently blocks final OK** (`버드뷰 OFF`).
@@ -390,7 +409,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 396 passed, hardware-free
+pytest -q                                     # 400 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed
@@ -462,6 +481,9 @@ Open gaps (see `INTENT.md` §5 for immediate field items and `PLAN.md` for the q
 2. Stage AI decisions: alignment/parking-position, plate handling, person + obstacle fusion, in-vehicle
    occupancy (all behind interfaces).
 3. Calibration workflow — no module or UI yet; missing/invalid/unreviewed calibration must block final OK.
+   The `vehicle_box_test/` first pass put a number on why this matters: without checkerboard intrinsics the
+   diagonal camera's recovered pose disagrees with the ground plane by 16 %, which is what stops the 3D
+   cuboid from being drawn at all.
 4. Real PLC adapter behind the existing boundary, with event-ordering tests.
 5. Field hardening: watchdogs, deployment runbook, structured safety audit traces.
 
