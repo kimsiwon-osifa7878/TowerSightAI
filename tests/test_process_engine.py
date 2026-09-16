@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from towersightai.config.settings import CameraRole
 from towersightai.inference.events import BoundingBox, DetectionEvent
 from towersightai.process.engine import (
+    COPY_VEHICLE_EXITING,
     AUDIO_EXIT_WARNING,
     COPY_EXIT_PERSON,
     COPY_IDLE_PERSON,
@@ -22,14 +23,33 @@ CAMERAS = {
 }
 
 
-def _event(label: str, confidence: float, *, x: float = 0.4, y: float = 0.4, at: datetime = T0):
+def _event(label: str, confidence: float, *, x: float = 0.4, y: float = 0.4, at: datetime = T0,
+           w: float = 0.2, h: float = 0.2):
     return DetectionEvent(
         camera_id="unused",
         label=label,
         confidence=confidence,
-        bbox=BoundingBox(x=x, y=y, w=0.2, h=0.2),
+        bbox=BoundingBox(x=x, y=y, w=w, h=h),
         timestamp=at,
     )
+
+
+# Front-camera box shapes measured at 구로 신안타워 2026-09-16.
+def _front_entering(at: datetime, x: float = 0.23):
+    """Car driving in, facing the camera: width ~0.54, w/h ~1.6."""
+    return _event("car", 0.9, at=at, x=x, y=0.30, w=0.54, h=0.34)
+
+
+def _front_exiting(at: datetime):
+    """Car being retrieved, side-on: fills the frame, w/h ~3.9."""
+    return _event("car", 0.9, at=at, x=0.0, y=0.22, w=0.98, h=0.25)
+
+
+def _feed_front(engine, at: datetime, factory, count: int = 5, step_ms: int = 100):
+    for index in range(count):
+        stamp = at + timedelta(milliseconds=step_ms * index)
+        engine.observe_detections("cam-front", CameraRole.front, (factory(stamp),), stamp)
+    return at + timedelta(milliseconds=step_ms * count)
 
 
 def _engine(**settings_kwargs) -> ParkingProcessEngine:
@@ -60,14 +80,19 @@ def _lpr_attempt(plate: str, center_y: float, height: int = 1000, confidence: fl
 
 
 def _drive_to_plate_reading(engine: ParkingProcessEngine, now: datetime) -> datetime:
+    """Trigger → direction classification (front-facing car = entry) → plate reading."""
     _send_trigger(engine, now)
     out = engine.tick(now + timedelta(seconds=1))
+    assert out.public_state is ParkingState.IDLE  # classifying: nothing announced yet
+    assert out.phase == "entry_classify"
+    assert out.lpr_control == "start"
+    _feed_front(engine, now + timedelta(seconds=1), _front_entering)
+    out = engine.tick(now + timedelta(seconds=2))
     assert out.public_state is ParkingState.VEHICLE_DETECTED
     assert any(r.kind == "vehicle_entry" and r.camera_id == "cam-right" for r in out.raw_events)
-    now = now + timedelta(seconds=2)
+    now = now + timedelta(seconds=3)
     out = engine.tick(now)
     assert out.public_state is ParkingState.PLATE_RECOGNITION
-    assert out.lpr_control == "start"
     return now
 
 
@@ -454,3 +479,115 @@ def test_entry_aborted_mid_vote_still_records_the_plate_outcome():
     assert plate_events[0].plate_number == "12가3456" and plate_events[0].reads == 1
     assert plate_events[0].reason.startswith("aborted:")
     assert any(event.kind == "vehicle_session_end" for event in out.raw_events)
+
+
+# ---- 입고 / 출고 판별 ---------------------------------------------------------------------
+
+def test_side_on_car_is_a_retrieval_and_never_announced_as_an_entry():
+    """Field observation 2026-09-16: a retrieval sits side-on to the front camera and shows no
+    plate, yet the engine announced 진입 준비 and gave parking guidance."""
+    engine = _engine()
+    _send_trigger(engine, T0)
+    out = engine.tick(T0 + timedelta(seconds=1))
+    assert out.phase == "entry_classify" and out.public_state is ParkingState.IDLE
+    _feed_front(engine, T0 + timedelta(seconds=1), _front_exiting)
+    out = engine.tick(T0 + timedelta(seconds=2))
+    assert out.phase == "vehicle_exiting"
+    assert out.public_state is ParkingState.IDLE
+    assert out.copy_key == COPY_VEHICLE_EXITING
+    assert out.lpr_control == "stop"
+    assert [r.kind for r in out.raw_events] == ["vehicle_exit_start"]
+    assert not any(r.kind == "vehicle_entry" for r in out.raw_events)
+    assert not out.show_wheel_guides
+
+
+def test_person_during_a_retrieval_is_not_reported_as_a_problem():
+    engine = _engine()
+    _send_trigger(engine, T0)
+    engine.tick(T0 + timedelta(seconds=1))
+    _feed_front(engine, T0 + timedelta(seconds=1), _front_exiting)
+    out = engine.tick(T0 + timedelta(seconds=2))
+    assert out.phase == "vehicle_exiting"
+    for index in range(5):
+        stamp = T0 + timedelta(seconds=2, milliseconds=100 * index)
+        engine.observe_detections("cam-front", CameraRole.front, (_event("person", 0.95, at=stamp),), stamp)
+        engine.observe_detections("cam-front", CameraRole.front, (_front_exiting(stamp),), stamp)
+    out = engine.tick(T0 + timedelta(seconds=3))
+    assert out.phase == "vehicle_exiting"
+    assert out.person_possible is False
+    assert out.warning_text == ""
+    assert out.audio_cue is None
+
+
+def test_retrieval_ends_when_the_car_is_gone_and_returns_to_idle():
+    engine = _engine()
+    _send_trigger(engine, T0)
+    engine.tick(T0 + timedelta(seconds=1))
+    _feed_front(engine, T0 + timedelta(seconds=1), _front_exiting)
+    engine.tick(T0 + timedelta(seconds=2))
+    current = T0 + timedelta(seconds=2)
+    out = None
+    for _ in range(10):
+        current += timedelta(seconds=1)
+        out = engine.tick(current)
+        if out.phase != "vehicle_exiting":
+            break
+    assert out.phase == "idle_monitoring"
+    assert out.public_state is ParkingState.IDLE
+    end = [r for r in out.raw_events if r.kind == "vehicle_exit_end"]
+    assert end and end[0].reason == "vehicle_gone"
+
+
+def test_unclear_direction_without_a_plate_is_an_error_not_an_entry():
+    """Owner rule: a car whose plate cannot be read is never confirmed as an entry."""
+    engine = _engine()
+    _send_trigger(engine, T0)
+    engine.tick(T0 + timedelta(seconds=1))
+    current = T0 + timedelta(seconds=1)
+    out = None
+    for _ in range(25):
+        current += timedelta(seconds=1)
+        # A box that matches neither shape: too narrow for a retrieval, too flat for an entry.
+        engine.observe_detections(
+            "cam-front", CameraRole.front, (_event("car", 0.9, at=current, w=0.60, h=0.12),), current
+        )
+        engine.observe_detections(
+            "cam-right", CameraRole.opposite_side, (_event("car", 0.8, at=current),), current
+        )
+        out = engine.tick(current)
+        if out.phase != "entry_classify":
+            break
+    assert out.phase == "idle_monitoring"
+    assert out.public_state is ParkingState.IDLE
+    assert "판별" in out.uncertain_reason or any(
+        r.kind == "vehicle_session_end" and "direction_unknown" in r.reason for r in out.raw_events
+    )
+    assert not any(r.kind == "vehicle_entry" for r in out.raw_events)
+
+
+def test_a_plate_read_confirms_an_entry_even_when_the_box_shape_is_unclear():
+    engine = _engine()
+    _send_trigger(engine, T0)
+    out = engine.tick(T0 + timedelta(seconds=1))
+    assert out.phase == "entry_classify"
+    engine.observe_lpr_attempt(*_lpr_attempt("12가3456", center_y=800))
+    out = engine.tick(T0 + timedelta(seconds=2))
+    assert out.public_state is ParkingState.VEHICLE_DETECTED
+    entry = [r for r in out.raw_events if r.kind == "vehicle_entry"]
+    assert entry and entry[0].reason == "plate"
+
+
+def test_trigger_without_any_front_vehicle_returns_to_idle_quietly():
+    """Traffic outside the open door: nothing reaches the front camera, so nothing is announced."""
+    engine = _engine()
+    _send_trigger(engine, T0)
+    out = engine.tick(T0 + timedelta(seconds=1))
+    assert out.phase == "entry_classify"
+    current = T0 + timedelta(seconds=1)
+    for _ in range(10):
+        current += timedelta(seconds=1)
+        out = engine.tick(current)
+        if out.phase != "entry_classify":
+            break
+    assert out.phase == "idle_monitoring"
+    assert not any(r.kind in ("vehicle_entry", "vehicle_exit_start") for r in out.raw_events)

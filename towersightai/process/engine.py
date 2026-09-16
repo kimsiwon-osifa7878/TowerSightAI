@@ -59,6 +59,7 @@ COPY_IDLE_PERSON = "idle_person_warning"
 COPY_EXIT_PERSON = "exit_person_warning"
 COPY_ALIGNMENT_FRONT = "alignment_front_guide"
 COPY_PARKED = "parked_instruct"
+COPY_VEHICLE_EXITING = "vehicle_exiting"
 
 AUDIO_EXIT_WARNING = "exit_warning"
 
@@ -169,6 +170,12 @@ class ParkingProcessEngine:
         # When the front camera first reported a vehicle during plate reading. The read timeout
         # runs from here, not from the opposite_side trigger.
         self._plate_front_seen_at: datetime | None = None
+        # 입고/출고 판별 (front camera box shape + plate presence)
+        self._classify_started_at: datetime | None = None
+        self._entry_shape_streak = 0
+        self._exit_shape_streak = 0
+        self._exit_started_at: datetime | None = None
+        self._exit_last_evidence_at: datetime | None = None
         self._plate_started_at: datetime | None = None
         self._plate_number = ""
         self._plate_confidence: float | None = None
@@ -251,10 +258,17 @@ class ParkingProcessEngine:
                     self._entry_last_evidence_at = received_at
                 if self._phase == "entry_plate_reading" and self._plate_front_seen_at is None:
                     self._plate_front_seen_at = received_at
+                if self._phase in ("entry_classify", "vehicle_exiting"):
+                    self._exit_last_evidence_at = received_at
+                self._observe_vehicle_shape(best)
+            elif self._phase == "entry_classify":
+                # No vehicle in the front frame: neither shape is being confirmed.
+                self._entry_shape_streak = 0
+                self._exit_shape_streak = 0
 
     def observe_lpr_attempt(self, attempt: Mapping[str, object], frame_height: int) -> None:
         """Collect a plate read when its bbox center sits below the configured line."""
-        if self._phase != "entry_plate_reading" or frame_height <= 0:
+        if self._phase not in ("entry_classify", "entry_plate_reading") or frame_height <= 0:
             return
         best = attempt.get("best_plate")
         if not isinstance(best, Mapping):
@@ -288,6 +302,25 @@ class ParkingProcessEngine:
         self._plate_reads.append(_PlateRead(plate, confidence, source, normalized))
         self._queue_plate_attempt(plate, confidence, accepted=True, reason="", bbox=normalized)
         self._entry_last_evidence_at = self._now or self._entry_last_evidence_at
+
+    def _observe_vehicle_shape(self, event: DetectionEvent) -> None:
+        """Front-camera box shape → entering (narrow, facing the camera) or exiting (fills the
+        frame sideways). Width is the primary signal; a sliver of a car driving in can show a
+        large aspect ratio but never a near-full-frame width."""
+        direction = self._settings.vehicle_direction
+        width, height = event.bbox.w, event.bbox.h
+        if height <= 0:
+            return
+        aspect = width / height
+        if width >= direction.exit_min_width_norm and aspect >= direction.exit_min_aspect:
+            self._exit_shape_streak += 1
+            self._entry_shape_streak = 0
+        elif width >= direction.entry_min_width_norm and aspect <= direction.entry_max_aspect:
+            self._entry_shape_streak += 1
+            self._exit_shape_streak = 0
+        else:  # ambiguous (partly visible car, odd angle): neither streak advances
+            self._entry_shape_streak = 0
+            self._exit_shape_streak = 0
 
     def _queue_plate_attempt(
         self,
@@ -326,6 +359,10 @@ class ParkingProcessEngine:
 
         if self._phase in ("idle_monitoring", "idle_person_warning"):
             self._tick_idle(now, uncertain)
+        elif self._phase == "entry_classify":
+            self._tick_classify(now, uncertain)
+        elif self._phase == "vehicle_exiting":
+            self._tick_vehicle_exiting(now)
         elif self._phase in ("entry_trigger_confirmed", "entry_plate_reading"):
             self._tick_entry(now, uncertain)
         elif self._phase == "entering":
@@ -368,19 +405,92 @@ class ParkingProcessEngine:
                     self._plc_human_reported = False
 
     def _confirm_entry(self, now: datetime) -> None:
-        self._transition("entry_trigger_confirmed", ParkingState.VEHICLE_DETECTED, now)
+        """A vehicle is at the trigger camera. Which direction it is going is still unknown, so
+        stay on the IDLE surface and classify first — an exiting car must never be announced as
+        an entry (field observation 2026-09-16)."""
+        self._transition("entry_classify", ParkingState.IDLE, now)
         self._entry_last_evidence_at = now
+        self._exit_last_evidence_at = now
+        self._classify_started_at = now
+        self._entry_shape_streak = 0
+        self._exit_shape_streak = 0
         self._plate_reads = []
         self._plate_number = ""
         self._plate_confidence = None
         self._plate_front_seen_at = None
-        self._queue_raw(RawEventRequest(kind="vehicle_entry", camera_id=self._trigger_camera_id))
+        self._pending_lpr = "start"  # the plate is the primary direction signal
         _LOGGER.info(
-            "process-engine entry confirmed camera=%s streak=%d threshold=%.2f",
+            "process-engine vehicle at trigger camera=%s streak=%d; classifying direction",
             self._trigger_camera_id,
             self._trigger_streak,
-            self._settings.vehicle_trigger.min_confidence,
         )
+
+    def _tick_classify(self, now: datetime, uncertain: str) -> None:
+        if uncertain:
+            self._abort_to_idle(now, uncertain)
+            return
+        release = self._settings.vehicle_trigger.release_seconds
+        last = self._exit_last_evidence_at or self._entry_last_evidence_at
+        if last is not None and (now - last).total_seconds() > release:
+            # Nothing reached the front camera: the trigger saw traffic outside the open door.
+            self._pending_lpr = "stop"
+            self._reset_cycle()
+            self._transition("idle_monitoring", ParkingState.IDLE, now)
+            return
+        direction = self._settings.vehicle_direction
+        if self._plate_reads:
+            self._start_entry(now, "plate")
+            return
+        if self._exit_shape_streak >= direction.consecutive_frames:
+            self._start_exit(now)
+            return
+        if self._entry_shape_streak >= direction.consecutive_frames:
+            self._start_entry(now, "front_shape")
+            return
+        if (
+            self._classify_started_at is not None
+            and (now - self._classify_started_at).total_seconds() > direction.classify_timeout_seconds
+        ):
+            # Owner rule: no plate and no confident shape → never assume an entry, report an error.
+            self._pending_lpr = "stop"
+            self._abort_to_idle(now, "차량 방향을 판별하지 못했습니다 (번호판 미인식)", reason="direction_unknown")
+
+    def _start_entry(self, now: datetime, evidence: str) -> None:
+        self._transition("entry_trigger_confirmed", ParkingState.VEHICLE_DETECTED, now)
+        self._entry_last_evidence_at = now
+        self._queue_raw(
+            RawEventRequest(kind="vehicle_entry", camera_id=self._trigger_camera_id, reason=evidence)
+        )
+        _LOGGER.info("process-engine entry confirmed by %s", evidence)
+
+    def _start_exit(self, now: datetime) -> None:
+        """Retrieval: the driver display says 출고중 and nothing else. A person around an exiting
+        car is normal, so the person watch does not warn here (owner decision 2026-09-16)."""
+        self._transition("vehicle_exiting", ParkingState.IDLE, now)
+        self._exit_started_at = now
+        self._exit_last_evidence_at = now
+        self._pending_lpr = "stop"
+        self._queue_raw(
+            RawEventRequest(kind="vehicle_exit_start", camera_id=self._trigger_camera_id)
+        )
+        _LOGGER.info("process-engine vehicle exiting (front box is side-on, no plate)")
+
+    def _tick_vehicle_exiting(self, now: datetime) -> None:
+        release = self._settings.vehicle_trigger.release_seconds
+        last = self._exit_last_evidence_at
+        gone = last is not None and (now - last).total_seconds() > release
+        started = self._exit_started_at or now
+        timed_out = (now - started).total_seconds() > self._settings.timers.machine_operation_seconds
+        if gone or timed_out:
+            self._queue_raw(
+                RawEventRequest(
+                    kind="vehicle_exit_end",
+                    reason="vehicle_gone" if gone else "timeout",
+                )
+            )
+            _LOGGER.info("process-engine vehicle exit finished reason=%s", "vehicle_gone" if gone else "timeout")
+            self._reset_cycle()
+            self._transition("idle_monitoring", ParkingState.IDLE, now)
 
     def _tick_entry(self, now: datetime, uncertain: str) -> None:
         if uncertain:
@@ -561,7 +671,7 @@ class ParkingProcessEngine:
 
     def _abort_to_idle(self, now: datetime, detail: str, *, reason: str = "uncertainty") -> None:
         _LOGGER.warning("process-engine abort to IDLE phase=%s reason=%s (%s)", self._phase, reason, detail)
-        if self._phase == "entry_plate_reading" and not self._plate_number:
+        if self._phase in ("entry_classify", "entry_plate_reading") and self._plate_reads and not self._plate_number:
             # The entry is being abandoned mid-vote; record what the reads amounted to so the
             # session is not silent about the plate.
             self._decide_plate(reason=f"aborted:{reason}")
@@ -578,6 +688,11 @@ class ParkingProcessEngine:
         self._plate_reads = []
         self._plate_started_at = None
         self._plate_front_seen_at = None
+        self._classify_started_at = None
+        self._entry_shape_streak = 0
+        self._exit_shape_streak = 0
+        self._exit_started_at = None
+        self._exit_last_evidence_at = None
         self._front_stable_since = None
         self._front_vehicle_center = None
         self._front_vehicle_at = None
@@ -628,6 +743,10 @@ class ParkingProcessEngine:
     def _person_possible(self) -> bool:
         # Cameras only. The radar is verification-only data and must never influence a
         # person decision, a driver warning, or the parking machine's operation.
+        if self._phase == "vehicle_exiting":
+            # A person next to a car being retrieved is normal; the machine is not about to move
+            # for us and final OK is blocked in IDLE anyway (owner decision 2026-09-16).
+            return False
         return self._person.active(self._person_threshold())
 
     def _trigger_confirmed(self) -> bool:
@@ -679,6 +798,8 @@ class ParkingProcessEngine:
             copy_key = COPY_EXIT_PERSON
             warning = "주차가 시작될 예정이므로 바깥으로 나가 주십시오."
             audio = AUDIO_EXIT_WARNING
+        elif self._phase == "vehicle_exiting":
+            copy_key = COPY_VEHICLE_EXITING
         elif self._phase == "alignment":
             copy_key = COPY_ALIGNMENT_FRONT
         elif self._phase == "parked_instruct":
@@ -732,6 +853,7 @@ __all__ = [
     "EngineOutput",
     "ParkingProcessEngine",
     "PlcRequest",
+    "COPY_VEHICLE_EXITING",
     "RawEventRequest",
     "UNRECOGNIZED_PLATE",
 ]

@@ -2218,6 +2218,11 @@ class OperatorWindow(QMainWindow):
         add_double(2, 2, "plate_zone.read_interval_seconds", "번호판 인식 주기(초)", 0.2, 10.0, 0.2)
         add_double(2, 3, "plate_zone.read_timeout_seconds", "번호판 판독 시간(초)", 5.0, 120.0, 1.0)
         add_double(6, 2, "plate_zone.min_read_seconds", "정차 후 최소 판독(초)", 0.0, 60.0, 1.0)
+        add_double(7, 0, "vehicle_direction.exit_min_width_norm", "출고 판정 최소 폭", 0.1, 1.0, 0.01)
+        add_double(7, 1, "vehicle_direction.exit_min_aspect", "출고 판정 가로세로비", 1.0, 10.0, 0.1)
+        add_double(7, 2, "vehicle_direction.entry_max_aspect", "입고 판정 가로세로비 상한", 0.5, 5.0, 0.1)
+        add_int(7, 3, "vehicle_direction.consecutive_frames", "방향 연속 프레임 수", 1, 30)
+        add_double(7, 4, "vehicle_direction.classify_timeout_seconds", "방향 판별 한도(초)", 5.0, 120.0, 1.0)
         add_double(6, 3, "plate_zone.arrival_timeout_seconds", "전면 도착 대기 한도(초)", 5.0, 300.0, 5.0)
         add_double(3, 0, "wheel_guides.left_x_norm", "유도선 아래 왼쪽", 0.0, 1.0, 0.01)
         add_double(3, 1, "wheel_guides.right_x_norm", "유도선 아래 오른쪽", 0.0, 1.0, 0.01)
@@ -2263,6 +2268,11 @@ class OperatorWindow(QMainWindow):
             "plate_zone.min_reads_for_vote": settings.plate_zone.min_reads_for_vote,
             "plate_zone.read_timeout_seconds": settings.plate_zone.read_timeout_seconds,
             "plate_zone.min_read_seconds": settings.plate_zone.min_read_seconds,
+            "vehicle_direction.exit_min_width_norm": settings.vehicle_direction.exit_min_width_norm,
+            "vehicle_direction.exit_min_aspect": settings.vehicle_direction.exit_min_aspect,
+            "vehicle_direction.entry_max_aspect": settings.vehicle_direction.entry_max_aspect,
+            "vehicle_direction.consecutive_frames": settings.vehicle_direction.consecutive_frames,
+            "vehicle_direction.classify_timeout_seconds": settings.vehicle_direction.classify_timeout_seconds,
             "plate_zone.arrival_timeout_seconds": settings.plate_zone.arrival_timeout_seconds,
             "plate_zone.read_interval_seconds": settings.plate_zone.read_interval_seconds,
             "wheel_guides.left_x_norm": settings.wheel_guides.left_x_norm,
@@ -2693,6 +2703,15 @@ class OperatorWindow(QMainWindow):
                         # image and its crop for the engine's automatic entries too.
                         source_image_path=event.source_image_path or None,
                         plate_bbox=dict(event.bbox) if event.bbox else None,
+                    )
+                elif event.kind == "vehicle_exit_start":
+                    self._record_raw(
+                        self._raw_data_manager.record_vehicle_exit_start,
+                        camera_id=event.camera_id or "opposite_side",
+                    )
+                elif event.kind == "vehicle_exit_end":
+                    self._record_raw(
+                        self._raw_data_manager.record_vehicle_exit_end, reason=event.reason
                     )
                 elif event.kind == "plate_attempt":
                     self._record_raw(

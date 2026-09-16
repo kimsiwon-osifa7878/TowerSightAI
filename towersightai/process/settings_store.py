@@ -103,6 +103,38 @@ class PlateZoneSettings:
 
 
 @dataclass(frozen=True)
+class VehicleDirectionSettings:
+    """Front-camera box shape that separates 입고 (entering, front-facing) from 출고 (exiting).
+
+    A car driving in faces the front camera; a car being retrieved sits sideways on the turntable
+    and its plate is not visible at all. Measured at 구로 신안타워 on 2026-09-16: an exiting car
+    fills the frame (width 0.92-1.00, w/h 3.3-4.4) while an entering car is narrow (width ~0.54,
+    w/h ~1.57). Width is the primary signal — a partly visible car driving in can show a large
+    aspect ratio on a sliver of a box, but never a near-full-frame width.
+    """
+
+    exit_min_width_norm: float = 0.85
+    exit_min_aspect: float = 2.5
+    entry_max_aspect: float = 2.0
+    entry_min_width_norm: float = 0.30
+    consecutive_frames: int = 5
+    classify_timeout_seconds: float = 20.0
+
+    def __post_init__(self) -> None:
+        for name in ("exit_min_width_norm", "entry_max_aspect", "entry_min_width_norm", "exit_min_aspect"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"vehicle_direction.{name} must be > 0")
+        if self.exit_min_width_norm > 1.0 or self.entry_min_width_norm > 1.0:
+            raise ValueError("vehicle_direction widths are normalized and must be <= 1")
+        if self.entry_max_aspect >= self.exit_min_aspect:
+            raise ValueError("vehicle_direction.entry_max_aspect must be below exit_min_aspect")
+        if self.consecutive_frames < 1:
+            raise ValueError("vehicle_direction.consecutive_frames must be >= 1")
+        if self.classify_timeout_seconds <= 0:
+            raise ValueError("vehicle_direction.classify_timeout_seconds must be > 0")
+
+
+@dataclass(frozen=True)
 class WheelGuideSettings:
     """Trapezoidal wheel-guide overlay on the front camera (normalized).
 
@@ -174,6 +206,7 @@ class ProcessTimerSettings:
 class OperatorRuntimeSettings:
     vehicle_trigger: VehicleTriggerSettings = field(default_factory=VehicleTriggerSettings)
     person_debounce: PersonDebounceSettings = field(default_factory=PersonDebounceSettings)
+    vehicle_direction: VehicleDirectionSettings = field(default_factory=VehicleDirectionSettings)
     plate_zone: PlateZoneSettings = field(default_factory=PlateZoneSettings)
     wheel_guides: WheelGuideSettings = field(default_factory=WheelGuideSettings)
     alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
@@ -213,6 +246,7 @@ def settings_from_payload(payload: Mapping[str, Any]) -> OperatorRuntimeSettings
     return OperatorRuntimeSettings(
         vehicle_trigger=_build_section(VehicleTriggerSettings, _section(payload, "vehicle_trigger")),
         person_debounce=_build_section(PersonDebounceSettings, _section(payload, "person_debounce")),
+        vehicle_direction=_build_section(VehicleDirectionSettings, _section(payload, "vehicle_direction")),
         plate_zone=_build_section(PlateZoneSettings, _section(payload, "plate_zone")),
         wheel_guides=_build_section(WheelGuideSettings, _section(payload, "wheel_guides")),
         alignment=_build_section(AlignmentSettings, _section(payload, "alignment")),

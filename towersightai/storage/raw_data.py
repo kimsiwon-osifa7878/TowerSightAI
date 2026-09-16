@@ -39,6 +39,8 @@ _DURABLE_EVENTS = frozenset(
         "media_artifact_created",
         "media_capture_failed",
         "ld2410_server_status",
+        "vehicle_exit_started",
+        "vehicle_exit_ended",
         "radar_window_started",
         "radar_window_closed",
     }
@@ -632,6 +634,18 @@ class RawDataManager:
             sink_payload={"source_image_path": source_image_path} if source_image_path else None,
             at=at,
         )
+
+    def record_vehicle_exit_start(self, *, camera_id: str, at: datetime | None = None) -> None:
+        """A retrieval (출고), not an entry: the car is side-on to the front camera and shows no
+        plate. Recorded separately so entry statistics and plate hit rate are not polluted."""
+        self.record(
+            "vehicle_exit_started",
+            payload={"camera_id": camera_id, "simulated": False, "safety_effect": "raw_only"},
+            at=at,
+        )
+
+    def record_vehicle_exit_end(self, *, reason: str, at: datetime | None = None) -> None:
+        self.record("vehicle_exit_ended", payload={"reason": reason, "safety_effect": "raw_only"}, at=at)
 
     def record_plate_attempt(
         self,

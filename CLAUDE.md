@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **402 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **408 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -195,7 +195,14 @@ Each tick returns an `EngineOutput` (public state, driver copy key, plate, audio
 requests, raw-event requests, LPR loop control, uncertainty reason). The cycle: IDLE person watch on
 ceiling+front+rear_side (opposite_side is **excluded** in IDLE — it sees outside the open door) →
 opposite_side vehicle trigger (operator-tunable confidence ≥0.6 × ≥5 consecutive frames, release on lost
-evidence) → 1 Hz front-camera FastALPR gated by the 차량진입선 / vehicle-entry line near the top (only
+evidence) → **direction classification** (`entry_classify`, public state stays IDLE so nothing is announced
+yet): a plate read, or a front-camera box that is narrow and upright, means 입고; a box that fills the frame
+side-on means 출고 (`vehicle_exiting`, public IDLE, driver copy `출고중` only, person watch suppressed —
+a person beside a car being retrieved is normal). No plate and no confident shape is an **error**, never an
+assumed entry. Measured shapes (구로 신안타워 2026-09-16): exiting w 0.92-1.00 / w/h 3.3-4.4, entering
+w ~0.54 / w/h ~1.57; width is primary because a partly visible entering car can show a large aspect ratio.
+Retrievals are recorded as `vehicle_exit_started` / `vehicle_exit_ended`, never `vehicle_entered`, so entry
+statistics and plate hit rate stay clean → 1 Hz front-camera FastALPR gated by the 차량진입선 / vehicle-entry line near the top (only
 plate bboxes **below** it count as "entering" and feed the vote) and majority vote. The read window runs
 `read_timeout_seconds` from the **front camera's first sight of the car** (not the opposite_side trigger),
 capped by `arrival_timeout_seconds` when the car never arrives, and a stationary car only ends the vote
@@ -206,7 +213,7 @@ wheel-guide alignment (wide bottom, narrow top for the front-camera perspective;
 heuristic, 3D box is future work) →
 parked instruct → 10 s no-person countdown → simulated `vehicle_parked`+plate via `FakePLCAdapter` →
 60 s machine-operation window (person watch now includes opposite_side; warns, never aborts) → IDLE.
-Outbound (출고) was explicitly removed by the owner. Rules the tests pin: every PLC payload carries
+Outbound (출고) has no PLC contract or AI stage; since 2026-09-16 the engine only *recognizes* a retrieval so it is not mistaken for an entry. Rules the tests pin: every PLC payload carries
 `simulated: True`; uncertainty (monitoring dead, front/rear_side camera NG) aborts any entry back to IDLE
 with a `vehicle_session_end`; the **LD2410 radar is not an engine input at all** (owner decision
 2026-09-16: verification-only sensor, recorded to raw data for the offline camera-vs-radar study, never
@@ -413,7 +420,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 402 passed, hardware-free
+pytest -q                                     # 408 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed

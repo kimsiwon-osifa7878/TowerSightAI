@@ -257,6 +257,13 @@ DRIVER_COPY_OVERRIDES: dict[str, tuple[str, str, str, str]] = {
         "기어를 P에 놓고 시동을 끈 후 밖으로 나가 주십시오.",
         "■",
     ),
+    # Retrieval: the car is being brought out, not driven in. Nothing is asked of a driver here.
+    "vehicle_exiting": (
+        "출고중",
+        "출고중",
+        "",
+        "",
+    ),
 }
 
 FRONT_GUIDE_ALIGNMENT_COPY_KEY = "alignment_front_guide"
