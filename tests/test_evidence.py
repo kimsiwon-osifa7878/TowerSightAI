@@ -334,3 +334,21 @@ def test_radar_evidence_disabled_or_simulated_does_nothing(tmp_path: Path, monke
     coordinator.handle_raw_event(_radar_event("radar_window_started", "rw-1", now, simulated=True))
     coordinator._executor.shutdown(wait=True)
     assert coordinator._radar_session_id is None and not artifacts and not failures
+
+
+def test_radar_snapshots_use_the_live_clock_not_the_backdated_window_time(tmp_path: Path, monkeypatch):
+    """Radar window times are backdated (start = first present sample). Stamping the snapshot with
+    that time made the frame-freshness check reject every camera — field data 2026-09-16 had 70
+    latest_frame_missing_or_stale failures and zero radar snapshots."""
+    now = datetime(2026, 9, 16, 1, 30, 46, tzinfo=timezone.utc)
+    coordinator, artifacts, failures, clock = _radar_coordinator(tmp_path, monkeypatch, now)
+    coordinator.update_frame("front", FakeImage(), received_at=now)
+    backdated = now - timedelta(seconds=3)  # the window opened 3 s ago
+    coordinator.handle_raw_event(_radar_event("radar_window_started", "rw-1", backdated, radar_window_id="w1"))
+    coordinator.close()
+
+    assert not [item for item in failures if item["reason"] == "latest_frame_missing_or_stale"]
+    snapshots = [item for item in artifacts if item["kind"] == "snapshot" and item["metadata"]["event_kind"] == "radar"]
+    assert len(snapshots) == 1 and snapshots[0]["captured_at"] == now
+    # The clip still starts from the backdated moment so the pre-roll covers the real onset.
+    assert coordinator._sessions == {} or all(s.started_at == backdated for s in coordinator._sessions.values())

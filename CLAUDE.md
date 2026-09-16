@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **395 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **396 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -362,12 +362,15 @@ default lane/stop guides outside calibration mode; error/NG states can never use
   absent; `radar_window_started` after `RAW_DATA_RADAR_WINDOW_MIN_SECONDS` (backdated to the first present
   sample), `radar_window_closed` after `RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS` measured from the last present
   sample (`cleared` / `radar_unavailable` / `service_stopped` / `application_stopped`). The window events are
-  durable, the sample is not. While a radar window is open and no camera person window is active, a 1 Hz
-  `radar_sample` records the per-camera person state at that instant (the mirror of `person_sample`, which
+  durable, the sample is not. While a radar window is open, a 1 Hz
+  `radar_sample` records the per-camera person state at that instant — including seconds where a camera
+  person window is also open, because skipping those blanks out exactly the agreeing seconds (field data
+  2026-09-16: 16 of 18 radar windows had a camera person window and still reported 0 % agreement) (the mirror of `person_sample`, which
   carries the radar snapshot) for up to `RAW_DATA_RADAR_SAMPLE_SECONDS` — the two together make every
   presence claim comparable from both sides, which is the whole point of the camera-vs-radar study.
   `PersonWindowSampler.camera_state(at)` is the shared per-camera view and its latest detections now
-  survive window close. Evidence: `radar` snapshots + a clip capped at `RAW_MEDIA_RADAR_CLIP_MAX_SECONDS`,
+  survive window close. Evidence: `radar` snapshots (stamped with the live clock, **not** the backdated window time — the
+  frame-freshness check rejected every camera otherwise) + a clip capped at `RAW_MEDIA_RADAR_CLIP_MAX_SECONDS`,
   `radar_end` snapshot on close, skipped with `person_window_active` while a camera person window owns the
   media and `radar_evidence_throttled` inside `RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS`. Analysis only.
 
@@ -387,7 +390,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 395 passed, hardware-free
+pytest -q                                     # 396 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed

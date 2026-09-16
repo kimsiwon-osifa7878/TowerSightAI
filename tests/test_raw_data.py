@@ -640,17 +640,24 @@ def test_radar_window_records_camera_state_alongside_the_radar_values(tmp_path: 
     assert payload["safety_effect"] == "raw_only"
 
 
-def test_radar_sample_carries_the_camera_detection_when_both_sources_agree(tmp_path: Path):
+def test_radar_sample_keeps_recording_when_a_camera_person_window_is_also_open(tmp_path: Path):
+    """The agreeing seconds are the whole point: skipping them while a person window is open would
+    make every radar window look like permanent disagreement (field data 2026-09-16 showed 0 %
+    agreement across 16 windows that cameras had in fact seen)."""
     start = datetime(2026, 9, 10, tzinfo=timezone.utc)
     manager = _manager(tmp_path, start, lambda at: _radar(received_at=at))
     manager.tick(now=start + timedelta(seconds=4))  # radar window opens, cameras quiet
     seen_at = start + timedelta(seconds=4, milliseconds=500)
     manager.record_detection_batch("front", (_event("person", seen_at),), task_id="process_monitoring", at=seen_at)
-    # The person window now owns the recording: person_sample already carries both sides.
     manager.tick(now=start + timedelta(seconds=5))
-    assert [s["payload"]["sampled_at"] for s in _events(tmp_path, "2026-09-10", "radar_sample")] == [
-        (start + timedelta(seconds=offset)).isoformat() for offset in (3, 4)
+
+    samples = _events(tmp_path, "2026-09-10", "radar_sample")
+    assert [s["payload"]["sampled_at"] for s in samples] == [
+        (start + timedelta(seconds=offset)).isoformat() for offset in (3, 4, 5)
     ]
+    assert [s["payload"]["camera_person_present"] for s in samples] == [False, False, True]
+    assert samples[-1]["payload"]["cameras"]["front"]["person_present"] is True
+    # person_sample still carries the radar side, so both tables agree on that second.
     person_samples = _events(tmp_path, "2026-09-10", "person_sample")
     assert person_samples and person_samples[0]["payload"]["cameras"]["front"]["person_present"] is True
     assert person_samples[0]["payload"]["ld2410"]["target_status"] == 2

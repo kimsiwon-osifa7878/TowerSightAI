@@ -538,14 +538,15 @@ class RawDataManager:
     def _sample_radar_cameras(self, sample_time: datetime, snapshot: Mapping[str, Any] | None) -> None:
         """While a radar window is open, record what the cameras were reporting at the same second.
 
-        This is the mirror image of ``person_sample`` (camera window carrying the radar snapshot):
-        together the two make every presence claim comparable from both sides. Skipped while a
-        camera person window is active — that window already records both — and bounded by
-        ``RAW_DATA_RADAR_SAMPLE_SECONDS`` because a radar window can sit open on static clutter
-        for hours.
+        This is the mirror image of ``person_sample`` (camera window carrying the radar snapshot).
+        It records for the whole radar window, including seconds where a camera person window is
+        also open: skipping those would blank out exactly the agreeing seconds and make the window
+        look like permanent disagreement. The small overlap with ``person_sample`` is deliberate —
+        each radar window stays self-contained. Bounded by ``RAW_DATA_RADAR_SAMPLE_SECONDS``
+        because a radar window can sit open on static clutter for hours.
         """
         window = self.radar_tracker.window
-        if window is None or self.config.radar_sample_seconds <= 0 or self.person_sampler.active:
+        if window is None or self.config.radar_sample_seconds <= 0:
             return
         if (sample_time - window.started_at).total_seconds() > self.config.radar_sample_seconds:
             return

@@ -155,7 +155,10 @@ class EvidenceCoordinator:
         elif event_type == "radar_window_started":
             self._handle_radar_window_started(event_id, event_at)
         elif event_type == "radar_window_closed" and self._radar_session_id:
-            self._capture_snapshots(event_id, "radar_end", self._healthy_camera_ids(), event_at)
+            # Radar window times are backdated (start = first present sample, end = last one), but
+            # the snapshot is of the live frame, so it must be stamped "now" — otherwise the frame
+            # freshness check rejects every camera with latest_frame_missing_or_stale.
+            self._capture_snapshots(event_id, "radar_end", self._healthy_camera_ids(), self.clock())
             with self._lock:
                 session = self._sessions.get(self._radar_session_id)
                 bounded = session.close_at if session is not None else None
@@ -192,7 +195,8 @@ class EvidenceCoordinator:
                 self._fail(event_id, "snapshot", camera_id, "radar_evidence_throttled", event_at)
             return
         self._last_radar_evidence_at = event_at
-        self._capture_snapshots(event_id, "radar", camera_ids, event_at)
+        # Stamped with the live clock, not the backdated window start: see radar_window_closed.
+        self._capture_snapshots(event_id, "radar", camera_ids, self.clock())
         self._radar_session_id = self._open_session(
             event_id,
             "radar",
