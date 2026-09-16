@@ -2713,3 +2713,37 @@ def test_ld2410_stopped_status_closes_the_radar_window_and_keeps_ok_blocked(tmp_
     assert window.model.can_show_final_ok is False
     window._raw_data_manager = None
     window.close()
+
+
+def test_ld2410_frames_never_reach_the_process_engine():
+    """Radar is verification-only: a frame updates the operator console and the raw recording,
+    but must not touch the engine that drives the driver display and the machine's operation."""
+    from towersightai.sensors.ld2410 import LD2410Frame
+
+    _qt_app()
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    engine = window.process_engine
+    assert engine is not None
+    before = {name: value for name, value in vars(engine).items() if not callable(value)}
+    frame = LD2410Frame(
+        received_at=datetime(2026, 9, 16, tzinfo=timezone.utc),
+        data_type=0x02,
+        target_status=3,
+        moving_distance_cm=120,
+        moving_energy=80,
+        motionless_distance_cm=82,
+        motionless_energy=31,
+        detection_distance_cm=120,
+        max_moving_gate=8,
+        max_motionless_gate=8,
+        moving_gate_energy=(0,) * 9,
+        motionless_gate_energy=(0,) * 9,
+        raw_hex="F4 F3 F2 F1",
+    )
+    window._append_ld2410_frame(frame, "192.0.2.30")
+    after = {name: value for name, value in vars(engine).items() if not callable(value)}
+    assert after == before
+    assert not window.process_engine.tick(datetime(2026, 9, 16, 0, 0, 1, tzinfo=timezone.utc)).person_possible
+    assert "192.0.2.30" in window.ld2410_connection_label.text()  # console still updates
+    window.close()

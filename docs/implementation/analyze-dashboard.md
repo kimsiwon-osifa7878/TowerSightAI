@@ -254,7 +254,7 @@ towersightai-analyze report --from … --to … --output artifacts/analysis/repo
 | `radar_window_started/closed`(target_status≠0 ≥ `RAW_DATA_RADAR_WINDOW_MIN_SECONDS` 기본 2, 끊김 5초 병합) | `storage/raw_data.py` 새 `RadarWindowTracker` | 시작/종료/병합/미연결 |
 | `radar` 종류 스냅샷+클립(≥3초 지속, 30초당 1회 제한, `RAW_MEDIA_RADAR_EVIDENCE=true`) | `storage/evidence.py` | 제한·실패 이벤트·simulated 무시 |
 | 통제 스냅샷 `RAW_MEDIA_CONTROL_SNAPSHOT_SECONDS`(0=끔) | `storage/evidence.py`, `config/settings.py` | 주기·감지 중 중복 억제 |
-| `engine_person_state` 이벤트(상태 변화 시 cameras/radar/phase) | `process/engine.py` `RawEventRequest`, `ui/pyqt_app.py` | 변화 시에만, 레이더 add-only 유지 |
+| `engine_person_state` 이벤트(상태 변화 시 cameras/radar/phase) | `process/engine.py` `RawEventRequest`, `ui/pyqt_app.py` | 변화 시에만. 레이더는 검증 전용이라 엔진 판정에 포함되지 않음 |
 | 원격 경로 `raw/<source_host>/YYYY-MM-DD/` + 로컬 마커 호환 | `storage/archive.py`, `raw_data.py` | 경로·기존 마커 재업로드 안 함 |
 | 문서: `.env.example`, README(§raw), CLAUDE.md §8, testing-strategy | | |
 

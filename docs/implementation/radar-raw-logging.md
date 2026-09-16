@@ -4,9 +4,12 @@
 떼어낸 독립 작업 명세. 이 문서만 읽고 구현할 수 있도록 현재 코드 위치·목표 스키마·테스트·문서 갱신
 범위를 모두 담았다.
 
+**레이더의 지위(2026-09-16 확정)**: LD2410은 **검증 전용**이다. 카메라 감지와의 정확도 비교를 위해 기록만 하고,
+프로세스 엔진·사용자 모드·안전 게이트·주차기 작동에는 일절 사용하지 않는다. 엔진의 `observe_radar`는 제거됐다.
+
 **범위 밖(이 작업에서 하지 않음)**: 통제(주기) 스냅샷, 엔진 판정(`engine_person_state`) 이벤트.
 NAS 호스트별 원격 경로(`raw/<source_host>/<day>`)는 2026-09-10 대시보드 작업에서 `storage/archive.py`
-`remote_raw_day_dir`로 이미 적용됨 — 건드리지 말 것. 엔진의 레이더 처리(`observe_radar`, add-only)는 **변경하지 않는다**.
+`remote_raw_day_dir`로 이미 적용됨 — 건드리지 말 것. 엔진의 레이더 처리는 2026-09-16에 **완전히 제거**됐다(검증 전용).
 
 ---
 
@@ -164,7 +167,7 @@ LD2410 값이 raw 데이터에 남는 경로는 하나뿐이다.
 | `towersightai/ui/pyqt_app.py` | `_record_ld2410_status`에서 `stopped` → 창 닫기 |
 | `.env.example` | 6개 키 + 주석 |
 | `README.md` §5 원격 아카이브(NAS) | 새 이벤트·미디어 종류·설정 키 설명 |
-| `CLAUDE.md` §8 | 이벤트 목록에 `ld2410_sample`, `radar_window_*`, `radar`/`radar_end` 미디어 추가; “LD2410 add-only” 문장 유지; 테스트 수 갱신 |
+| `CLAUDE.md` §8 | 이벤트 목록에 `ld2410_sample`, `radar_window_*`, `radar`/`radar_end` 미디어 추가; LD2410은 검증 전용(엔진 입력 아님) 문장으로 갱신; 테스트 수 갱신 |
 | `docs/implementation/testing-strategy.md` | 단위 테스트 목록에 레이더 샘플·창·증거 항목 추가 |
 | `INTENT.md` §4 | 결정 기록 한 줄: “레이더 상시 raw 기록(1 Hz)+감지 창+증거는 분석 전용, 엔진 입력 아님” |
 
@@ -211,7 +214,7 @@ CLAUDE.md의 “현재 스위트 수(324)”를 최종 결과로 갱신한다.
 ## 5. 안전 규칙 (반드시 지킬 것)
 
 - 새 이벤트와 미디어는 **분석 전용**이다. 엔진 `observe_radar`, 상태기, `can_show_final_ok`, PLC 경로에 아무것도
-  연결하지 않는다. 레이더는 여전히 add-only 사람 신호이며 이 작업으로 그 성격이 바뀌지 않는다.
+  연결하지 않는다. 레이더는 검증 전용이며 엔진·사용자 모드·안전 게이트에 입력되지 않는다(2026-09-16 확정).
 - 기록·캡처 실패는 로그와 `media_capture_failed`로 드러내되 UI를 멈추거나 안전 표시를 바꾸지 않는다.
 - `simulated: true` 이벤트는 증거를 만들지 않는다(기존 규칙 유지).
 - 자격 증명·IP는 기존 redaction 규칙을 따른다(`client_ip`는 사설 IP라 기존 `person_sample`과 같이 기록 허용).

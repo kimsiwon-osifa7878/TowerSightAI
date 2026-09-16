@@ -2929,11 +2929,9 @@ class OperatorWindow(QMainWindow):
         self._ld2410_connection_state = "client_connected"
         self._ld2410_client_ip = client_ip
         self._ld2410_last_frame_at = frame.received_at
-        if self.process_engine is not None:
-            # Radar is an add-only person source for the engine (never clears).
-            self.process_engine.observe_radar(
-                person_present=frame.target_status != 0, received_at=frame.received_at
-            )
+        # The radar is verification-only: frames are recorded to raw data (RawDataManager reads
+        # the service snapshot) and shown on the operator console, but they never reach the
+        # process engine, the driver display, or any safety decision.
         self._append_ld2410_console_line(_format_ld2410_console_line(frame, client_ip))
         self._refresh_ld2410_console_status()
 

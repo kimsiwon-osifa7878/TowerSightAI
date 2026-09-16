@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **394 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **395 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -55,6 +55,9 @@ These override convenience, refactors, and UI polish.
 - **Simulation is never authorization.** UI tests, `차량 진입 시뮬레이션`, driver-test panel, fake adapters,
   the HTML prototype, LD2410 console, diagnostics, and NAS sync success must never make
   `can_show_final_ok` true and must never emit real PLC events. Diagnostics default to `safe_to_operate=False`.
+- **The LD2410 radar is verification data, not a safety input.** It is recorded to raw data for the offline
+  camera-vs-radar accuracy study only. It must never reach the process engine, user mode, the safety gate, or
+  the parking machine's operation; person presence comes from the cameras alone.
 - **Never hide uncertainty behind UI success.** Driver text and PLC signals must reflect the conservative state.
 - **Never commit secrets.** No real RTSP URLs with credentials, PLC secrets, NAS credentials, `.env`, or local
   Hailo install paths in code, docs, tests, logs, or screenshots. `.env.example` holds placeholders only.
@@ -188,8 +191,10 @@ parked instruct → 10 s no-person countdown → simulated `vehicle_parked`+plat
 60 s machine-operation window (person watch now includes opposite_side; warns, never aborts) → IDLE.
 Outbound (출고) was explicitly removed by the owner. Rules the tests pin: every PLC payload carries
 `simulated: True`; uncertainty (monitoring dead, front/rear_side camera NG) aborts any entry back to IDLE
-with a `vehicle_session_end`; the LD2410 radar is an **add-only** person source (it can raise
-person-possible, never clear it); the engine never computes an OK — `can_show_final_ok` stays the only gate.
+with a `vehicle_session_end`; the **LD2410 radar is not an engine input at all** (owner decision
+2026-09-16: verification-only sensor, recorded to raw data for the offline camera-vs-radar study, never
+reaching the engine, the driver display, or any operating/safety decision — person presence is cameras
+only); the engine never computes an OK — `can_show_final_ok` stays the only gate.
 
 Hosting facts: the engine's inference is the combined `process_monitoring` purpose task (one Hailo child,
 person+vehicle labels, child min-confidence fixed at 0.2 — operator thresholds are applied in the parent, so
@@ -366,10 +371,12 @@ default lane/stop guides outside calibration mode; error/NG states can never use
   `radar_end` snapshot on close, skipped with `person_window_active` while a camera person window owns the
   media and `radar_evidence_throttled` inside `RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS`. Analysis only.
 
-**All of this is audit/telemetry only, with one add-only exception.** Archive success and media capture must
-never relax, authorize, or influence the safety gate, AI, or the state machine. LD2410 values may
-additionally feed the process engine as an **add-only** person signal (raising person-possible/warnings);
-they can never clear a person, accelerate progression, or relax anything. Evidence extensions for the
+**All of this is audit/telemetry only — no exceptions.** Archive success and media capture must
+never relax, authorize, or influence the safety gate, AI, or the state machine. The LD2410 is a
+**verification-only** sensor (owner decision 2026-09-16): its values are recorded for the offline
+camera-vs-radar comparison and never feed the process engine, the driver display, or any operating
+decision. `tests/test_process_engine.py` and `tests/test_pyqt_app.py` pin that the engine has no radar
+input and that an LD2410 frame leaves the engine untouched. Evidence extensions for the
 engine: a `managed: true` `vehicle_entered` opens a clip that stays open until `vehicle_session_ended`
 (parking start) instead of the fixed 10 s post-roll, and `person_window_closed` now also captures a
 `person_end` snapshot. NAS upload mode `immediate` (operator setting) triggers a debounced current-day
@@ -380,7 +387,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 394 passed, hardware-free
+pytest -q                                     # 395 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed

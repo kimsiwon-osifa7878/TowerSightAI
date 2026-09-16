@@ -172,17 +172,16 @@ def test_idle_person_debounce_and_clear():
     assert [r.name for r in out.plc_requests] == ["human_clear"]
 
 
-def test_radar_is_add_only_person_source():
+def test_engine_has_no_radar_input_at_all():
+    """The LD2410 is verification-only data (owner decision 2026-09-16): it is recorded to raw
+    data for the camera-vs-radar study and must never reach the engine, the driver display, or the
+    parking machine's operation. Person presence comes from the cameras alone."""
     engine = _engine()
-    engine.observe_radar(person_present=True, received_at=T0)
+    assert not hasattr(engine, "observe_radar")
+    assert not any("radar" in name.lower() for name in vars(engine))
     out = engine.tick(T0 + timedelta(seconds=1))
-    assert out.public_state is ParkingState.HUMAN_DETECTED
-    assert out.person_possible
-    # radar "no person" never arrives as a clearing signal; only staleness clears
-    out = engine.tick(T0 + timedelta(seconds=2))
-    assert out.public_state is ParkingState.HUMAN_DETECTED
-    out = engine.tick(T0 + timedelta(seconds=6))
     assert out.public_state is ParkingState.IDLE
+    assert not out.person_possible
 
 
 def test_opposite_side_person_ignored_in_idle():

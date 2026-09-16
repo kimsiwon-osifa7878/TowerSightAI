@@ -1,8 +1,8 @@
 """Continuous parking-process engine.
 
 Pure Python (no Qt), deterministic under an injected clock, unit-testable from
-synthetic events. The engine consumes normalized detection batches, radar
-presence, LPR attempts, and health signals; on each 1 Hz ``tick`` it advances an
+synthetic events. The engine consumes normalized detection batches, LPR
+attempts, and health signals; on each 1 Hz ``tick`` it advances an
 internal :class:`SafetyStateMachine` and returns an :class:`EngineOutput` that
 the UI host applies (display override, audio cue, simulated PLC requests, raw
 event requests, LPR loop control).
@@ -19,7 +19,10 @@ Safety posture:
   any in-progress entry back to IDLE. The machine-operating phase is the one
   exception: the machine is already moving, so the engine keeps warning instead
   of pretending to stop it.
-- Radar (LD2410) can only *add* person-possible; it can never clear a person.
+- The LD2410 radar is **not an input**. It is a verification-only sensor: its
+  readings are recorded to raw data for the offline camera-vs-radar study and
+  never reach the engine, the driver display, or any operating decision. Person
+  presence comes from the cameras alone.
 """
 
 from __future__ import annotations
@@ -140,8 +143,6 @@ class ParkingProcessEngine:
 
         self._person = _PersonWatch()
         self._person_cameras: set[str] = set()
-        self._radar_present = False
-        self._radar_at: datetime | None = None
 
         self._trigger_streak = 0
         self._trigger_last_at: datetime | None = None
@@ -179,12 +180,6 @@ class ParkingProcessEngine:
     def observe_camera_health(self, camera_id: str, role: CameraRole, healthy: bool) -> None:
         self._camera_health[camera_id] = healthy
         self._camera_roles[camera_id] = role
-
-    def observe_radar(self, *, person_present: bool, received_at: datetime) -> None:
-        """Radar is add-only: it can raise person-possible, never clear it early."""
-        if person_present:
-            self._radar_present = True
-            self._radar_at = received_at
 
     def observe_detections(
         self,
@@ -564,11 +559,6 @@ class ParkingProcessEngine:
         self._person.expire(now, debounce.stale_seconds)
         if self._person.streak == 0:
             self._person_cameras.clear()
-        if self._radar_at is not None and (
-            (now - self._radar_at).total_seconds() > debounce.stale_seconds
-        ):
-            self._radar_present = False
-            self._radar_at = None
         trigger = self._settings.vehicle_trigger
         if self._trigger_last_at is not None and (
             (now - self._trigger_last_at).total_seconds() > trigger.stale_seconds
@@ -596,7 +586,9 @@ class ParkingProcessEngine:
         return debounce.idle_frames
 
     def _person_possible(self) -> bool:
-        return self._person.active(self._person_threshold()) or self._radar_present
+        # Cameras only. The radar is verification-only data and must never influence a
+        # person decision, a driver warning, or the parking machine's operation.
+        return self._person.active(self._person_threshold())
 
     def _trigger_confirmed(self) -> bool:
         return (
