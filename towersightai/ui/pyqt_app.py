@@ -12,7 +12,7 @@ from pathlib import Path
 from towersightai.camera.pipeline import build_preview_pipeline, normalize_rotation_degrees
 from towersightai.config.settings import CameraRole, Settings
 from towersightai.inference.events import DetectionEvent
-from towersightai.inference.live_detection import LiveDetectionRunner, latest_events, live_multistream_detection_process
+from towersightai.inference.live_detection import latest_events
 from towersightai.inference.purpose_tasks import (
     PlateOcrEvent,
     PURPOSE_LPR_IMAGE,
@@ -44,6 +44,19 @@ from towersightai.runtime_logging import DEFAULT_RUNTIME_LOG, new_run_id
 from towersightai.state_machine.core import ParkingState
 from towersightai.sensors.ld2410 import LD2410Frame, LD2410TCPService
 from towersightai.storage.connection_test import NasConnectionTestResult, run_nas_connection_test
+from towersightai.storage.file_transfer import NasFileTransferResult, upload_files_to_nas
+from towersightai.calibration.checkerboard import CheckerboardSpec
+from towersightai.calibration.intrinsics import (
+    CAPTURE_POSES,
+    DEFAULT_INTRINSICS_ROOT,
+    MIN_SAMPLES as CALIBRATION_MIN_SAMPLES,
+    CheckerboardDetection,
+    IntrinsicsResult,
+    IntrinsicsSample,
+    IntrinsicsSessionStore,
+    calibrate_intrinsics,
+    detect_checkerboard,
+)
 from towersightai.storage.evidence import EvidenceCoordinator
 from towersightai.storage.raw_data import RawDataManager
 from towersightai.ui.model import (
@@ -76,6 +89,8 @@ SIDEBAR_SECTIONS = (
             "번호판 인식",
             "레이더 (LD2410)",
             "NAS 연결 확인",
+            "NAS 파일 전송",
+            "카메라 캘리브레이션",
             "시스템 점검",
             "실행 로그",
         ),
@@ -88,22 +103,34 @@ HAILO_HEALTH_INTERVAL_SECONDS = 60
 LOG_VIEW_TAIL_BYTES = 64 * 1024
 LOG_VIEW_MAX_LINES = 1200
 NAS_TEST_CLIP_SECONDS = 2.0
+CALIBRATION_DETECT_INTERVAL_MS = 400
+# Process-monitoring auto-start: wait for the streaming camera set to settle so one child is
+# launched with every camera instead of front-only followed by an immediate relaunch, and back
+# off after failed runs so RTSP 400 (Tapo session budget) storms cannot feed themselves.
+MONITORING_CAMERA_SETTLE_SECONDS = 4.0
+MONITORING_START_COOLDOWN_SECONDS = 10.0
+MONITORING_FAILURE_COOLDOWN_SECONDS = 30.0
+MONITORING_FAILURE_COOLDOWN_MAX_SECONDS = 120.0
+CALIBRATION_STEADY_HITS = 2
+CALIBRATION_HOLD_SECONDS = 2.5
 NAS_TEST_CLIP_FPS = 10
 NAS_TEST_DIR = Path("artifacts/runtime/nas-connection-test")
 
 try:
-    from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
     from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen
     from PyQt6.QtWidgets import (
         QApplication,
         QCheckBox,
         QComboBox,
         QDoubleSpinBox,
+        QFileDialog,
         QFrame,
         QGridLayout,
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QListWidget,
         QSpinBox,
         QMainWindow,
         QMessageBox,
@@ -140,6 +167,7 @@ class CameraSurface(QFrame):
         # (bottom_left_x, bottom_right_x, top_left_x, top_right_x, top_y, stop_y), all normalized
         self._guide_overlay: tuple[float, float, float, float, float, float] | None = None
         self._plate_line: float | None = None
+        self._marker_points: tuple[tuple[float, float], ...] = ()
         # Pixels reserved at the bottom for an overlay that covers the tile, such as the
         # driver bottom strip. Operator layouts keep this at 0.
         self.bottom_inset = 0
@@ -163,6 +191,11 @@ class CameraSurface(QFrame):
 
     def set_detections(self, detections: tuple[DetectionEvent, ...]) -> None:
         self._detections = detections
+        self.update()
+
+    def set_marker_points(self, points: tuple[tuple[float, float], ...]) -> None:
+        """Normalized (0..1) image points drawn as small dots, e.g. detected checkerboard corners."""
+        self._marker_points = tuple(points)
         self.update()
 
     def clear_detections(self) -> None:
@@ -266,6 +299,15 @@ class CameraSurface(QFrame):
             painter.setPen(QPen(QColor("#94a3b8"), 1))
             painter.drawLine(center_x, content.top() + 24, center_x, content.bottom() - 24)
             painter.drawLine(content.left() + 36, center_y, content.right() - 36, center_y)
+
+        if self._marker_points and display_frame is not None and self.display_mode != "cover":
+            painter.setPen(QPen(QColor("#F5A623"), 2))
+            painter.setBrush(QColor("#F5A623"))
+            for nx, ny in self._marker_points:
+                px = image_rect.left() + int(nx * image_rect.width())
+                py = image_rect.top() + int(ny * image_rect.height())
+                painter.drawEllipse(px - 3, py - 3, 6, 6)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
 
         if self._vehicle_simulation:
             vehicle_color = QColor("#38bdf8")
@@ -508,110 +550,6 @@ class CameraCaptureWorker(QObject):
                 )
             capture = cv2.VideoCapture(self.camera.rtsp_url)
         return capture, using_gstreamer
-
-
-class LiveDetectionWorker(QObject):
-    detections_ready = pyqtSignal(str, object)
-    status_changed = pyqtSignal(str, str)
-    detection_started = pyqtSignal(str, str)
-    first_inference_ready = pyqtSignal(float)
-    finished = pyqtSignal(str)
-
-    def __init__(
-        self,
-        settings: Settings,
-        camera_ids: tuple[str, ...],
-        camera_rotations: dict[str, int] | None = None,
-        hef_path: Path | None = None,
-        legacy_mode: bool = False,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.settings = settings
-        self.camera_ids = camera_ids
-        self.camera_rotations = dict(camera_rotations or {})
-        self.hef_path = hef_path
-        self.legacy_mode = legacy_mode
-        self.cameras = tuple(camera for camera in settings.cameras if camera.id in set(camera_ids))
-        self._runner: LiveDetectionRunner | None = None
-        self._stop_requested = False
-
-    def stop(self) -> None:
-        self._stop_requested = True
-        if self._runner is not None:
-            self._runner.stop()
-
-    def _build_process(self):
-        if self.legacy_mode:
-            return live_multistream_detection_process(
-                self.settings,
-                self.cameras,
-                camera_rotations=self.camera_rotations,
-            )
-        return live_multistream_detection_process(
-            self.settings,
-            self.cameras,
-            camera_rotations=self.camera_rotations,
-            hef_path=self.hef_path,
-        )
-
-    def run(self) -> None:
-        attempt = 0
-        while not self._stop_requested:
-            if self._stop_requested:
-                break
-            process = self._build_process()
-            active_hef = Path(process.hef_path)
-            if not self.legacy_mode and f"hef-path={active_hef}" not in " ".join(process.command):
-                for camera_id in self.camera_ids:
-                    self.status_changed.emit(camera_id, f"AI 추론 실패: 선택 모델이 파이프라인에 반영되지 않았습니다. 선택={active_hef.name}")
-                break
-            started_at = time.monotonic()
-            first_event_sent = False
-            if not self.legacy_mode:
-                self.detection_started.emit(str(active_hef), str(process.log_path or ""))
-            for camera_id in self.camera_ids:
-                if self.legacy_mode:
-                    self.status_changed.emit(camera_id, "이전 AI Detection 실행 중" if attempt == 0 else "이전 AI Detection 재시도 중")
-                else:
-                    self.status_changed.emit(camera_id, "AI Detection 실행 중" if attempt == 0 else "AI Detection 재시도 중")
-
-            def on_events(events: tuple[DetectionEvent, ...]) -> None:
-                nonlocal first_event_sent
-                if events and not first_event_sent:
-                    first_event_sent = True
-                    self.first_inference_ready.emit(time.monotonic() - started_at)
-                grouped: dict[str, list[DetectionEvent]] = {}
-                for event in events:
-                    grouped.setdefault(event.camera_id, []).append(event)
-                for camera_id, camera_events in grouped.items():
-                    self.detections_ready.emit(camera_id, latest_events(camera_events))
-
-            def on_error(message: str) -> None:
-                for camera_id in self.camera_ids:
-                    self.status_changed.emit(camera_id, message)
-
-            self._runner = LiveDetectionRunner(process, on_events=on_events, on_error=on_error)
-            try:
-                started = self._runner.run()
-            except Exception as exc:  # noqa: BLE001 - worker boundary must expose unexpected runtime failures.
-                logging.getLogger("towersightai.ai.general").exception(
-                    "live-detection-worker-crashed cameras=%s",
-                    self.camera_ids,
-                )
-                for camera_id in self.camera_ids:
-                    self.status_changed.emit(camera_id, f"AI detection worker failed: {exc}")
-                break
-            if self._stop_requested:
-                break
-            if not started:
-                break
-            attempt += 1
-            for camera_id in self.camera_ids:
-                self.status_changed.emit(camera_id, "이전 AI Detection 재시작 대기" if self.legacy_mode else "AI Detection 재시작 대기")
-            QThread.msleep(min(5000, 500 * attempt))
-        for camera_id in self.camera_ids:
-            self.finished.emit(camera_id)
 
 
 class PurposeInferenceWorker(QObject):
@@ -860,6 +798,133 @@ class PeriodicFrontLprWorker(QObject):
             self.status_changed.emit(f"번호판 인식 오류: {exc}")
 
 
+def _qimage_to_bgr(frame: QImage):  # noqa: ANN202 - numpy array; numpy imported lazily.
+    """Convert a preview QImage to a contiguous BGR numpy array (copy)."""
+    import numpy as np
+
+    image = frame.convertToFormat(QImage.Format.Format_RGB888)
+    height, width = image.height(), image.width()
+    buffer = image.constBits()
+    buffer.setsize(height * image.bytesPerLine())
+    # Rows are padded to 4 bytes, so slice each row to its real payload before reshaping.
+    rows = np.frombuffer(buffer, dtype=np.uint8).reshape((height, image.bytesPerLine()))
+    array = rows[:, : width * 3].reshape((height, width, 3))
+    return np.ascontiguousarray(array[:, :, ::-1])
+
+
+class CheckerboardDetectWorker(QObject):
+    """Find checkerboard corners in preview frames off the UI thread."""
+
+    detect_requested = pyqtSignal(int, object)  # token, bgr frame (queued into the worker thread)
+    detected = pyqtSignal(int, object, object)  # token, bgr frame, CheckerboardDetection | None
+
+    def __init__(self, spec: CheckerboardSpec, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.spec = spec
+        self.detect_requested.connect(self.detect)
+
+    @pyqtSlot(int, object)
+    def detect(self, token: int, bgr) -> None:  # noqa: ANN001 - numpy array.
+        detection = None
+        try:
+            import cv2
+
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            detection = detect_checkerboard(gray, self.spec)
+        except Exception:  # noqa: BLE001 - a detector failure must not kill the thread.
+            logging.getLogger("towersightai.calibration").exception("checkerboard-detect-failed")
+        self.detected.emit(token, bgr, detection)
+
+
+class IntrinsicsCalibrateWorker(QObject):
+    """Run cv2.calibrateCamera over the captured samples and save the result files."""
+
+    result_ready = pyqtSignal(object, object, object)  # IntrinsicsResult, session path, latest path
+    failed = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        store: IntrinsicsSessionStore,
+        samples: tuple[IntrinsicsSample, ...],
+        spec: CheckerboardSpec,
+        *,
+        camera_id: str,
+        rotation_degrees: int,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.store = store
+        self.samples = samples
+        self.spec = spec
+        self.camera_id = camera_id
+        self.rotation_degrees = rotation_degrees
+
+    def run(self) -> None:
+        logger = logging.getLogger("towersightai.calibration")
+        try:
+            result = calibrate_intrinsics(
+                self.samples, self.spec, camera_id=self.camera_id, rotation_degrees=self.rotation_degrees
+            )
+            result_path, latest_path = self.store.save_result(result)
+        except Exception as exc:  # noqa: BLE001 - report instead of crashing the UI.
+            logger.exception("intrinsics-calibration-failed camera=%s", self.camera_id)
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+        else:
+            logger.info(
+                "intrinsics-calibration-end camera=%s samples=%s rms=%.4f quality=%s path=%s",
+                self.camera_id, result.sample_count, result.rms_reprojection_error, result.quality, latest_path,
+            )
+            self.result_ready.emit(result, result_path, latest_path)
+        self.finished.emit()
+
+
+class NasFileTransferWorker(QObject):
+    """Upload operator-selected files into the NAS transfer folder off the UI thread.
+
+    Relay only: the result never changes safety state, calibration state, or PLC output.
+    """
+
+    status_changed = pyqtSignal(str)
+    result_ready = pyqtSignal(object)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        config,  # noqa: ANN001 - RawStorageConfig, kept untyped to avoid a settings import cycle.
+        files: tuple[Path, ...],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.config = config
+        self.files = tuple(Path(item) for item in files)
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:
+        logger = logging.getLogger("towersightai.storage.nas_transfer")
+        if self._stop_requested:
+            self.finished.emit()
+            return
+
+        def progress(index: int, total: int, name: str) -> None:
+            self.status_changed.emit(f"NAS 파일 전송: ({index}/{total}) {name} 업로드 중")
+
+        result = upload_files_to_nas(self.config, self.files, progress=progress)
+        logger.info(
+            "nas-transfer-end ok=%s remote_dir=%s files=%s bytes=%s error=%s",
+            result.ok,
+            result.remote_dir,
+            len(result.artifacts),
+            result.total_bytes,
+            result.error,
+        )
+        self.result_ready.emit(result)
+        self.finished.emit()
+
+
 class NasConnectionTestWorker(QObject):
     """Encode the collected preview frames and write one test payload to the NAS.
 
@@ -949,14 +1014,8 @@ class NasConnectionTestWorker(QObject):
             raise RuntimeError("cv2.VideoWriter could not open the clip file")
         try:
             for frame in self.frames:
-                image = frame.convertToFormat(QImage.Format.Format_RGB888)
-                buffer = image.constBits()
-                buffer.setsize(image.height() * image.bytesPerLine())
-                array = np.frombuffer(buffer, dtype=np.uint8).reshape(
-                    (image.height(), image.bytesPerLine() // 3, 3)
-                )[:, : image.width(), :]
-                bgr = array[:, :, ::-1]
-                if (image.width(), image.height()) != (width, height):
+                bgr = _qimage_to_bgr(frame)
+                if (frame.width(), frame.height()) != (width, height):
                     bgr = cv2.resize(bgr, (width, height))
                 writer.write(np.ascontiguousarray(bgr))
         finally:
@@ -1072,8 +1131,6 @@ class OperatorWindow(QMainWindow):
         self._runtime_camera_status: dict[str, str] = {}
         self._threads: list[QThread] = []
         self._workers: list[CameraCaptureWorker] = []
-        self._detection_threads: list[QThread] = []
-        self._detection_workers: list[LiveDetectionWorker] = []
         self._purpose_threads: list[QThread] = []
         self._purpose_workers: list[PurposeInferenceWorker] = []
         self._front_lpr_threads: list[QThread] = []
@@ -1086,16 +1143,30 @@ class OperatorWindow(QMainWindow):
         self._nas_test_timer: QTimer | None = None
         self._nas_test_ticks = 0
         self._nas_test_widget: CameraSurface | None = None
-        self._detection_enabled = False
+        self._nas_transfer_threads: list[QThread] = []
+        self._nas_transfer_workers: list[NasFileTransferWorker] = []
+        self._nas_transfer_running = False
+        self._nas_transfer_files: list[Path] = []
+        self._calib_spec = CheckerboardSpec()
+        self._calib_store: IntrinsicsSessionStore | None = None
+        self._calib_samples: list[IntrinsicsSample] = []
+        self._calib_pose_index = 0
+        self._calib_camera_id = ""
+        self._calib_running = False
+        self._calib_calibrating = False
+        self._calib_detect_busy = False
+        self._calib_token = 0
+        self._calib_hits = 0
+        self._calib_hold_until = 0.0
+        self._calib_capture_requested = False
+        self._calib_timer: QTimer | None = None
+        self._calib_detect_thread: QThread | None = None
+        self._calib_detect_worker: CheckerboardDetectWorker | None = None
+        self._calib_threads: list[QThread] = []
+        self._calib_workers: list[IntrinsicsCalibrateWorker] = []
         self._detection_camera_ids: tuple[str, ...] = ()
         self._detection_event_counts: dict[str, int] = {}
-        self._detection_load_started_at: float | None = None
-        self._detection_first_inference_seconds: float | None = None
-        self._detection_model_label = ""
-        self._detection_log_path: Path | None = None
-        self._detection_unconfirmed_reported = False
         self._detection_failed = False
-        self._detection_legacy_mode = False
         self._purpose_task_enabled = False
         self._purpose_task_id = ""
         self._purpose_task_label = ""
@@ -1133,6 +1204,8 @@ class OperatorWindow(QMainWindow):
         self._selected_hailo_model_path: Path | None = None
         self.sidebar_buttons: dict[str, QPushButton] = {}
         self.purpose_task_buttons: dict[str, QPushButton] = {}
+        # Extra run/stop buttons for the same task on other pages (e.g. 전체 카메라).
+        self.purpose_task_extra_buttons: dict[str, list[QPushButton]] = {}
         self.camera_rotation_buttons: dict[str, QPushButton] = {}
         self._system_test_threads: list[QThread] = []
         self._system_test_workers: list[QObject] = []
@@ -1151,6 +1224,9 @@ class OperatorWindow(QMainWindow):
         self._engine_copy_key: str | None = None
         self._engine_last_phase = "idle_monitoring"
         self._engine_last_start_attempt = 0.0
+        self._monitoring_consecutive_failures = 0
+        self._monitoring_streaming_set: tuple[str, ...] = ()
+        self._monitoring_streaming_since = 0.0
         self._engine_stopped_by_operator = False
         self._audio_player = None  # lazy AudioAlertPlayer (QtMultimedia optional)
         self._periodic_lpr_threads: list[QThread] = []
@@ -1201,15 +1277,13 @@ class OperatorWindow(QMainWindow):
         for thread in self._threads:
             thread.quit()
             thread.wait(10000)
-        self._stop_ai_detection()
         self._stop_purpose_inference()
         self._stop_front_camera_lpr()
         self._shutdown_periodic_lpr()
         self._stop_nas_connection_test()
+        self._stop_nas_file_transfer()
+        self._stop_calibration_session()
         self._stop_hailo_health_monitor()
-        for thread in self._detection_threads:
-            thread.quit()
-            thread.wait(5000)
         for thread in self._purpose_threads:
             thread.quit()
             thread.wait(5000)
@@ -1219,6 +1293,15 @@ class OperatorWindow(QMainWindow):
         for thread in self._nas_test_threads:
             thread.quit()
             thread.wait(10000)
+        for thread in self._nas_transfer_threads:
+            thread.quit()
+            thread.wait(10000)
+        if self._calib_detect_thread is not None:
+            self._calib_detect_thread.quit()
+            self._calib_detect_thread.wait(5000)
+        for thread in self._calib_threads:
+            thread.quit()
+            thread.wait(30000)
         for thread in self._system_test_threads:
             thread.quit()
             thread.wait(35000)
@@ -1302,6 +1385,10 @@ class OperatorWindow(QMainWindow):
         self._raw_sync_timer.start(max(1000, int(self.settings.raw_storage.sync_interval_seconds * 1000)))
 
     def _record_raw(self, callback, *args, **kwargs) -> None:  # noqa: ANN001 - compact failure boundary.
+        manager = self._raw_data_manager
+        if manager is not None and getattr(manager, "_closed", False):
+            # Late worker signals during shutdown: the audit file is already sealed.
+            return
         try:
             callback(*args, **kwargs)
         except Exception:  # noqa: BLE001 - persistence failure must be visible in logs, not crash UI.
@@ -1310,6 +1397,10 @@ class OperatorWindow(QMainWindow):
     def _record_ld2410_status(self, state: str, details) -> None:  # noqa: ANN001 - worker callback boundary.
         if self._raw_data_manager is not None:
             self._record_raw(self._raw_data_manager.record_ld2410_status, state, details)
+            close_window = getattr(self._raw_data_manager, "close_radar_window", None)
+            if state == "stopped" and close_window is not None:
+                # Analysis-only: the radar window must not stay open forever without its source.
+                self._record_raw(close_window, reason="service_stopped")
         self.ld2410_status_ready.emit(state, dict(details))
 
     def _receive_ld2410_frame(self, frame: LD2410Frame, client_ip: str) -> None:
@@ -1381,7 +1472,7 @@ class OperatorWindow(QMainWindow):
         if tile is None:
             return
         if self._raw_data_manager is not None and detections:
-            task_id = self._purpose_task_id or ("legacy_detection" if self._detection_legacy_mode else "general_detection")
+            task_id = self._purpose_task_id or "unknown"
             self._record_raw(
                 self._raw_data_manager.record_detection_batch,
                 camera_id,
@@ -1396,18 +1487,7 @@ class OperatorWindow(QMainWindow):
                 widget.clear_detections()
             return
         self._detection_event_counts[camera_id] = self._detection_event_counts.get(camera_id, 0) + len(detections)
-        if self._detection_enabled:
-            if self._detection_legacy_mode:
-                self.ai_detection_label.setText(_legacy_ai_detection_label(self._detection_camera_ids, self._detection_event_counts))
-            else:
-                self.ai_detection_label.setText(
-                    _ai_detection_label(
-                        self._detection_camera_ids,
-                        self._detection_event_counts,
-                        first_inference_seconds=self._detection_first_inference_seconds,
-                    )
-                )
-        elif self._purpose_task_enabled:
+        if self._purpose_task_enabled:
             self.ai_detection_label.setText(
                 _purpose_detection_label(
                     self._purpose_task_label,
@@ -1451,48 +1531,6 @@ class OperatorWindow(QMainWindow):
             self._driver_simulated = False
             self._refresh_driver_display()
 
-    def _set_detection_status(self, camera_id: str, message: str) -> None:
-        if "실행 중" in message or "재시도 중" in message or "재시작 대기" in message:
-            if self._detection_legacy_mode:
-                self.ai_detection_label.setText(_legacy_ai_detection_label(self._detection_camera_ids, self._detection_event_counts))
-            else:
-                self.ai_detection_label.setText(
-                    _ai_detection_label(
-                        self._detection_camera_ids,
-                        self._detection_event_counts,
-                        first_inference_seconds=self._detection_first_inference_seconds,
-                    )
-                )
-            return
-        self.ai_detection_label.setText(f"{'이전 AI Detection' if self._detection_legacy_mode else 'AI Detection'} 오류: {camera_id}")
-        self._detection_failed = True
-        if hasattr(self, "model_status_label"):
-            self.model_status_label.setText(f"추론 실패: {self._detection_model_label or '모델 미확인'}")
-        self.warning_label.setText(f"Hailo detection 문제: {message[:120]}")
-
-    def _set_detection_started(self, hef_path: str, log_path: str) -> None:
-        self._detection_load_started_at = time.monotonic()
-        self._detection_first_inference_seconds = None
-        self._detection_unconfirmed_reported = False
-        self._detection_failed = False
-        self._detection_model_label = Path(hef_path).name
-        self._detection_log_path = Path(log_path) if log_path else None
-        self.ai_detection_label.setText(_ai_detection_label(self._detection_camera_ids, self._detection_event_counts, loading_seconds=0.0))
-        self.model_status_label.setText(f"실행 모델: {self._detection_model_label}")
-        self.warning_label.setText(f"AI 모델 로드 중: {self._detection_model_label}")
-
-    def _set_first_inference_ready(self, elapsed_seconds: float) -> None:
-        self._detection_first_inference_seconds = elapsed_seconds
-        self.ai_detection_label.setText(
-            _ai_detection_label(
-                self._detection_camera_ids,
-                self._detection_event_counts,
-                first_inference_seconds=elapsed_seconds,
-            )
-        )
-        self.model_status_label.setText(f"실행 모델: {self._detection_model_label}")
-        self.warning_label.setText(f"AI 추론 시작 완료: {self._detection_model_label} ({elapsed_seconds:.1f}s)")
-
     def _refresh_runtime_health_labels(self) -> None:
         if self._detection_failed:
             return
@@ -1507,7 +1545,7 @@ class OperatorWindow(QMainWindow):
         birdview_suffix = " · 버드뷰 OFF" if not self.model.birdview_available else ""
         if blocked_count:
             self.camera_summary_label.setText(f"카메라 {blocked_count}/{camera_total} 차단{birdview_suffix}")
-            if self._detection_enabled or preserve_notice:
+            if preserve_notice:
                 return
             warning = "카메라 입력 차단: " + ", ".join(tile.title for tile in blocked_tiles)
             if not self.model.birdview_available:
@@ -1516,7 +1554,7 @@ class OperatorWindow(QMainWindow):
             return
 
         self.camera_summary_label.setText(f"카메라 {camera_total}/{camera_total} 정상{birdview_suffix}")
-        if self._detection_enabled or preserve_notice:
+        if preserve_notice:
             return
         if self.model.plc_state.value != "CONNECTED":
             self.warning_label.setText("PLC 상태 미확인: 최종 OK 차단")
@@ -1662,6 +1700,8 @@ class OperatorWindow(QMainWindow):
         self._register_operator_page("번호판 인식", self._build_lpr_page(), camera_layout="front")
         self._register_operator_page("레이더 (LD2410)", self.ld2410_console_view)
         self._register_operator_page("NAS 연결 확인", self._build_nas_page())
+        self._register_operator_page("NAS 파일 전송", self._build_nas_transfer_page())
+        self._register_operator_page("카메라 캘리브레이션", self._build_calibration_page(), camera_layout="single:front")
         self._register_operator_page("시스템 점검", self._build_system_page())
         self._register_operator_page("실행 로그", self._build_log_page())
         self._register_operator_page("주차 프로세스 테스트", self._build_driver_test_page())
@@ -1760,11 +1800,15 @@ class OperatorWindow(QMainWindow):
         page, body, controls = self._page_scaffold(
             "전체 카메라", "활성 카메라 실시간 스트리밍 · 최종 OK는 항상 차단됩니다."
         )
-        self.legacy_ai_detection_button = QPushButton("이전 AI Detection")
-        self.legacy_ai_detection_button.setProperty("primary", "true")
-        self.legacy_ai_detection_button.setCheckable(True)
-        self.legacy_ai_detection_button.clicked.connect(self._toggle_legacy_ai_detection)
-        controls.addWidget(self.legacy_ai_detection_button)
+        # Same two tasks as their own pages; starting one stops whatever inference is running
+        # (a manual task or the automatic process monitoring) and then launches the clicked one.
+        for task_id in (PURPOSE_PERSON_PRESENCE, PURPOSE_VEHICLE_DETECTION):
+            button = QPushButton(f"{PURPOSE_TASK_SPECS[task_id].label} 시작")
+            button.setProperty("primary", "true")
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, task_id=task_id: self._toggle_purpose_inference(task_id))
+            self.purpose_task_extra_buttons.setdefault(task_id, []).append(button)
+            controls.addWidget(button)
         controls.addStretch(1)
         page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
         page.camera_slot.setContentsMargins(0, 0, 0, 0)
@@ -1849,6 +1893,101 @@ class OperatorWindow(QMainWindow):
         body.addWidget(self.nas_history, 1)
         return page
 
+    def _build_nas_transfer_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "NAS 파일 전송",
+            "선택한 파일을 NAS의 transfer 폴더 한 곳에 저장합니다. 원격 접속으로 파일을 주고받을 수 없을 때 NAS를 중계로 씁니다.",
+        )
+        self.nas_transfer_pick_button = QPushButton("파일 선택")
+        self.nas_transfer_pick_button.clicked.connect(self._pick_nas_transfer_files)
+        controls.addWidget(self.nas_transfer_pick_button)
+        self.nas_transfer_clear_button = QPushButton("목록 비우기")
+        self.nas_transfer_clear_button.clicked.connect(self._clear_nas_transfer_files)
+        controls.addWidget(self.nas_transfer_clear_button)
+        self.nas_transfer_send_button = QPushButton("NAS로 보내기")
+        self.nas_transfer_send_button.setProperty("primary", "true")
+        self.nas_transfer_send_button.clicked.connect(self._start_nas_file_transfer)
+        controls.addWidget(self.nas_transfer_send_button)
+        controls.addStretch(1)
+        self.nas_transfer_target_label = QLabel(self._nas_transfer_target_text())
+        self.nas_transfer_target_label.setObjectName("pageSubtitleLabel")
+        self.nas_transfer_target_label.setWordWrap(True)
+        body.addWidget(self.nas_transfer_target_label)
+        self.nas_transfer_list = QListWidget()
+        self.nas_transfer_list.setObjectName("testLog")
+        body.addWidget(self.nas_transfer_list, 1)
+        self.nas_transfer_result_label = QLabel("보낼 파일을 선택해 주세요.")
+        self.nas_transfer_result_label.setObjectName("pageStatusLabel")
+        self.nas_transfer_result_label.setWordWrap(True)
+        body.addWidget(self.nas_transfer_result_label)
+        self.nas_transfer_history = QPlainTextEdit()
+        self.nas_transfer_history.setObjectName("testLog")
+        self.nas_transfer_history.setReadOnly(True)
+        self.nas_transfer_history.setPlaceholderText("전송 이력이 여기에 기록됩니다. 파일 중계 전용이며 최종 OK를 허용하지 않습니다.")
+        body.addWidget(self.nas_transfer_history, 1)
+        self._refresh_nas_transfer_buttons()
+        return page
+
+    def _build_calibration_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "카메라 캘리브레이션",
+            "체커보드를 지시대로 들면 자동으로 촬영해 렌즈 내부 파라미터(초점거리·왜곡)를 측정합니다. "
+            "결과는 측정 파일일 뿐이며 검토 전까지 캘리브레이션 유효로 취급되지 않습니다.",
+        )
+        self.calibration_camera_box = QComboBox()
+        self.calibration_camera_box.currentIndexChanged.connect(self._on_calibration_camera_changed)
+        controls.addWidget(QLabel("카메라"))
+        controls.addWidget(self.calibration_camera_box)
+        self.calibration_start_button = QPushButton("촬영 시작")
+        self.calibration_start_button.setProperty("primary", "true")
+        self.calibration_start_button.clicked.connect(self._start_calibration_session)
+        controls.addWidget(self.calibration_start_button)
+        self.calibration_capture_button = QPushButton("지금 촬영")
+        self.calibration_capture_button.clicked.connect(self._request_calibration_capture)
+        controls.addWidget(self.calibration_capture_button)
+        self.calibration_skip_button = QPushButton("이 자세 건너뛰기")
+        self.calibration_skip_button.clicked.connect(self._skip_calibration_pose)
+        controls.addWidget(self.calibration_skip_button)
+        self.calibration_run_button = QPushButton("측정 실행")
+        self.calibration_run_button.setProperty("primary", "true")
+        self.calibration_run_button.clicked.connect(self._run_calibration)
+        controls.addWidget(self.calibration_run_button)
+        self.calibration_stop_button = QPushButton("세션 종료")
+        self.calibration_stop_button.clicked.connect(self._stop_calibration_session)
+        controls.addWidget(self.calibration_stop_button)
+        self.calibration_auto_box = QCheckBox("자동 촬영")
+        self.calibration_auto_box.setChecked(True)
+        controls.addWidget(self.calibration_auto_box)
+        controls.addStretch(1)
+        cols, rows = self._calib_spec.inner_corners
+        board = QLabel(
+            f"체커보드: {self._calib_spec.columns}x{self._calib_spec.rows}칸 {self._calib_spec.square_mm:g}mm "
+            f"(내부 코너 {cols}x{rows}) · 인쇄: data/calibration/checkerboard/ · 필요 샘플 {CALIBRATION_MIN_SAMPLES}장 이상"
+        )
+        board.setObjectName("pageSubtitleLabel")
+        board.setWordWrap(True)
+        body.addWidget(board)
+        self.calibration_instruction_label = QLabel("촬영 시작을 누르면 첫 번째 자세를 안내합니다.")
+        self.calibration_instruction_label.setObjectName("pageTitleLabel")
+        self.calibration_instruction_label.setWordWrap(True)
+        body.addWidget(self.calibration_instruction_label)
+        self.calibration_status_label = QLabel("대기 중")
+        self.calibration_status_label.setObjectName("pageStatusLabel")
+        self.calibration_status_label.setWordWrap(True)
+        body.addWidget(self.calibration_status_label)
+        page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
+        page.camera_slot.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(page.camera_slot, 1)
+        self.calibration_history = QPlainTextEdit()
+        self.calibration_history.setObjectName("testLog")
+        self.calibration_history.setReadOnly(True)
+        self.calibration_history.setMaximumHeight(140)
+        self.calibration_history.setPlaceholderText("촬영·측정 이력이 여기에 기록됩니다. 측정 결과는 최종 OK를 허용하지 않습니다.")
+        body.addWidget(self.calibration_history)
+        self._populate_calibration_cameras()
+        self._refresh_calibration_buttons()
+        return page
+
     def _build_system_page(self) -> QWidget:
         page, body, controls = self._page_scaffold(
             "시스템 점검", "설정·Hailo·카메라·PLC 진단을 실행합니다. 모든 결과는 safe_to_operate=False 입니다."
@@ -1880,6 +2019,18 @@ class OperatorWindow(QMainWindow):
         self.hailo_health_label.setWordWrap(True)
         self.hailo_health_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         body.addWidget(self.hailo_health_label)
+        hailo_controls = QHBoxLayout()
+        hailo_controls.setSpacing(8)
+        self.hailo_holder_kill_button = QPushButton("고아 프로세스 종료")
+        self.hailo_holder_kill_button.setProperty("danger", "true")
+        self.hailo_holder_kill_button.setEnabled(False)
+        self.hailo_holder_kill_button.setToolTip(
+            "이 앱의 자식이 아닌 추론(Hailo)·증거 녹화(RTSP) 프로세스를 종료합니다. 죽은 UI가 남긴 고아를 정리합니다."
+        )
+        self.hailo_holder_kill_button.clicked.connect(self._terminate_hailo_holders)
+        hailo_controls.addWidget(self.hailo_holder_kill_button)
+        hailo_controls.addStretch(1)
+        body.addLayout(hailo_controls)
         self.system_test_log = QPlainTextEdit()
         self.system_test_log.setObjectName("testLog")
         self.system_test_log.setReadOnly(True)
@@ -2234,6 +2385,8 @@ class OperatorWindow(QMainWindow):
         elif label == "주차 프로세스 테스트":
             self._refresh_driver_display(apply_layout=False)
             self.driver_preview.restore_presentation()
+        elif label == "카메라 캘리브레이션":
+            self._refresh_calibration_page()
         self.update()
 
     def _adopt_camera_area(self, page: QWidget, layout_mode: str) -> None:
@@ -2278,6 +2431,28 @@ class OperatorWindow(QMainWindow):
             self.hailo_health_label.setText(
                 f"Hailo 장치 상태 ({stamp} 기준)\n" + "\n".join(snapshot.detail_lines())
             )
+        if hasattr(self, "hailo_holder_kill_button"):
+            self.hailo_holder_kill_button.setEnabled(bool(snapshot.foreign_holders))
+
+    def _terminate_hailo_holders(self, checked: bool = False) -> None:
+        """Kill orphaned Hailo holders (never this app's own children). Diagnostic only."""
+        del checked
+        if not self._operator_unlocked:
+            return
+        snapshot = self._hailo_health_snapshot
+        holders = snapshot.foreign_holders if snapshot is not None else ()
+        if not holders:
+            self.warning_label.setText("종료할 고아 프로세스가 없습니다.")
+            return
+        from towersightai.inference.hailo_health import terminate_foreign_holders
+
+        handled = terminate_foreign_holders(holders)
+        listed = ", ".join(str(pid) for pid in handled) or "없음"
+        message = f"고아 프로세스 종료 요청: PID {listed}. 다음 상태 갱신에서 확인됩니다"
+        self.warning_label.setText(f"{message}. 진단 전용이며 최종 OK는 차단됩니다.")
+        if hasattr(self, "system_test_log"):
+            self.system_test_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        self.hailo_holder_kill_button.setEnabled(False)
 
     def _run_system_test(self, test_id: str) -> None:
         if not self._operator_unlocked:
@@ -2413,23 +2588,6 @@ class OperatorWindow(QMainWindow):
                 self._driver_state_override = None
                 self._refresh_driver_display()
         self._refresh_user_mode_labels()
-        if (
-            self._detection_enabled
-            and not self._detection_legacy_mode
-            and self._detection_load_started_at is not None
-            and self._detection_first_inference_seconds is None
-        ):
-            elapsed = time.monotonic() - self._detection_load_started_at
-            self.ai_detection_label.setText(
-                _ai_detection_label(self._detection_camera_ids, self._detection_event_counts, loading_seconds=elapsed)
-            )
-            if elapsed >= FIRST_INFERENCE_TIMEOUT_SECONDS and not self._detection_unconfirmed_reported:
-                self._detection_unconfirmed_reported = True
-                self._detection_failed = True
-                self.model_status_label.setText(f"추론 미확인: {self._detection_model_label}")
-                self.warning_label.setText(
-                    f"AI 추론 실패: {self._detection_model_label} 첫 detection 이벤트가 {FIRST_INFERENCE_TIMEOUT_SECONDS:.0f}s 내 확인되지 않았습니다."
-                )
         if self._purpose_task_enabled and self._purpose_task_started_at is not None and self._purpose_task_first_inference_seconds is None:
             elapsed = time.monotonic() - self._purpose_task_started_at
             self.ai_detection_label.setText(
@@ -2464,15 +2622,30 @@ class OperatorWindow(QMainWindow):
             or self._purpose_workers
             or self._pending_user_purpose_task_id
             or self._purpose_task_enabled
-            or self._detection_enabled
         ):
             return
-        if time.monotonic() - self._engine_last_start_attempt < 10.0:
+        now = time.monotonic()
+        if now - self._engine_last_start_attempt < self._monitoring_cooldown_seconds():
             return
-        if not _streaming_camera_ids(self.settings, self._runtime_camera_status):
+        streaming = _streaming_camera_ids(self.settings, self._runtime_camera_status)
+        if streaming != self._monitoring_streaming_set:
+            self._monitoring_streaming_set = streaming
+            self._monitoring_streaming_since = now
+        if not streaming:
             return
-        self._engine_last_start_attempt = time.monotonic()
+        if now - self._monitoring_streaming_since < MONITORING_CAMERA_SETTLE_SECONDS:
+            return
+        self._engine_last_start_attempt = now
         self._start_purpose_inference(PURPOSE_PROCESS_MONITORING)
+
+    def _monitoring_cooldown_seconds(self) -> float:
+        failures = self._monitoring_consecutive_failures
+        if failures <= 0:
+            return MONITORING_START_COOLDOWN_SECONDS
+        return min(
+            MONITORING_FAILURE_COOLDOWN_MAX_SECONDS,
+            MONITORING_FAILURE_COOLDOWN_SECONDS * (2 ** (failures - 1)),
+        )
 
     def _engine_display_allowed(self) -> bool:
         """The engine drives the driver display unless a test/simulation owns it."""
@@ -2507,6 +2680,19 @@ class OperatorWindow(QMainWindow):
                         event.plate_number,
                         confidence=event.confidence,
                         simulated=False,
+                        recognized=event.recognized,
+                        reads=event.reads,
+                        reason=event.reason,
+                    )
+                elif event.kind == "plate_attempt":
+                    self._record_raw(
+                        self._raw_data_manager.record_plate_attempt,
+                        event.plate_number,
+                        confidence=event.confidence,
+                        camera_id=event.camera_id or "front",
+                        accepted=event.accepted,
+                        reason=event.reason,
+                        plate_bbox=event.bbox,
                     )
         if output.lpr_control == "start":
             self._start_periodic_lpr()
@@ -2906,7 +3092,6 @@ class OperatorWindow(QMainWindow):
         self._driver_simulated = True
         self._pending_user_purpose_task_id = ""
         self._stop_purpose_inference()
-        self._stop_ai_detection()
         self._stop_front_camera_lpr()
         self._reset_person_alert()
         if self._raw_data_manager is not None:
@@ -2987,9 +3172,6 @@ class OperatorWindow(QMainWindow):
         self._camera_rotations[camera_id] = next_rotation
         self._refresh_rotation_controls()
         self._restart_camera_capture()
-        if self._detection_enabled:
-            self._stop_ai_detection()
-            self.ai_detection_label.setText("AI 추론 OFF: 회전 변경")
         if self._purpose_task_enabled:
             self._stop_purpose_inference()
             self.ai_detection_label.setText("목적 추론 OFF: 회전 변경")
@@ -3036,6 +3218,8 @@ class OperatorWindow(QMainWindow):
                 widget.hide()
         if mode == "front":
             layout = ((CameraRole.front, 0, 0, 1, 1),)
+        elif mode.startswith("single:"):
+            layout = ((CameraRole(mode.split(":", 1)[1]), 0, 0, 1, 1),)
         elif not self.model.birdview_available:
             layout = (
                 (CameraRole.front, 0, 0, 2, 1),
@@ -3057,7 +3241,7 @@ class OperatorWindow(QMainWindow):
             widget.setMaximumWidth(16777215)
             self.grid.addWidget(widget, row, col, row_span, col_span)
             widget.show()
-        if mode == "front":
+        if mode == "front" or mode.startswith("single:"):
             self.grid.setColumnStretch(0, 1)
             self.grid.setColumnStretch(1, 0)
         elif not self.model.birdview_available:
@@ -3068,113 +3252,6 @@ class OperatorWindow(QMainWindow):
             self.grid.setColumnStretch(1, 1)
         self.grid.setRowStretch(0, 1)
         self.grid.setRowStretch(1, 0 if mode == "front" else 1)
-
-    def _toggle_ai_detection(self, checked: bool = False) -> None:
-        del checked
-        if self._detection_enabled:
-            self._stop_ai_detection()
-            return
-        self._start_ai_detection(legacy_mode=False)
-
-    def _toggle_legacy_ai_detection(self, checked: bool = False) -> None:
-        del checked
-        if self._detection_enabled:
-            self._stop_ai_detection()
-            return
-        self._start_ai_detection(legacy_mode=True)
-
-    def _start_ai_detection(self, *, legacy_mode: bool = False) -> None:
-        if self.settings is None:
-            self._set_detection_buttons_checked(False)
-            self.warning_label.setText("설정이 없어 AI 추론을 시작할 수 없습니다.")
-            return
-        if self._purpose_task_enabled:
-            self._stop_purpose_inference()
-        if self._detection_workers:
-            self._set_detection_buttons_checked(False)
-            self.warning_label.setText("AI 추론 종료 처리 중입니다. 잠시 후 다시 시도해 주세요.")
-            return
-        streaming_camera_ids = _streaming_camera_ids(self.settings, self._runtime_camera_status)
-        if not streaming_camera_ids:
-            self._set_detection_buttons_checked(False)
-            self._set_detection_button_texts()
-            self.ai_detection_label.setText("AI 추론 OFF")
-            self.warning_label.setText("정상 스트리밍 중인 카메라가 없어 AI 추론을 시작하지 않습니다.")
-            return
-        self._detection_enabled = True
-        self._detection_legacy_mode = legacy_mode
-        self._detection_camera_ids = streaming_camera_ids
-        if self._raw_data_manager is not None:
-            self._record_raw(
-                self._raw_data_manager.record_ai_started,
-                "legacy_detection" if legacy_mode else "general_detection",
-                streaming_camera_ids,
-                simulated=self._driver_simulated,
-            )
-        self._detection_event_counts = {camera_id: 0 for camera_id in streaming_camera_ids}
-        self._detection_load_started_at = time.monotonic()
-        self._detection_first_inference_seconds = None
-        self._detection_unconfirmed_reported = False
-        self._detection_failed = False
-        selected_hef = Path(self.settings.hailo_hef_path) if legacy_mode else Path(self._selected_hailo_model_path or self.settings.hailo_hef_path)
-        self._detection_model_label = selected_hef.name
-        self._detection_log_path = None
-        if legacy_mode:
-            self.model_status_label.setText(f"이전 방식: {self._detection_model_label}")
-            self.ai_detection_label.setText(_legacy_ai_detection_label(streaming_camera_ids, self._detection_event_counts))
-            self.warning_label.setText("이전 방식 AI Detection 실행 중: " + ", ".join(streaming_camera_ids))
-        else:
-            self.model_status_label.setText(f"모델 로드 중: {self._detection_model_label}")
-            self.ai_detection_label.setText(_ai_detection_label(streaming_camera_ids, self._detection_event_counts, loading_seconds=0.0))
-            self.warning_label.setText(f"AI 모델 로드 중: {self._detection_model_label}")
-        self._set_detection_buttons_checked(True, legacy_mode=legacy_mode)
-        self._set_detection_button_texts(legacy_mode=legacy_mode)
-        thread = QThread(self)
-        worker = LiveDetectionWorker(
-            self.settings,
-            streaming_camera_ids,
-            camera_rotations={camera_id: self._camera_rotations.get(camera_id, 0) for camera_id in streaming_camera_ids},
-            hef_path=None if legacy_mode else self._selected_hailo_model_path,
-            legacy_mode=legacy_mode,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.detections_ready.connect(self._set_camera_detections)
-        worker.status_changed.connect(self._set_detection_status)
-        if not legacy_mode:
-            worker.detection_started.connect(self._set_detection_started)
-            worker.first_inference_ready.connect(self._set_first_inference_ready)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(lambda worker=worker, thread=thread: self._cleanup_detection_worker(thread, worker))
-        self._detection_threads.append(thread)
-        self._detection_workers.append(worker)
-        thread.start()
-
-    def _stop_ai_detection(self) -> None:
-        raw_task_id = "legacy_detection" if self._detection_legacy_mode else "general_detection"
-        if self._raw_data_manager is not None:
-            self._record_raw(self._raw_data_manager.record_ai_stopped, raw_task_id)
-        self._detection_enabled = False
-        self._detection_legacy_mode = False
-        self._detection_camera_ids = ()
-        self._detection_event_counts = {}
-        self._detection_load_started_at = None
-        self._detection_first_inference_seconds = None
-        self._detection_model_label = ""
-        self._detection_log_path = None
-        self._detection_unconfirmed_reported = False
-        self._detection_failed = False
-        self._set_detection_buttons_checked(False)
-        self._set_detection_button_texts()
-        if hasattr(self, "ai_detection_label"):
-            self.ai_detection_label.setText("AI 추론 OFF")
-        if hasattr(self, "model_status_label"):
-            selected_text = self._selected_hailo_model_path.name if self._selected_hailo_model_path is not None else "없음"
-            self.model_status_label.setText(f"모델 선택: {selected_text}")
-        for worker in tuple(self._detection_workers):
-            worker.stop()
-        for widget in self._all_camera_surfaces():
-            widget.clear_detections()
 
     def _toggle_purpose_inference(self, task_id: str) -> None:
         if self._purpose_task_enabled and self._purpose_task_id == task_id:
@@ -3393,6 +3470,429 @@ class OperatorWindow(QMainWindow):
             self._nas_test_running = False
             self._refresh_nas_test_button()
 
+    def _nas_transfer_target_text(self) -> str:
+        config = self.settings.raw_storage if self.settings is not None else None
+        if config is None or not config.nas_folder:
+            return "저장 위치: NAS 설정 없음 (.env의 SYNOLOGY_NAS_* 확인)"
+        from towersightai.storage.file_transfer import remote_file_transfer_dir
+
+        return f"저장 위치: {config.nas_host}:{remote_file_transfer_dir(config)}"
+
+    def _pick_nas_transfer_files(self, checked: bool = False) -> None:
+        del checked
+        if not self._operator_unlocked or self._nas_transfer_running:
+            return
+        start_dir = str(self._nas_transfer_files[-1].parent) if self._nas_transfer_files else str(Path.home())
+        selected, _filter = QFileDialog.getOpenFileNames(self, "NAS로 보낼 파일 선택", start_dir)
+        if selected:
+            self._add_nas_transfer_files([Path(item) for item in selected])
+
+    def _add_nas_transfer_files(self, files: list[Path]) -> None:
+        """Append files to the pending list (duplicates by path are ignored)."""
+        existing = {path.resolve(strict=False) for path in self._nas_transfer_files}
+        for path in files:
+            resolved = Path(path).resolve(strict=False)
+            if resolved in existing:
+                continue
+            existing.add(resolved)
+            self._nas_transfer_files.append(Path(path))
+        self._render_nas_transfer_files()
+
+    def _clear_nas_transfer_files(self, checked: bool = False) -> None:
+        del checked
+        if self._nas_transfer_running:
+            return
+        self._nas_transfer_files = []
+        self._render_nas_transfer_files()
+
+    def _render_nas_transfer_files(self) -> None:
+        widget = getattr(self, "nas_transfer_list", None)
+        if widget is not None:
+            widget.clear()
+            for path in self._nas_transfer_files:
+                size = path.stat().st_size if path.is_file() else 0
+                widget.addItem(f"{path.name}  ({size:,}B)  {path}")
+        label = getattr(self, "nas_transfer_result_label", None)
+        if label is not None and not self._nas_transfer_running:
+            count = len(self._nas_transfer_files)
+            label.setText(f"선택된 파일 {count}개" if count else "보낼 파일을 선택해 주세요.")
+        self._refresh_nas_transfer_buttons()
+
+    def _start_nas_file_transfer(self, checked: bool = False) -> None:
+        """Upload the selected files into the NAS transfer folder. It never authorizes final OK."""
+        del checked
+        if not self._operator_unlocked:
+            return
+        if self._nas_transfer_running:
+            self._set_nas_transfer_status("NAS 파일 전송이 이미 실행 중입니다")
+            return
+        config = self.settings.raw_storage if self.settings is not None else None
+        if config is None or not config.nas_host:
+            self.instruction_label.setText("NAS 파일 전송 불가")
+            self._set_nas_transfer_status("NAS 설정이 없습니다. .env의 SYNOLOGY_NAS_* 값을 확인해 주세요")
+            return
+        if not self._nas_transfer_files:
+            self._set_nas_transfer_status("보낼 파일이 없습니다. 먼저 파일을 선택해 주세요")
+            return
+
+        self._nas_transfer_running = True
+        self._refresh_nas_transfer_buttons()
+        self._set_nas_transfer_status(f"NAS 파일 전송: {len(self._nas_transfer_files)}개 파일 업로드 시작")
+        thread = QThread(self)
+        worker = NasFileTransferWorker(config, tuple(self._nas_transfer_files))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.status_changed.connect(self._set_nas_transfer_status)
+        worker.result_ready.connect(self._set_nas_transfer_result)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(
+            lambda worker=worker, thread=thread: self._cleanup_nas_transfer_worker(thread, worker)
+        )
+        self._nas_transfer_threads.append(thread)
+        self._nas_transfer_workers.append(worker)
+        thread.start()
+
+    def _set_nas_transfer_status(self, message: str) -> None:
+        self.warning_label.setText(f"{message}. 파일 중계 전용이며 최종 OK는 차단됩니다.")
+        if hasattr(self, "nas_transfer_result_label"):
+            self.nas_transfer_result_label.setText(message)
+
+    def _set_nas_transfer_result(self, result: NasFileTransferResult) -> None:
+        if result.ok:
+            self.instruction_label.setText(f"NAS 파일 전송 완료: {result.remote_dir}")
+            self._set_nas_transfer_status(result.summary)
+        else:
+            self.instruction_label.setText("NAS 파일 전송 실패")
+            self._set_nas_transfer_status(f"{result.summary} · {result.error}")
+        if hasattr(self, "nas_transfer_history"):
+            stamp = datetime.now().strftime("%H:%M:%S")
+            if result.ok:
+                names = ", ".join(artifact.relative_path for artifact in result.artifacts)
+                self.nas_transfer_history.appendPlainText(
+                    f"[{stamp}] 성공 {result.remote_dir} · {result.summary} · {names}"
+                )
+            else:
+                self.nas_transfer_history.appendPlainText(f"[{stamp}] 실패 {result.error} · {result.summary}")
+        if result.ok:
+            # Sent files leave the pending list so a second click does not re-upload them.
+            self._nas_transfer_files = []
+            widget = getattr(self, "nas_transfer_list", None)
+            if widget is not None:
+                widget.clear()
+
+    def _refresh_nas_transfer_buttons(self) -> None:
+        idle = not self._nas_transfer_running
+        for name in ("nas_transfer_pick_button", "nas_transfer_clear_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(idle)
+        send = getattr(self, "nas_transfer_send_button", None)
+        if send is not None:
+            send.setEnabled(idle and bool(self._nas_transfer_files))
+
+    def _stop_nas_file_transfer(self) -> None:
+        for worker in tuple(self._nas_transfer_workers):
+            worker.stop()
+
+    def _cleanup_nas_transfer_worker(self, thread: QThread, worker: NasFileTransferWorker) -> None:
+        if thread in self._nas_transfer_threads:
+            self._nas_transfer_threads.remove(thread)
+        if worker in self._nas_transfer_workers:
+            self._nas_transfer_workers.remove(worker)
+        if not self._nas_transfer_workers:
+            self._nas_transfer_running = False
+            self._refresh_nas_transfer_buttons()
+
+    # ---- camera intrinsics calibration (operator console only) ----------------------------
+
+    def _populate_calibration_cameras(self) -> None:
+        box = getattr(self, "calibration_camera_box", None)
+        if box is None:
+            return
+        box.blockSignals(True)
+        box.clear()
+        if self.settings is not None:
+            preferred = self.settings.vehicle_envelope.front_left_role
+            for camera in self.settings.active_cameras:
+                box.addItem(f"{camera.id} ({camera.role.value})", camera.role.value)
+            index = box.findData(preferred.value)
+            if index >= 0:
+                box.setCurrentIndex(index)
+        else:
+            box.addItem("front (front)", CameraRole.front.value)
+        box.blockSignals(False)
+        self._sync_calibration_layout()
+
+    def _calibration_role(self) -> CameraRole:
+        box = getattr(self, "calibration_camera_box", None)
+        data = box.currentData() if box is not None else None
+        try:
+            return CameraRole(data) if data else CameraRole.front
+        except ValueError:
+            return CameraRole.front
+
+    def _calibration_camera(self):  # noqa: ANN202 - CameraConfig | None
+        if self.settings is None:
+            return None
+        role = self._calibration_role()
+        for camera in self.settings.active_cameras:
+            if camera.role is role:
+                return camera
+        return None
+
+    def _sync_calibration_layout(self) -> None:
+        self._camera_page_layouts["카메라 캘리브레이션"] = f"single:{self._calibration_role().value}"
+
+    def _on_calibration_camera_changed(self, _index: int = 0) -> None:
+        if self._calib_running:
+            # The session is bound to one camera; switching would mix intrinsics.
+            self._stop_calibration_session()
+        self._sync_calibration_layout()
+        page = self.operator_pages.get("카메라 캘리브레이션")
+        if page is not None and self.operator_workspace_stack.currentWidget() is page:
+            self._adopt_camera_area(page, self._camera_page_layouts["카메라 캘리브레이션"])
+
+    def _refresh_calibration_page(self) -> None:
+        self._sync_calibration_layout()
+        page = self.operator_pages.get("카메라 캘리브레이션")
+        if page is not None:
+            self._adopt_camera_area(page, self._camera_page_layouts["카메라 캘리브레이션"])
+        self._refresh_calibration_buttons()
+
+    def _refresh_calibration_buttons(self) -> None:
+        running, calibrating = self._calib_running, self._calib_calibrating
+        poses_left = self._calib_pose_index < len(CAPTURE_POSES)
+        for name, enabled in (
+            ("calibration_start_button", not running and not calibrating),
+            ("calibration_capture_button", running and poses_left and not calibrating),
+            ("calibration_skip_button", running and poses_left and not calibrating),
+            ("calibration_run_button", len(self._calib_samples) >= CALIBRATION_MIN_SAMPLES and not calibrating),
+            ("calibration_stop_button", running and not calibrating),
+            ("calibration_camera_box", not running and not calibrating),
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _set_calibration_status(self, message: str) -> None:
+        if hasattr(self, "calibration_status_label"):
+            self.calibration_status_label.setText(message)
+        self.warning_label.setText(f"{message}. 측정 전용이며 최종 OK는 차단됩니다.")
+
+    def _log_calibration(self, message: str) -> None:
+        if hasattr(self, "calibration_history"):
+            self.calibration_history.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+    def _show_calibration_pose(self) -> None:
+        label = getattr(self, "calibration_instruction_label", None)
+        if label is None:
+            return
+        if self._calib_pose_index >= len(CAPTURE_POSES):
+            label.setText(f"모든 자세 완료 ({len(self._calib_samples)}장). 측정 실행을 누르세요.")
+            return
+        pose = CAPTURE_POSES[self._calib_pose_index]
+        label.setText(f"[{self._calib_pose_index + 1}/{len(CAPTURE_POSES)}] {pose.instruction} — {pose.hint}")
+
+    def _start_calibration_session(self, checked: bool = False) -> None:
+        del checked
+        if not self._operator_unlocked or self._calib_running or self._calib_calibrating:
+            return
+        camera = self._calibration_camera()
+        if camera is None:
+            self._set_calibration_status("설정된 카메라가 없어 캘리브레이션을 시작할 수 없습니다")
+            return
+        widget = self.camera_widgets.get(camera.role)
+        if widget is None or self._runtime_camera_status.get(camera.id) != "정상 수신":
+            self._set_calibration_status(f"{camera.id} 카메라가 수신 중이 아닙니다. 전체 카메라에서 수신을 확인해 주세요")
+            return
+        root = (
+            self.settings.calibration_path.parent / "intrinsics" if self.settings is not None else DEFAULT_INTRINSICS_ROOT
+        )
+        self._calib_store = IntrinsicsSessionStore(root, camera.id)
+        self._calib_samples = []
+        self._calib_pose_index = 0
+        self._calib_camera_id = camera.id
+        self._calib_hits = 0
+        self._calib_hold_until = 0.0
+        self._calib_capture_requested = False
+        self._calib_running = True
+        self._ensure_calibration_detect_worker()
+        timer = QTimer(self)
+        timer.setInterval(CALIBRATION_DETECT_INTERVAL_MS)
+        timer.timeout.connect(self._calibration_tick)
+        self._calib_timer = timer
+        timer.start()
+        self._show_calibration_pose()
+        self._set_calibration_status(f"{camera.id} 촬영 세션 시작. 체커보드를 지시된 자세로 들어 주세요")
+        self._log_calibration(f"세션 시작 camera={camera.id} dir={self._calib_store.session_dir}")
+        self._refresh_calibration_buttons()
+
+    def _ensure_calibration_detect_worker(self) -> None:
+        if self._calib_detect_worker is not None:
+            return
+        thread = QThread(self)
+        worker = CheckerboardDetectWorker(self._calib_spec)
+        worker.moveToThread(thread)
+        worker.detected.connect(self._on_checkerboard_detected)
+        self._calib_detect_thread = thread
+        self._calib_detect_worker = worker
+        thread.start()
+
+    def _calibration_tick(self) -> None:
+        if not self._calib_running or self._calib_detect_busy or self._calib_detect_worker is None:
+            return
+        if self._calib_pose_index >= len(CAPTURE_POSES):
+            return
+        if time.monotonic() < self._calib_hold_until:
+            return
+        camera = self._calibration_camera()
+        widget = self.camera_widgets.get(camera.role) if camera is not None else None
+        frame = widget.current_frame() if widget is not None else None
+        if frame is None:
+            return
+        self._calib_detect_busy = True
+        self._calib_token += 1
+        bgr = _qimage_to_bgr(frame)
+        # Signal → queued slot so the detector runs on its own thread.
+        self._calib_detect_worker.detect_requested.emit(self._calib_token, bgr)
+
+    def _on_checkerboard_detected(self, token: int, bgr, detection) -> None:  # noqa: ANN001
+        self._calib_detect_busy = False
+        if not self._calib_running or token != self._calib_token:
+            return
+        camera = self._calibration_camera()
+        widget = self.camera_widgets.get(camera.role) if camera is not None else None
+        if detection is None:
+            self._calib_hits = 0
+            if widget is not None:
+                widget.set_marker_points(())
+            self._set_calibration_status("체커보드가 보이지 않습니다. 보드 전체가 화면에 들어오게 해 주세요")
+            return
+        if widget is not None:
+            widget.set_marker_points(detection.normalized)
+        self._calib_hits += 1
+        auto = getattr(self, "calibration_auto_box", None)
+        auto_enabled = auto.isChecked() if auto is not None else True
+        if self._calib_capture_requested or (auto_enabled and self._calib_hits >= CALIBRATION_STEADY_HITS):
+            self._accept_calibration_sample(bgr, detection)
+        else:
+            self._set_calibration_status(
+                f"체커보드 인식됨 ({self._calib_hits}/{CALIBRATION_STEADY_HITS}), 잠시 그대로 유지해 주세요"
+            )
+
+    def _accept_calibration_sample(self, bgr, detection: CheckerboardDetection) -> None:  # noqa: ANN001
+        if self._calib_store is None or self._calib_pose_index >= len(CAPTURE_POSES):
+            return
+        pose = CAPTURE_POSES[self._calib_pose_index]
+        try:
+            sample = self._calib_store.save_sample(len(self._calib_samples) + 1, pose.key, bgr, detection)
+        except OSError as exc:
+            self._set_calibration_status(f"프레임 저장 실패: {exc}")
+            return
+        self._calib_samples.append(sample)
+        self._calib_capture_requested = False
+        self._calib_hits = 0
+        self._calib_hold_until = time.monotonic() + CALIBRATION_HOLD_SECONDS
+        self._log_calibration(
+            f"촬영 {len(self._calib_samples)} pose={pose.key} coverage={detection.coverage:.2f} {sample.image_path.name}"
+        )
+        self._calib_pose_index += 1
+        self._show_calibration_pose()
+        if self._calib_pose_index >= len(CAPTURE_POSES):
+            self._set_calibration_status(f"촬영 완료 {len(self._calib_samples)}장. 측정 실행을 누르세요")
+        else:
+            self._set_calibration_status(f"{len(self._calib_samples)}장 저장. 다음 자세로 이동해 주세요")
+        self._refresh_calibration_buttons()
+
+    def _request_calibration_capture(self, checked: bool = False) -> None:
+        del checked
+        if self._calib_running:
+            self._calib_capture_requested = True
+            self._calib_hold_until = 0.0
+            self._set_calibration_status("다음 인식 프레임을 저장합니다")
+
+    def _skip_calibration_pose(self, checked: bool = False) -> None:
+        del checked
+        if not self._calib_running or self._calib_pose_index >= len(CAPTURE_POSES):
+            return
+        skipped = CAPTURE_POSES[self._calib_pose_index]
+        self._calib_pose_index += 1
+        self._calib_hits = 0
+        self._log_calibration(f"건너뜀 pose={skipped.key}")
+        self._show_calibration_pose()
+        self._refresh_calibration_buttons()
+
+    def _run_calibration(self, checked: bool = False) -> None:
+        del checked
+        if not self._operator_unlocked or self._calib_calibrating or self._calib_store is None:
+            return
+        if len(self._calib_samples) < CALIBRATION_MIN_SAMPLES:
+            self._set_calibration_status(f"샘플 부족: {len(self._calib_samples)}/{CALIBRATION_MIN_SAMPLES}")
+            return
+        camera = self._calibration_camera()
+        rotation = camera.rotation_degrees if camera is not None else 0
+        self._calib_calibrating = True
+        self._stop_calibration_timer()
+        self._refresh_calibration_buttons()
+        self._set_calibration_status(f"{len(self._calib_samples)}장으로 측정 중")
+        thread = QThread(self)
+        worker = IntrinsicsCalibrateWorker(
+            self._calib_store,
+            tuple(self._calib_samples),
+            self._calib_spec,
+            camera_id=self._calib_camera_id,
+            rotation_degrees=rotation,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result_ready.connect(self._on_calibration_result)
+        worker.failed.connect(self._on_calibration_failed)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(lambda worker=worker, thread=thread: self._cleanup_calibration_worker(thread, worker))
+        self._calib_threads.append(thread)
+        self._calib_workers.append(worker)
+        thread.start()
+
+    def _on_calibration_result(self, result: IntrinsicsResult, result_path, latest_path) -> None:  # noqa: ANN001
+        self._set_calibration_status(f"측정 완료: {result.summary()} → {latest_path}")
+        self._log_calibration(f"측정 완료 {result.summary()} 저장 {latest_path} (reviewed=false)")
+        self.instruction_label.setText(f"카메라 캘리브레이션 측정 완료 ({result.quality})")
+
+    def _on_calibration_failed(self, error: str) -> None:
+        self._set_calibration_status(f"측정 실패: {error}")
+        self._log_calibration(f"측정 실패 {error}")
+
+    def _cleanup_calibration_worker(self, thread: QThread, worker: IntrinsicsCalibrateWorker) -> None:
+        if thread in self._calib_threads:
+            self._calib_threads.remove(thread)
+        if worker in self._calib_workers:
+            self._calib_workers.remove(worker)
+        if not self._calib_workers:
+            self._calib_calibrating = False
+            self._calib_running = False
+            self._refresh_calibration_buttons()
+
+    def _stop_calibration_timer(self) -> None:
+        if self._calib_timer is not None:
+            self._calib_timer.stop()
+            self._calib_timer.deleteLater()
+            self._calib_timer = None
+
+    def _stop_calibration_session(self, checked: bool = False) -> None:
+        del checked
+        self._stop_calibration_timer()
+        if self._calib_running:
+            self._log_calibration(f"세션 종료 samples={len(self._calib_samples)}")
+        self._calib_running = False
+        self._calib_detect_busy = False
+        camera = self._calibration_camera()
+        widget = self.camera_widgets.get(camera.role) if camera is not None else None
+        if widget is not None:
+            widget.set_marker_points(())
+        if hasattr(self, "calibration_instruction_label") and not self._calib_calibrating:
+            self.calibration_instruction_label.setText("촬영 시작을 누르면 첫 번째 자세를 안내합니다.")
+        self._refresh_calibration_buttons()
+
     def _start_purpose_inference(self, task_id: str) -> None:
         if self.settings is None:
             self._set_purpose_buttons_checked(False)
@@ -3410,8 +3910,6 @@ class OperatorWindow(QMainWindow):
                 f"{previous} 중지 중입니다. 종료되면 {requested.label} 추론을 자동 시작합니다. 최종 OK는 차단됩니다."
             )
             return
-        if self._detection_enabled:
-            self._stop_ai_detection()
         spec = PURPOSE_TASK_SPECS[task_id]
         camera_ids = self._purpose_camera_ids(task_id)
         if task_id != PURPOSE_LPR_IMAGE and not camera_ids:
@@ -3425,7 +3923,6 @@ class OperatorWindow(QMainWindow):
         self._purpose_task_started_at = time.monotonic()
         self._purpose_task_first_inference_seconds = None
         self._purpose_lpr_results = ()
-        self._detection_enabled = False
         self._detection_failed = False
         self._detection_camera_ids = camera_ids
         if self._raw_data_manager is not None:
@@ -3442,8 +3939,6 @@ class OperatorWindow(QMainWindow):
         if hasattr(self, "user_warning_label"):
             self.user_warning_label.setText(f"{spec.label} 실행 준비 중입니다. 최종 OK는 차단됩니다.")
             self._refresh_user_mode_labels()
-        self._set_detection_buttons_checked(False)
-        self._set_detection_button_texts()
         self._set_purpose_buttons_checked(True, task_id=task_id)
         self._set_purpose_button_texts()
 
@@ -3498,6 +3993,8 @@ class OperatorWindow(QMainWindow):
 
     def _set_purpose_first_inference_ready(self, elapsed_seconds: float) -> None:
         self._purpose_task_first_inference_seconds = elapsed_seconds
+        if self._purpose_task_id == PURPOSE_PROCESS_MONITORING:
+            self._monitoring_consecutive_failures = 0
         self.ai_detection_label.setText(
             _purpose_detection_label(
                 self._purpose_task_label,
@@ -3591,6 +4088,13 @@ class OperatorWindow(QMainWindow):
                     raw_task_id,
                     reason="worker_finished",
                 )
+            if raw_task_id == PURPOSE_PROCESS_MONITORING:
+                # Count the cooldown from the end of the run; escalate on consecutive failures.
+                self._engine_last_start_attempt = time.monotonic()
+                if failed:
+                    self._monitoring_consecutive_failures += 1
+                elif self._purpose_task_first_inference_seconds is not None:
+                    self._monitoring_consecutive_failures = 0
             self._purpose_task_enabled = False
             self._purpose_task_id = ""
             self._purpose_task_label = ""
@@ -3611,12 +4115,18 @@ class OperatorWindow(QMainWindow):
             self._pending_user_purpose_task_id = ""
             self._start_purpose_inference(pending_task_id)
 
+    def _purpose_buttons(self) -> tuple[tuple[str, QPushButton], ...]:
+        pairs = list(self.purpose_task_buttons.items())
+        for task_id, buttons in self.purpose_task_extra_buttons.items():
+            pairs.extend((task_id, button) for button in buttons)
+        return tuple(pairs)
+
     def _set_purpose_buttons_checked(self, checked: bool, *, task_id: str = "") -> None:
-        for current_task_id, button in self.purpose_task_buttons.items():
+        for current_task_id, button in self._purpose_buttons():
             button.setChecked(checked and current_task_id == task_id)
 
     def _set_purpose_button_texts(self) -> None:
-        for task_id, button in self.purpose_task_buttons.items():
+        for task_id, button in self._purpose_buttons():
             label = PURPOSE_TASK_SPECS[task_id].label
             running = self._purpose_task_enabled and self._purpose_task_id == task_id
             button.setText(f"{label} 중지" if running else f"{label} 시작")
@@ -3627,52 +4137,6 @@ class OperatorWindow(QMainWindow):
             return
         button.setChecked(self._front_lpr_enabled)
         button.setText("정면 카메라 인식 중…" if self._front_lpr_enabled else "정면 카메라 인식")
-
-    def _cleanup_detection_worker(self, thread: QThread, worker: LiveDetectionWorker) -> None:
-        if thread in self._detection_threads:
-            self._detection_threads.remove(thread)
-        if worker in self._detection_workers:
-            self._detection_workers.remove(worker)
-        if self._detection_enabled and not self._detection_workers:
-            failed = self._detection_failed
-            legacy_mode = self._detection_legacy_mode
-            if self._raw_data_manager is not None:
-                self._record_raw(
-                    self._raw_data_manager.record_ai_stopped,
-                    "legacy_detection" if legacy_mode else "general_detection",
-                    reason="worker_finished",
-                )
-            self._detection_enabled = False
-            self._detection_legacy_mode = False
-            self._detection_camera_ids = ()
-            self._detection_event_counts = {}
-            self._detection_load_started_at = None
-            self._detection_first_inference_seconds = None
-            self._detection_model_label = ""
-            self._detection_log_path = None
-            self._detection_unconfirmed_reported = False
-            self._set_detection_buttons_checked(False)
-            self._set_detection_button_texts()
-            if failed and hasattr(self, "ai_detection_label"):
-                self.ai_detection_label.setText("이전 AI Detection 오류" if legacy_mode else "AI 추론 오류")
-            if hasattr(self, "model_status_label"):
-                if failed:
-                    failed_model = Path(self.settings.hailo_hef_path).name if legacy_mode and self.settings is not None else "모델 미확인"
-                    if worker.hef_path is not None:
-                        failed_model = worker.hef_path.name
-                    self.model_status_label.setText(f"추론 실패: {failed_model}")
-                else:
-                    selected_text = self._selected_hailo_model_path.name if self._selected_hailo_model_path is not None else "없음"
-                    self.model_status_label.setText(f"모델 선택: {selected_text}")
-
-    def _set_detection_buttons_checked(self, checked: bool, *, legacy_mode: bool = False) -> None:
-        if hasattr(self, "legacy_ai_detection_button"):
-            self.legacy_ai_detection_button.setChecked(checked and legacy_mode)
-
-    def _set_detection_button_texts(self, *, legacy_mode: bool = False) -> None:
-        if hasattr(self, "legacy_ai_detection_button"):
-            text = "이전 AI Detection ON" if self._detection_enabled and legacy_mode else "이전 AI Detection"
-            self.legacy_ai_detection_button.setText(text)
 
 def _fresh_detections(detections: tuple[DetectionEvent, ...]) -> tuple[DetectionEvent, ...]:
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=DETECTION_TTL_SECONDS)
@@ -3876,36 +4340,6 @@ def _detection_color(label: str) -> QColor:
 
 def _detection_label(event: DetectionEvent) -> str:
     return f"{event.label} {event.confidence:.2f}"
-
-
-def _ai_detection_label(
-    camera_ids: tuple[str, ...],
-    event_counts: dict[str, int] | None = None,
-    *,
-    loading_seconds: float | None = None,
-    first_inference_seconds: float | None = None,
-) -> str:
-    if not camera_ids:
-        return "AI 추론 OFF"
-    if event_counts is None:
-        label = "AI 추론 ON: " + ", ".join(camera_ids)
-    else:
-        parts = [f"{camera_id}({event_counts.get(camera_id, 0)})" for camera_id in camera_ids]
-        label = "AI 추론 ON: " + ", ".join(parts)
-    if first_inference_seconds is not None:
-        return f"{label} / first inference {first_inference_seconds:.1f}s"
-    if loading_seconds is not None:
-        return f"{label} / loading {loading_seconds:.1f}s"
-    return label
-
-
-def _legacy_ai_detection_label(camera_ids: tuple[str, ...], event_counts: dict[str, int] | None = None) -> str:
-    if not camera_ids:
-        return "이전 AI Detection OFF"
-    if event_counts is None:
-        return "이전 AI Detection ON: " + ", ".join(camera_ids)
-    parts = [f"{camera_id}({event_counts.get(camera_id, 0)})" for camera_id in camera_ids]
-    return "이전 AI Detection ON: " + ", ".join(parts)
 
 
 def _purpose_detection_label(

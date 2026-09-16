@@ -12,3 +12,8 @@ hailort*.log
 models/
 refers/SPSS_ParkIO_안내자료.pdf
 data/operator-settings.json
+data/field-media/*
+!data/field-media/README.md
+data/calibration/intrinsics/
+data/calibration/checkerboard/
+data/analysis/

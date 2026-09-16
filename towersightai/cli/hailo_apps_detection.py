@@ -5,6 +5,10 @@ import contextlib
 import io
 import json
 import os
+
+# Captured before the heavy Hailo/GStreamer imports: the parent UI can die during our multi-second
+# start-up, and a re-parented child (systemd --user, not pid 1) must notice that when it arms.
+STARTUP_PPID = os.getppid()
 import re
 import sys
 import threading
@@ -361,11 +365,94 @@ def main() -> int:
     if _all_sources_are_files(cameras):
         app.on_eos = app.shutdown
     diagnostics.start()
+    arm_parent_death_signal()
+    watchdog = start_parent_watchdog(lambda: _shutdown_orphaned(app))
     try:
         app.run()
     finally:
+        watchdog.set()
         diagnostics.stop()
     return 0
+
+
+def arm_parent_death_signal(
+    signum: int | None = None,
+    *,
+    startup_ppid: int | None = None,
+    getppid=os.getppid,  # noqa: ANN001
+    on_orphaned=None,  # noqa: ANN001
+) -> bool:
+    """Ask the kernel to SIGKILL this process when its parent thread exits (Linux PR_SET_PDEATHSIG).
+
+    This is the backstop for the Python watchdog below: a child whose interpreter is wedged inside
+    GStreamer cannot run Python threads, but the kernel still delivers the death signal and closes
+    /dev/hailo0. Returns True when armed. Not available on non-Linux hosts (returns False).
+
+    The signal only fires for a parent that dies *after* arming, so a parent that already died
+    during our start-up is detected by comparing the current ppid with ``STARTUP_PPID`` (a
+    re-parented child usually lands under ``systemd --user``, not pid 1).
+    """
+    import ctypes
+    import signal as _signal
+
+    signum = _signal.SIGKILL if signum is None else signum
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        result = libc.prctl(1, ctypes.c_ulong(signum), 0, 0, 0)  # PR_SET_PDEATHSIG = 1
+    except (OSError, AttributeError):
+        return False
+    if result != 0:
+        return False
+    startup = STARTUP_PPID if startup_ppid is None else startup_ppid
+    if getppid() != startup:
+        print(f"PARENT_LOST before arming (startup_ppid={startup} now={getppid()}); exiting", flush=True)
+        (on_orphaned or (lambda: os._exit(3)))()
+    return True
+
+
+def parent_changed(original_ppid: int, getppid=os.getppid) -> bool:  # noqa: ANN001
+    """True once the process that spawned us is gone (we were re-parented to init/systemd)."""
+    return getppid() != original_ppid
+
+
+def start_parent_watchdog(on_orphaned, *, interval_seconds: float = 1.0, getppid=os.getppid):  # noqa: ANN001
+    """Poll the parent pid; when it changes, call ``on_orphaned`` once.
+
+    The parent (operator UI) spawns this child in its own session so it can kill the whole
+    process group; if the parent dies without doing so the child would otherwise keep the Hailo
+    device open forever (observed: a 7-day-old orphan blocking every later inference with
+    HAILO_OUT_OF_PHYSICAL_DEVICES). Returns a threading.Event that stops the watchdog.
+    """
+    import threading
+
+    stop = threading.Event()
+    original = STARTUP_PPID if getppid is os.getppid else getppid()
+
+    def _watch() -> None:
+        while not stop.wait(interval_seconds):
+            if parent_changed(original, getppid):
+                print(f"PARENT_LOST original_ppid={original} now={getppid()}; shutting down", flush=True)
+                try:
+                    on_orphaned()
+                finally:
+                    return
+
+    threading.Thread(target=_watch, name="parent-watchdog", daemon=True).start()
+    return stop
+
+
+def _shutdown_orphaned(app) -> None:  # noqa: ANN001
+    """Release the device promptly: try a clean pipeline shutdown, then hard-exit."""
+    import threading
+
+    def _force_exit() -> None:
+        os._exit(3)
+
+    threading.Timer(5.0, _force_exit).start()
+    try:
+        app.shutdown()
+    except Exception:  # noqa: BLE001 - the hard exit above is the safety net.
+        os._exit(3)
 
 
 def _all_sources_are_files(cameras: tuple[tuple[str, str], ...]) -> bool:

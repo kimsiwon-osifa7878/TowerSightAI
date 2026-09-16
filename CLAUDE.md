@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **276 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **394 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -93,6 +93,8 @@ towersightai/
 │   ├── raw_data_sync.py       # towersightai-sync-raw-data
 │   ├── hailo_apps_detection.py# runs INSIDE the Hailo Apps venv (not the project venv)
 │   ├── fast_alpr_lpr.py       # CPU FastALPR ONNX plate detection + OCR
+│   ├── checkerboard.py        # towersightai-checkerboard: printable calibration board
+│   ├── analyze.py             # towersightai-analyze: sites / days / sync / index / serve
 │   └── event_video_recorder.py# H.264 passthrough MKV segment recorder subprocess
 ├── process/
 │   ├── engine.py              # ParkingProcessEngine: continuous inbound cycle (pure Python, injected clock)
@@ -109,12 +111,24 @@ towersightai/
 │   ├── hourly_writer.py       # bounded hourly shards + atomic gzip publication
 │   ├── evidence.py            # EvidenceCoordinator: JPEG snapshots + MKV clips for real events
 │   ├── archive.py             # manifest v2 (SHA-256 per file) + Synology SFTP atomic upload
-│   └── connection_test.py     # operator NAS write check into <folder>/connectiontest/ (diagnostic only)
+│   ├── connection_test.py     # operator NAS write check into <folder>/connectiontest/ (diagnostic only)
+│   └── file_transfer.py       # operator file relay into <folder>/transfer/ (SHA-256 verified, relay only)
+├── calibration/
+│   ├── checkerboard.py        # CheckerboardSpec + printable PDF/SVG/PNG (no external deps)
+│   └── intrinsics.py          # CAPTURE_POSES, detect_checkerboard, calibrate_intrinsics, IntrinsicsSessionStore
 ├── sensors/ld2410.py          # LD2410 binary frame parser, ring buffer, one-client TCP service
+├── analyze/                   # OFFLINE analysis dashboard (dev/verification only, never runs on site):
+│   ├── config.py              #   sites.json (per-site NAS address), AnalysisPaths under data/analysis/
+│   ├── nas_reader.py          #   read-only SFTP mirror (legacy raw/<day> and raw/<host>/<day>), SHA-256 verified
+│   ├── loader.py / digest.py  #   JSONL shards → per-day digest (frames, radar samples, media, coverage)
+│   ├── episodes.py            #   camera/radar episode replay (engine-equivalent rules) + pairing
+│   ├── labels.py / metrics.py #   reviewer labels (append-only JSONL), precision / mutual recall / sweeps
+│   ├── server.py              #   stdlib HTTP JSON API + static SPA (127.0.0.1 only)
+│   └── static/                #   index.html, app.css, app.js (no external deps)
 ├── diagnostics.py             # DiagnosticsService: settings/hailo/image/camera/plc/full smoke
 └── runtime_logging.py         # runtime log config, credential redaction, run IDs, run-status files
 
-tests/          # 276 hardware-free unit/UI/fake-data tests
+tests/          # 344 hardware-free unit/UI/fake-data tests
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
 data/samples/   # sanitized sample images (test-car.png)
 docs/design/    # approved visual contracts (driver prototype, operator console proposals A/B)
@@ -122,7 +136,10 @@ artifacts/      # runtime logs, detections, raw JSONL/media  (gitignored)
 models/, tmp/   # gitignored
 ```
 
-There is **no `ai_stages/` or `calibration/` module yet** even though the docs describe both.
+There is **no `ai_stages/` module yet**. `calibration/` holds only checkerboard generation and the intrinsics
+measurement tooling; there is still no site (extrinsics) calibration, no calibration validity check, and no
+calibration UI beyond the 카메라 캘리브레이션 measurement page. `data/field-media/{front,rear_side,opposite_side}/`
+(per-camera folders, gitignored) is where real site photos/videos for the 3D vehicle-box work are collected.
 
 ---
 
@@ -211,6 +228,13 @@ Validation that intentionally fails fast:
 - `RAW_DATA_ENABLED=true` requires all `SYNOLOGY_NAS_*` values; host must be a bare hostname (no scheme/port/path).
 - `RAW_DATA_SHARD_MINUTES` must divide 60.
 
+`VEHICLE_BOX_*` (all mm, blank = default): pallet 5350×2200, rail inner width 2106, bay heights 1600/1900,
+vehicle limits L5205 × W2000 (2100 with mirrors) × H1550/1850, wheel track ≤2000, plus the side-camera role
+mapping (`VEHICLE_BOX_FRONT_LEFT_CAMERA=rear_side`, `VEHICLE_BOX_REAR_RIGHT_CAMERA=opposite_side`). Defaults
+come from the 구로 신안타워 approval drawing (`refers/…승인도…pdf` J001); `VehicleEnvelopeConfig` rejects limits
+that exceed the bay and non-side or duplicate camera roles. This is the site geometry for the planned 3D
+vehicle-box stage (INTENT.md §4 확정안) — no estimation code exists yet.
+
 `BIRDVIEW_MODE`: `ceiling` (default when absent) or `disabled`. `disabled` drops the ceiling camera from
 `Settings.active_cameras`, hides its UI surfaces, and **permanently blocks final OK** (`버드뷰 OFF`).
 The current site profile uses `BIRDVIEW_MODE=disabled` with `CAMERA_1_ROTATION_DEGREES=270`.
@@ -280,8 +304,12 @@ B안): panel surfaces `#151B24`/`#232C39` radius 12, amber accent `#F5A623` (`pr
 checked nav), instrument camera tiles drawn in `CameraSurface.paintEvent` only for `contain` mode — the
 driver view (`cover`) stays chromeless cyan/navy.
 
-Workspace pages: `전체 카메라` (landing; camera grid + `이전 AI Detection` toggle), `차량 감지`, `사람 감지`,
+Workspace pages: `전체 카메라` (landing; camera grid + `사람 감지`/`차량 감지` start buttons that mirror the task pages),
+`차량 감지`, `사람 감지`,
 `번호판 인식` (정면 카메라 인식 + 이미지 LPR), `레이더 (LD2410)`, `NAS 연결 확인` (`storage/connection_test.py`),
+`NAS 파일 전송` (`storage/file_transfer.py`; picked files → `<folder>/transfer/`, remote-access file relay),
+`카메라 캘리브레이션` (guided 15-pose checkerboard capture → `cv2.calibrateCamera` → `data/calibration/intrinsics/`;
+measurement file only, `reviewed=false`, never marks calibration valid),
 `시스템 점검` (DiagnosticsService off-thread + Hailo 장치 상태 패널), `실행 로그` (runtime log tail + filter), `주차 프로세스 테스트`
 (driver-stage playback + `차량 진입 시뮬레이션`). Camera pages share ONE camera grid
 (`operator_camera_area`) that `_adopt_camera_area` reparents into the active page with an `all` or `front`
@@ -306,17 +334,37 @@ default lane/stop guides outside calibration mode; error/NG states can never use
 - `RAW_DATA_ENABLED=true` appends schema-v2 JSONL to bounded shards
   `artifacts/raw/YYYY-MM-DD/events-YYYYMMDD-HHMM.jsonl`; closed shards are atomically published as `.jsonl.gz`.
   Records: application/AI start-stop, vehicle entry, plate results, raw per-camera detections, LD2410 status,
-  and 0.5 s `person_sample` rows continuing 5 s past clear.
+  and 0.5 s `person_sample` rows continuing 5 s past clear. Plate recording is complete per entry:
+  `plate_recognized` carries `recognized`/`reads`/`reason` and is written for 미인식 and aborted votes too,
+  and every 1 Hz front-camera read is a `plate_attempt` row (`accepted` plus a rejection reason such as
+  `above_entry_line`) so the analysis dashboard can measure LPR hit rate.
 - `RAW_MEDIA_ENABLED=true` captures JPEG snapshots and H.264-**passthrough** silent MKV clips (5 s pre-roll,
   10 s vehicle post-roll, 5-minute clip parts) for **real** events only. Media bytes never enter JSONL —
   `media_artifact_created` stores relative path, size, SHA-256, capture time, metadata. Failures are explicit
   `media_capture_failed` events.
-- `storage/archive.py` uploads completed days to `${SYNOLOGY_NAS_FOLDER}/raw/YYYY-MM-DD/` over strict-host-key
+- `storage/archive.py` uploads completed days to `${SYNOLOGY_NAS_FOLDER}/raw/<source_host>/YYYY-MM-DD/` (per-host
+  since 2026-09-10 — dev and field boxes used to overwrite each other's shards in a shared `raw/YYYY-MM-DD/`;
+  the analysis reader still reads that legacy layout) over strict-host-key
   SFTP: per-file SHA-256 manifest v2, `.part` upload → verify → atomic rename, manifest published last.
   Local days are deleted only after a verified upload and 14 days.
 - `LD2410_TCP_ENABLED=true` accepts **one** ESP32 client sending raw LD2410 frames (`F4 F3 F2 F1` header).
   Each `person_sample` embeds the newest frame at or before the sample time: ≤1 s = `fresh`, older buffered =
   `stale`, none = `unavailable`; future frames are never selected.
+- Radar raw logging (spec `docs/implementation/radar-raw-logging.md`, 2026-09-10): `RawDataManager.tick()` also
+  records a 1 Hz `ld2410_sample` (provider snapshot minus `raw_hex`; `fresh` always, `stale` only on a new
+  `received_at`, `unavailable` never, provider error once) and drives `RadarWindowTracker`
+  (`idle → confirming → open → closing`): present = `fresh` + `target_status != 0`, unknown never counts as
+  absent; `radar_window_started` after `RAW_DATA_RADAR_WINDOW_MIN_SECONDS` (backdated to the first present
+  sample), `radar_window_closed` after `RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS` measured from the last present
+  sample (`cleared` / `radar_unavailable` / `service_stopped` / `application_stopped`). The window events are
+  durable, the sample is not. While a radar window is open and no camera person window is active, a 1 Hz
+  `radar_sample` records the per-camera person state at that instant (the mirror of `person_sample`, which
+  carries the radar snapshot) for up to `RAW_DATA_RADAR_SAMPLE_SECONDS` — the two together make every
+  presence claim comparable from both sides, which is the whole point of the camera-vs-radar study.
+  `PersonWindowSampler.camera_state(at)` is the shared per-camera view and its latest detections now
+  survive window close. Evidence: `radar` snapshots + a clip capped at `RAW_MEDIA_RADAR_CLIP_MAX_SECONDS`,
+  `radar_end` snapshot on close, skipped with `person_window_active` while a camera person window owns the
+  media and `radar_evidence_throttled` inside `RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS`. Analysis only.
 
 **All of this is audit/telemetry only, with one add-only exception.** Archive success and media capture must
 never relax, authorize, or influence the safety gate, AI, or the state machine. LD2410 values may
@@ -332,7 +380,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 276 passed, hardware-free
+pytest -q                                     # 394 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed
@@ -340,6 +388,10 @@ LOG_LEVEL=DEBUG towersightai-operator-ui --env .env    # per-run IDs, resolved p
 towersightai-check-settings --env .env [--check-hailo|--health-check-cameras|--preview-cameras --dry-run]
 towersightai-ai-diagnostics --env .env --output artifacts/runtime/ai-diagnostics.txt
 towersightai-sync-raw-data --env .env [--include-current-day]
+towersightai-checkerboard [--paper A4|A3] [--square-mm 25]   # printable board → data/calibration/checkerboard/
+towersightai-analyze sites import-env <site> --env .env        # register a NAS site for the analysis dashboard
+towersightai-analyze sync --site <site> --from YYYY-MM-DD --to YYYY-MM-DD
+./run-dashboard.sh                                            # = towersightai-analyze serve --open (dev/verification only)
 RUN_HARDWARE_TESTS=1 towersightai-hailo-image-smoke --env .env \
   --image data/samples/test-car.png --check-installation --run
 WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-verification
@@ -411,6 +463,10 @@ state, AI, or PLC contract exists for it yet.
 - Two virtualenvs matter: the project `.venv` (UI, tests) and the Hailo Apps venv (`HAILO_APPS_PYTHON`) that
   actually executes `towersightai.cli.hailo_apps_detection`. Import errors there usually mean `PYTHONPATH`,
   not a code bug.
+- The operator console exposes exactly two manual inference tasks, `사람 감지` and `차량 감지` (plus the automatic
+  `프로세스 감시` that feeds the engine and image/front LPR). The old `이전 AI Detection` / general multistream
+  path was removed from the UI on 2026-09-10; `inference/live_detection.py` keeps `LiveDetectionRunner` only as
+  a tested library (runner helpers are shared with `purpose_tasks.py`).
 - `towersightai/inference/pipeline.py` still builds the legacy TAPPAS `hailopython` string and is still under
   test — it is **not** the runtime path. Do not "fix" the live pipeline by editing it.
 - `Settings` requires all four cameras even when `BIRDVIEW_MODE=disabled`; use `active_cameras`, not `cameras`,
@@ -430,6 +486,32 @@ state, AI, or PLC contract exists for it yet.
 - A leftover `operator_ui` process (e.g. a verify-script launch that survived SIGTERM) keeps camera RTSP
   sessions and starves later inference with RTSP 400. `pgrep -f operator_ui` before diagnosing "inference
   suddenly fails"; the verify script now force-kills after 10 s.
+- An **orphaned inference child** (`Hailo Multisource App`, re-parented to systemd after the UI died without
+  `killpg`) holds `/dev/hailo0` forever; every later child fails with `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` and
+  then segfaults in libgsthailo. `fuser /dev/hailo0` finds it (its cmdline is renamed, so `pgrep -f
+  hailo_apps_detection` does not). Defences: the child arms `PR_SET_PDEATHSIG` + a ppid watchdog, the health
+  monitor lists device holders (`HAILO 점유됨`), fatal messages name the holder PID, and 시스템 점검 has
+  `고아 프로세스 종료` for non-child holders.
+- The same orphan class exists for the **evidence recorder** (`cli/event_video_recorder.py`, spawned per camera
+  when `RAW_MEDIA_ENABLED=true`): recorders left behind by a killed UI keep their RTSP session, and Tapo's
+  per-camera session budget then rejects the inference child with `Bad Request (400)`. `ss -tn | grep :554`
+  shows them. The recorder now arms `PR_SET_PDEATHSIG`, polls its ppid, and force-exits 5 s after a stop
+  request if EOS never completes; the health scan (`find_orphaned_children`) lists both orphan kinds.
+- RTSP `Bad Request (400)` is a *session-budget* failure, not a stream fault: Tapo keeps a dropped session
+  for tens of seconds, so a fast retry only burns another slot. The runner waits
+  `rtsp_busy_restart_delay_seconds` (10 s) after a 400 exit, and the monitoring auto-start waits 4 s for the
+  streaming camera set to settle (one launch with every camera instead of front-only + relaunch) and backs off
+  30 s → 60 s → 120 s after failed runs.
+- Launching the UI from a shell that still exports the legacy `/opt/hailo/tappas` `GST_PLUGIN_PATH` /
+  `LD_LIBRARY_PATH` makes children fail with `g_once_init_leave` / `gst_buffer_get_meta: api != 0` assertions
+  and zero events. `run.sh` strips them and `hailo_apps_runtime_env` now strips them for the child as well.
 - pyhailort: a temporary `Device()` is treated as released before `.control` is used — hold it in a
   variable and `device.release()` (see `hailo_health.make_subprocess_temp_probe`).
+- The analysis dashboard (`towersightai/analyze/`, `towersightai-analyze`) is a **development/verification tool**
+  that runs on the analyst's PC against the NAS archive — never on the site device. It must stay read-only and
+  must never import `process`, `state_machine`, `plc`, or `ui` (a test pins this). NAS credentials live in
+  `data/analysis/sites.json` (gitignored); labels in `data/analysis/sites/<site>/labels.jsonl`. Until the radar
+  raw enhancement (`ld2410_sample` / `radar_window_*`) is deployed, radar episodes come only from
+  `person_sample.ld2410` and are flagged `partial`. Days are keyed by `(source_host, day)`; host roles (현장/개발) live in `sites.json` and the dashboard
+  shows field hosts only by default.
 - Korean UI strings are part of the contract; keep the exact labels tests assert on.

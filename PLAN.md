@@ -16,8 +16,23 @@ was explicitly removed by the owner and stays a future concept. Operator-tunable
 
 Follow-ups queued from that work:
 
-- 3D vehicle bounding-box estimation (wheels/bumper via AI or OpenCV) to replace the
-  bbox-stability parked heuristic and drive directional alignment guidance. Plan-only today.
+- 3D vehicle box (직육면체) estimation — **design confirmed 2026-09-09** (INTENT.md §4):
+  cameras 3/4 (front+left, rear+right diagonals; role mapping in `.env`) as the primary pair,
+  plus the front camera (camera 2) as an optional third view when it streams: it observes the
+  front face head-on, so it pins the vehicle width, lateral offset and yaw from the front-face
+  centre line and the bumper bottom height, reusing the existing preview frames (no extra RTSP
+  session). The box must be computable from 3/4 alone; the front view only tightens width /
+  offset and cross-checks; disagreement between views widens the uncertainty (conservative).
+  OpenCV silhouette (Hailo bbox is ROI only), tyre-contact → floor plane → side planes → box,
+  multi-camera cross-check, Kalman smoothing, ±5 cm target incl. moving, origin = pallet
+  centre. Drawing defaults live in `VehicleEnvelopeConfig` (`VEHICLE_BOX_*`). Field photos and
+  videos for offline work go to `data/field-media/{front,rear_side,opposite_side}/`
+  (per-camera folders, no filename prefix, gitignored). Stage 1: dev-bench (1:18 model)
+  intrinsics + pallet extrinsics + silhouette method comparison + offline accuracy report,
+  then the same offline report on real field media once collected.
+  Stage 2: `vehicle_box` stage module returning PASS/WAIT/RETRY/NG/ERROR, operator page with
+  overlay, size-limit check. Stage 3: replace the bbox-stability parked heuristic and drive
+  directional alignment guidance. Calibration UI gates everything (unreviewed → final OK blocked).
 - Polygon exclusion zone for the opposite_side trigger camera (door-open street traffic).
 - Outbound (출고) flow once a PLC exit signal contract exists.
 - Bundling `artifacts/runtime/purpose-ai/` task logs into the NAS day directory.

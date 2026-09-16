@@ -90,12 +90,14 @@ cp .env.example .env
 ### 진단
 | 메뉴 | 하는 일 |
 |---|---|
-| 전체 카메라 | 활성 카메라 실시간 그리드. `이전 AI Detection`(회귀 격리용 구 경로) 토글 포함 |
+| 전체 카메라 | 활성 카메라 실시간 그리드. `사람 감지 시작`/`차량 감지 시작` 버튼 포함(누르면 실행 중인 추론을 멈추고 누른 추론을 시작) |
 | 차량 감지 | front 카메라에서 Hailo 검출(차량 라벨만). `차량 감지 시작/중지` |
 | 사람 감지 | 수신 중인 모든 카메라에서 person 감지. 박스는 각 타일에 표시 |
 | 번호판 인식 | `정면 카메라 인식`(현재 프레임 1장) / `번호판 이미지 인식`(tmp/car_number-test 일괄). FastALPR(CPU) |
 | 레이더 (LD2410) | ESP32가 보내는 레이더 원시 프레임 콘솔. 표시 전용(안전판정 미사용) |
 | NAS 연결 확인 | NAS `connectiontest/`에 검증 페이로드 기록+SHA-256 재확인. 카메라 수신 중이면 2초 클립 동봉 |
+| NAS 파일 전송 | `파일 선택` → `NAS로 보내기`. 선택한 파일을 NAS `transfer/` 폴더 한 곳에 SHA-256 검증 업로드. 원격 접속으로 파일을 못 옮길 때 NAS 중계용 |
+| 카메라 캘리브레이션 | 체커보드(`towersightai-checkerboard`로 인쇄) 유도 촬영 15자세 → `측정 실행`으로 렌즈 내부 파라미터 측정. 결과 `data/calibration/intrinsics/<camera>.json`(reviewed=false, 측정 파일일 뿐) |
 | 시스템 점검 | 설정/Hailo 설치/샘플 추론/카메라별 프레임/PLC 시뮬레이터 개별 실행, `전체 스모크`는 전부 순차 실행. **Hailo 장치 상태 패널**(60초 자동 갱신) 포함 |
 | 실행 로그 | `towersightai.log` 실시간 tail + 문자열 필터 |
 
@@ -138,6 +140,14 @@ RUN_HARDWARE_TESTS=1 towersightai-hailo-image-smoke --env .env --image data/samp
 백그라운드로 Synology SFTP(`${SYNOLOGY_NAS_FOLDER}/raw/`)에 업로드됩니다(파일별 SHA-256 검증, 검증된
 업로드 14일 후 로컬 삭제). `RAW_MEDIA_ENABLED=true`면 실제 차량/사람/번호판 이벤트의 스냅샷과 무재인코딩
 H.264 클립도 함께 보관됩니다. **아카이브 성공/실패는 안전 판정과 무관한 감사 기능입니다.**
+
+레이더(LD2410)는 카메라 사람 창과 무관하게 1초마다 `ld2410_sample`(`raw_hex` 제외)로 기록되고, 레이더가
+3초 이상 연속 감지하면 `radar_window_started`, 5초 이상 미감지/불명이면 `radar_window_closed`가 남습니다.
+창이 열릴 때 `*-radar-*.jpg` 스냅샷과 최대 30초 `radar` 클립, 닫힐 때 `*-radar_end-*.jpg`가 추가됩니다
+(카메라 사람 창이 이미 열려 있으면 `person_window_active`, 60초 안에 또 열리면 `radar_evidence_throttled`
+사유만 기록). 설정 키: `RAW_DATA_LD2410_SAMPLE_INTERVAL_SECONDS`(0=끔), `RAW_DATA_RADAR_WINDOW_MIN_SECONDS`,
+`RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS`, `RAW_MEDIA_RADAR_EVIDENCE`, `RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS`,
+`RAW_MEDIA_RADAR_CLIP_MAX_SECONDS`. 모두 분석 전용이며 안전 판정에는 쓰이지 않습니다.
 
 **새 장비 최초 1회 — NAS 호스트 키 등록** (안 하면 `not found in known_hosts`로 업로드 실패):
 
@@ -193,3 +203,49 @@ UI를 바꿨다면 커밋 전에 실제 화면 검증:
 ```bash
 WAIT_SECONDS=15 tools/verify_operator_ui_screenshot.sh .env tmp/operator-ui-verification
 ```
+
+## 부록 A. 데이터 분석 대시보드 (개발·검증 전용)
+
+NAS에 쌓인 raw 데이터(JSONL·스냅샷·클립)를 읽어 **카메라 사람 감지와 레이더(LD2410) 사람 감지의 정확도를
+비교**하는 로컬 웹 대시보드다. 현장 장비에서 운영하지 않고 개발/분석 PC에서만 실행한다. 읽기 전용이며
+안전 게이트·엔진·PLC와 무관하다(`towersightai/analyze/`, 설계: `docs/implementation/analyze-dashboard.md`).
+
+```bash
+# 0) CLI 진입점이 없으면 한 번 재설치 (편집 설치 뒤 pyproject에 추가된 스크립트)
+python -m pip install -e ".[ui]"
+# 1) 현장(NAS) 등록 — 배포 .env의 SYNOLOGY_NAS_* 값을 가져오거나 직접 입력
+towersightai-analyze sites import-env shinantower --env .env --label "구로 신안타워"
+towersightai-analyze sites add other --host nas.example.com --port 45222 --user u --password p --folder /home/share
+# 2) NAS 날짜 목록 확인 후 내려받기 (검증된 SHA-256, 이벤트만; 미디어는 볼 때 개별 다운로드)
+towersightai-analyze days --site shinantower --remote
+towersightai-analyze sync --site shinantower --from 2026-09-03 --to 2026-09-05 [--media]
+# 3) 대시보드 (아래 한 줄이면 됨; PORT / AUTO_SYNC_MINUTES / NO_OPEN 환경변수로 조정)
+./run-dashboard.sh                          # = towersightai-analyze serve --open, http://127.0.0.1:8765
+```
+
+- **현장/개발 데이터 구분**: 날짜의 소유 장비는 NAS 호스트 폴더(`raw/<host>/날짜`) > manifest의 `source_host` >
+  현장 설정의 **기본 호스트**(`default_host`, 폴더도 manifest도 없이 올라온 날짜 = 재배포할 수 없는 현장기) 순서로 정한다.
+  구로 신안타워는 `pakrio-shinantower`가 기본 호스트다. 예외는 `데이터 · NAS 설정`의 로컬 캐시 표에서 날짜별
+  **소유 장비**를 직접 지정한다(예: 개발기가 manifest 없이 올린 2026-09-09 → `erumtni-NucBox-G3`). 지정은 `sites.json`에
+  남아 다시 내려받아도 유지된다. 이 PC의 호스트명은
+  자동으로 `개발`, 나머지는 `현장`으로 보며(`데이터 · NAS 설정`의 호스트 표에서 바꿀 수 있음) 모든 페이지는 기본으로
+  **현장 데이터만** 보여준다(사이드바 호스트 선택: 현장만/전체/개발기만/특정 호스트). 개발 데이터의 로컬 캐시는 같은
+  표에서 삭제할 수 있다(NAS 원본과 라벨은 유지). 업로드 쪽도 이제 `raw/<source_host>/YYYY-MM-DD/`로 나눠 저장하므로
+  두 장비가 같은 날짜 폴더를 덮어쓰는 일은 생기지 않는다(기존 `raw/YYYY-MM-DD/`도 계속 읽는다).
+- 서버가 떠 있는 동안 기본 10분마다 NAS를 확인해 새 날짜·바뀐 날짜의 이벤트 파일만 자동으로 받는다
+  (`serve --auto-sync-minutes 0`으로 끔). 사이드바의 `NAS 최신화` 버튼은 같은 동작을 즉시 실행한다.
+  스냅샷·클립은 자동 최신화 대상이 아니며 검토 화면에서 볼 때 개별로 받는다.
+- 현장 등록은 대시보드의 `데이터 · NAS 설정` 페이지에서도 할 수 있다. 값은 `data/analysis/sites.json`
+  (git 미추적, 0600)에 저장되며 비밀번호는 화면·API에 노출되지 않는다.
+- 레이더가 몇 초 이상(기본 3초) 사람을 감지하면 그 창 동안 **전 카메라 스냅샷·클립과 1초 단위 카메라 상태**가 함께
+  저장되어 NAS로 올라간다. 대시보드 에피소드 목록의 `카메라 대조` 열은 '레이더 감지 중 카메라가 사람을 본 초 / 전체 초'이고,
+  검토 화면에 초 단위 대조표가 나온다. 동의 0회면 레이더 단독 감지다.
+- 에피소드마다 그 차량의 **번호판**이 함께 표시된다(겹치는 차량 세션의 결과, 없으면 ±60초 안의 판독). 판독 실패는
+  `미인식`으로 표시되고, 검토 화면에서 1초 주기 판독 이력(반영/제외 사유)과 번호판 잘라내기 이미지를 볼 수 있다.
+- 페이지: 개요(정밀도·상호 재현율·시간당 오탐·커버리지), 타임라인(하루 띠, 드래그 확대), 에피소드(필터·CSV),
+  검토(스냅샷·클립·0.5초 샘플·레이더 곡선·판정 1/2/3 단축키), 비교(일치 매트릭스·지연·분포), 임계값 스윕,
+  데이터 사전, 데이터·NAS 설정.
+- 레이더 단독 감지는 raw 보강(`ld2410_sample`, `radar_window_*`, `radar` 스냅샷) 이후 날짜부터 계산되며,
+  그 전 날짜는 카메라 사람 창 안의 레이더 값만 있어 `부분`으로 표시된다.
+- 클립 재생은 `ffmpeg`(MKV→MP4 리먹스)가 필요하다. 없으면 MKV 저장만 된다.
+- 라벨은 `data/analysis/sites/<site>/labels.jsonl`에 append-only로 쌓인다(백업 대상).

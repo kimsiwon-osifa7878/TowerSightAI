@@ -73,6 +73,36 @@ class ConnectionTestUploader(Protocol):
         ...
 
 
+def connect_ssh_client(config: RawStorageConfig) -> Any:
+    """Open a strict-host-key paramiko SSH client for the configured NAS (caller closes it)."""
+    try:
+        import paramiko
+    except ImportError as exc:  # pragma: no cover - packaging guard.
+        raise RuntimeError("paramiko is required for the Synology NAS connection") from exc
+
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    if config.known_hosts_path.is_file():
+        client.load_host_keys(str(config.known_hosts_path))
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    try:
+        client.connect(
+            hostname=config.nas_host,
+            port=config.nas_port,
+            username=config.nas_username,
+            password=config.nas_password,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=15,
+            banner_timeout=15,
+            auth_timeout=15,
+        )
+    except Exception:
+        client.close()
+        raise
+    return client
+
+
 class ParamikoConnectionTestUploader:
     """Upload one local directory with the archive path's strict-host-key SFTP rules."""
 
@@ -80,28 +110,8 @@ class ParamikoConnectionTestUploader:
         self.config = config
 
     def upload(self, local_dir: Path, remote_dir: str) -> tuple[UploadedArtifact, ...]:
+        client = connect_ssh_client(self.config)
         try:
-            import paramiko
-        except ImportError as exc:  # pragma: no cover - packaging guard.
-            raise RuntimeError("paramiko is required for the Synology NAS check") from exc
-
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        if self.config.known_hosts_path.is_file():
-            client.load_host_keys(str(self.config.known_hosts_path))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        try:
-            client.connect(
-                hostname=self.config.nas_host,
-                port=self.config.nas_port,
-                username=self.config.nas_username,
-                password=self.config.nas_password,
-                allow_agent=False,
-                look_for_keys=False,
-                timeout=15,
-                banner_timeout=15,
-                auth_timeout=15,
-            )
             with client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(60.0)
                 mkdirs(sftp, remote_dir)

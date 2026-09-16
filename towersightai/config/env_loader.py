@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from typing import Mapping
 
-from towersightai.config.settings import CameraRole, Settings
+from towersightai.config.settings import CameraRole, Settings, VehicleEnvelopeConfig
 
 REQUIRED_SETTINGS_KEYS = (
     "HAILO_HEF_PATH",
@@ -145,6 +145,7 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
         ui_fullscreen=_parse_bool(values.get("UI_FULLSCREEN", "true")),
         ui_camera_resolution=values.get("UI_CAMERA_RESOLUTION", "1280x720"),
         birdview_mode=values.get("BIRDVIEW_MODE", "ceiling"),
+        vehicle_envelope=_vehicle_envelope_dict(values),
         ld2410={
             "enabled": _parse_bool(values.get("LD2410_TCP_ENABLED", "false")),
             "bind_host": values.get("LD2410_TCP_BIND_HOST", "0.0.0.0"),
@@ -208,6 +209,31 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
             ),
             "media_gstreamer_python": _expand_config_path(
                 values.get("RAW_MEDIA_GSTREAMER_PYTHON", "/usr/bin/python3"), values
+            ),
+            "ld2410_sample_interval_seconds": _parse_float(
+                values.get("RAW_DATA_LD2410_SAMPLE_INTERVAL_SECONDS", "1"),
+                "RAW_DATA_LD2410_SAMPLE_INTERVAL_SECONDS",
+            ),
+            "radar_window_min_seconds": _parse_float(
+                values.get("RAW_DATA_RADAR_WINDOW_MIN_SECONDS", "3"),
+                "RAW_DATA_RADAR_WINDOW_MIN_SECONDS",
+            ),
+            "radar_window_clear_seconds": _parse_float(
+                values.get("RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS", "5"),
+                "RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS",
+            ),
+            "radar_sample_seconds": _parse_float(
+                values.get("RAW_DATA_RADAR_SAMPLE_SECONDS", "60"),
+                "RAW_DATA_RADAR_SAMPLE_SECONDS",
+            ),
+            "media_radar_evidence": _parse_bool(values.get("RAW_MEDIA_RADAR_EVIDENCE", "true")),
+            "media_radar_min_interval_seconds": _parse_float(
+                values.get("RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS", "60"),
+                "RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS",
+            ),
+            "media_radar_clip_max_seconds": _parse_float(
+                values.get("RAW_MEDIA_RADAR_CLIP_MAX_SECONDS", "30"),
+                "RAW_MEDIA_RADAR_CLIP_MAX_SECONDS",
             ),
             "nas_host": values.get("SYNOLOGY_NAS_HOST", ""),
             "nas_port": _parse_int(values.get("SYNOLOGY_NAS_PORT", "22"), "SYNOLOGY_NAS_PORT"),
@@ -284,6 +310,40 @@ def _strip_optional_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
+
+
+_VEHICLE_ENVELOPE_KEYS = (
+    ("pallet_length_mm", "VEHICLE_BOX_PALLET_LENGTH_MM"),
+    ("pallet_width_mm", "VEHICLE_BOX_PALLET_WIDTH_MM"),
+    ("rail_inner_width_mm", "VEHICLE_BOX_RAIL_INNER_WIDTH_MM"),
+    ("bay_height_sedan_mm", "VEHICLE_BOX_BAY_HEIGHT_SEDAN_MM"),
+    ("bay_height_suv_mm", "VEHICLE_BOX_BAY_HEIGHT_SUV_MM"),
+    ("max_vehicle_length_mm", "VEHICLE_BOX_MAX_LENGTH_MM"),
+    ("max_vehicle_width_mm", "VEHICLE_BOX_MAX_WIDTH_MM"),
+    ("max_vehicle_width_with_mirrors_mm", "VEHICLE_BOX_MAX_WIDTH_WITH_MIRRORS_MM"),
+    ("max_vehicle_height_sedan_mm", "VEHICLE_BOX_MAX_HEIGHT_SEDAN_MM"),
+    ("max_vehicle_height_suv_mm", "VEHICLE_BOX_MAX_HEIGHT_SUV_MM"),
+    ("max_wheel_track_mm", "VEHICLE_BOX_MAX_WHEEL_TRACK_MM"),
+)
+
+
+def _vehicle_envelope_dict(values: Mapping[str, str]) -> dict[str, object]:
+    """Drawing-derived defaults apply whenever a VEHICLE_BOX_* key is absent or blank."""
+    defaults = VehicleEnvelopeConfig()
+    result: dict[str, object] = {}
+    for field_name, key in _VEHICLE_ENVELOPE_KEYS:
+        raw = values.get(key, "")
+        if raw.strip():
+            result[field_name] = _parse_float(raw, key)
+        else:
+            result[field_name] = getattr(defaults, field_name)
+    result["front_left_camera_role"] = (
+        values.get("VEHICLE_BOX_FRONT_LEFT_CAMERA", "").strip() or defaults.front_left_camera_role
+    )
+    result["rear_right_camera_role"] = (
+        values.get("VEHICLE_BOX_REAR_RIGHT_CAMERA", "").strip() or defaults.rear_right_camera_role
+    )
+    return result
 
 
 def _parse_bool(value: str) -> bool:

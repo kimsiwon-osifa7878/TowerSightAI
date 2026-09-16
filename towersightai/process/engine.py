@@ -68,11 +68,20 @@ class PlcRequest:
 
 @dataclass(frozen=True)
 class RawEventRequest:
-    kind: str  # "vehicle_entry" | "vehicle_session_end" | "plate"
+    kind: str  # "vehicle_entry" | "vehicle_session_end" | "plate" | "plate_attempt"
     camera_id: str = ""
     reason: str = ""
     plate_number: str = ""
     confidence: float | None = None
+    # plate_attempt: one 1 Hz front-camera read. ``accepted`` is False for a plate seen above the
+    # 차량진입선 (outside the machine) or for a frame with no plate at all — the analysis dashboard
+    # needs the rejected reads to measure how often LPR actually sees a plate during an entry.
+    accepted: bool = True
+    bbox: Mapping[str, float] | None = None
+    # plate: the majority-vote outcome. ``recognized`` is False for 미인식 so every entry leaves
+    # an explicit result instead of silence.
+    recognized: bool = True
+    reads: int = 0
 
 
 @dataclass(frozen=True)
@@ -244,21 +253,56 @@ class ParkingProcessEngine:
             else:
                 best = None
         if not isinstance(best, Mapping):
+            self._queue_plate_attempt("", None, accepted=False, reason="no_plate_detected")
             return
         plate = str(best.get("plate_number") or "").strip()
         bbox = best.get("bbox")
+        confidence = float(best.get("confidence") or 0.0)
         if not plate or not isinstance(bbox, Mapping):
+            self._queue_plate_attempt(plate, confidence, accepted=False, reason="no_plate_bbox")
             return
         try:
             center_y = (float(bbox["y1"]) + float(bbox["y2"])) / 2.0
         except (KeyError, TypeError, ValueError):
+            self._queue_plate_attempt(plate, confidence, accepted=False, reason="invalid_bbox")
             return
         line_y = self._settings.plate_zone.line_y_norm * frame_height
+        normalized = self._normalized_bbox(bbox, frame_height)
         if center_y <= line_y:
-            return  # above the line: outside the machine, ignore
-        confidence = float(best.get("confidence") or 0.0)
+            # Above the 차량진입선: the plate is outside the machine, so it never feeds the vote.
+            self._queue_plate_attempt(plate, confidence, accepted=False, reason="above_entry_line", bbox=normalized)
+            return
         self._plate_reads.append((plate, confidence))
+        self._queue_plate_attempt(plate, confidence, accepted=True, reason="", bbox=normalized)
         self._entry_last_evidence_at = self._now or self._entry_last_evidence_at
+
+    def _queue_plate_attempt(
+        self,
+        plate: str,
+        confidence: float | None,
+        *,
+        accepted: bool,
+        reason: str,
+        bbox: Mapping[str, float] | None = None,
+    ) -> None:
+        self._queue_raw(
+            RawEventRequest(
+                kind="plate_attempt",
+                camera_id="front",
+                plate_number=plate,
+                confidence=confidence,
+                accepted=accepted,
+                reason=reason,
+                bbox=bbox,
+            )
+        )
+
+    @staticmethod
+    def _normalized_bbox(bbox: Mapping[str, object], frame_height: int) -> dict[str, float] | None:
+        try:
+            return {key: round(float(bbox[key]), 2) for key in ("x1", "y1", "x2", "y2")}
+        except (KeyError, TypeError, ValueError):
+            return None
 
     # ------------------------------------------------------------------ tick
 
@@ -368,13 +412,26 @@ class ParkingProcessEngine:
         top = max(counts.values())
         return top * 2 > len(self._plate_reads)
 
-    def _decide_plate(self) -> None:
+    def _decide_plate(self, *, reason: str = "vote") -> None:
+        """Close the plate vote. Both outcomes are recorded: a recognized plate and 미인식 alike,
+        so every entry leaves an explicit raw result instead of silence."""
         counts: dict[str, list[float]] = {}
         for plate, confidence in self._plate_reads:
             counts.setdefault(plate, []).append(confidence)
+        reads = len(self._plate_reads)
         if not counts:
             self._plate_number = UNRECOGNIZED_PLATE
             self._plate_confidence = None
+            self._queue_raw(
+                RawEventRequest(
+                    kind="plate",
+                    plate_number=UNRECOGNIZED_PLATE,
+                    confidence=None,
+                    recognized=False,
+                    reads=reads,
+                    reason=reason,
+                )
+            )
         else:
             def rank(item: tuple[str, list[float]]) -> tuple[int, float]:
                 _plate, confidences = item
@@ -388,6 +445,9 @@ class ParkingProcessEngine:
                     kind="plate",
                     plate_number=plate,
                     confidence=self._plate_confidence,
+                    recognized=True,
+                    reads=reads,
+                    reason=reason,
                 )
             )
         _LOGGER.info(
@@ -467,6 +527,10 @@ class ParkingProcessEngine:
 
     def _abort_to_idle(self, now: datetime, detail: str, *, reason: str = "uncertainty") -> None:
         _LOGGER.warning("process-engine abort to IDLE phase=%s reason=%s (%s)", self._phase, reason, detail)
+        if self._phase == "entry_plate_reading" and not self._plate_number:
+            # The entry is being abandoned mid-vote; record what the reads amounted to so the
+            # session is not silent about the plate.
+            self._decide_plate(reason=f"aborted:{reason}")
         if self._lpr_active or self._pending_lpr == "start":
             self._pending_lpr = "stop"
         self._queue_raw(RawEventRequest(kind="vehicle_session_end", reason=f"{reason}:{detail}"))

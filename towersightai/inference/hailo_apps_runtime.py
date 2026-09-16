@@ -56,8 +56,20 @@ def hailo_apps_detection_command(
     return tuple(command)
 
 
+# A legacy /opt TAPPAS stack leaking into the verified Hailo Apps 5.1 runtime produces cryptic
+# GStreamer assertions ("g_once_init_leave", "gst_buffer_get_meta: api != 0") and no events.
+# run.sh strips these for the whole app; strip them here too so a UI launched from a shell with
+# the old exports still spawns a clean child.
+LEGACY_STACK_ENV_KEYS = ("GST_PLUGIN_PATH", "LD_LIBRARY_PATH", "GST_PLUGIN_SYSTEM_PATH")
+DEFAULT_GST_REGISTRY = Path("tmp/towersightai-gstreamer-5.1.registry.bin")
+
+
 def hailo_apps_runtime_env(settings: Settings) -> dict[str, str]:
     env = os.environ.copy()
+    for key in LEGACY_STACK_ENV_KEYS:
+        env.pop(key, None)
+    project_root_for_registry = Path(__file__).resolve(strict=False).parents[2]
+    env.setdefault("GST_REGISTRY", str(project_root_for_registry / DEFAULT_GST_REGISTRY))
     workspace = settings.hailo_apps_workspace.resolve(strict=False)
     resources = settings.hailo_apps_resources.resolve(strict=False)
     venv = settings.hailo_apps_python.parent.parent.resolve(strict=False)

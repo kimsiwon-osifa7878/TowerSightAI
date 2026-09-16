@@ -30,6 +30,81 @@ class LD2410Config:
 
 
 @dataclass(frozen=True)
+class VehicleEnvelopeConfig:
+    """Site geometry and vehicle limits for the 3D vehicle-box (직육면체) estimation.
+
+    Defaults come from the Hyundai Elevator approval drawing for 구로 신안타워 (RSTT5-36,
+    2025-12-08, sheets J001/J002): the 주차구획 pallet rectangle, rail inner width, bay heights,
+    and the 설계기준 vehicle limits (mirrors folded). Every value is millimetres. The world
+    frame origin is the pallet rectangle centre, x along the pallet length (entry direction),
+    y across the width, z up. The two diagonal side cameras are named by the vehicle corner
+    they face so the physical cameras can be swapped by configuration only.
+    """
+
+    pallet_length_mm: float = 5350.0
+    pallet_width_mm: float = 2200.0
+    rail_inner_width_mm: float = 2106.0
+    bay_height_sedan_mm: float = 1600.0
+    bay_height_suv_mm: float = 1900.0
+    max_vehicle_length_mm: float = 5205.0
+    max_vehicle_width_mm: float = 2000.0
+    max_vehicle_width_with_mirrors_mm: float = 2100.0
+    max_vehicle_height_sedan_mm: float = 1550.0
+    max_vehicle_height_suv_mm: float = 1850.0
+    max_wheel_track_mm: float = 2000.0
+    front_left_camera_role: str = "rear_side"
+    rear_right_camera_role: str = "opposite_side"
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("VEHICLE_BOX_PALLET_LENGTH_MM", self.pallet_length_mm),
+            ("VEHICLE_BOX_PALLET_WIDTH_MM", self.pallet_width_mm),
+            ("VEHICLE_BOX_RAIL_INNER_WIDTH_MM", self.rail_inner_width_mm),
+            ("VEHICLE_BOX_BAY_HEIGHT_SEDAN_MM", self.bay_height_sedan_mm),
+            ("VEHICLE_BOX_BAY_HEIGHT_SUV_MM", self.bay_height_suv_mm),
+            ("VEHICLE_BOX_MAX_LENGTH_MM", self.max_vehicle_length_mm),
+            ("VEHICLE_BOX_MAX_WIDTH_MM", self.max_vehicle_width_mm),
+            ("VEHICLE_BOX_MAX_WIDTH_WITH_MIRRORS_MM", self.max_vehicle_width_with_mirrors_mm),
+            ("VEHICLE_BOX_MAX_HEIGHT_SEDAN_MM", self.max_vehicle_height_sedan_mm),
+            ("VEHICLE_BOX_MAX_HEIGHT_SUV_MM", self.max_vehicle_height_suv_mm),
+            ("VEHICLE_BOX_MAX_WHEEL_TRACK_MM", self.max_wheel_track_mm),
+        ):
+            if not value > 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.max_vehicle_length_mm > self.pallet_length_mm:
+            raise ValueError("VEHICLE_BOX_MAX_LENGTH_MM must not exceed VEHICLE_BOX_PALLET_LENGTH_MM.")
+        if self.max_vehicle_width_mm > self.pallet_width_mm:
+            raise ValueError("VEHICLE_BOX_MAX_WIDTH_MM must not exceed VEHICLE_BOX_PALLET_WIDTH_MM.")
+        if self.max_vehicle_width_with_mirrors_mm < self.max_vehicle_width_mm:
+            raise ValueError(
+                "VEHICLE_BOX_MAX_WIDTH_WITH_MIRRORS_MM must not be smaller than VEHICLE_BOX_MAX_WIDTH_MM."
+            )
+        if self.max_wheel_track_mm > self.rail_inner_width_mm:
+            raise ValueError("VEHICLE_BOX_MAX_WHEEL_TRACK_MM must not exceed VEHICLE_BOX_RAIL_INNER_WIDTH_MM.")
+        if self.max_vehicle_height_sedan_mm > self.bay_height_sedan_mm:
+            raise ValueError("VEHICLE_BOX_MAX_HEIGHT_SEDAN_MM must not exceed VEHICLE_BOX_BAY_HEIGHT_SEDAN_MM.")
+        if self.max_vehicle_height_suv_mm > self.bay_height_suv_mm:
+            raise ValueError("VEHICLE_BOX_MAX_HEIGHT_SUV_MM must not exceed VEHICLE_BOX_BAY_HEIGHT_SUV_MM.")
+        side_roles = {CameraRole.rear_side.value, CameraRole.opposite_side.value}
+        for name, role in (
+            ("VEHICLE_BOX_FRONT_LEFT_CAMERA", self.front_left_camera_role),
+            ("VEHICLE_BOX_REAR_RIGHT_CAMERA", self.rear_right_camera_role),
+        ):
+            if role not in side_roles:
+                raise ValueError(f"{name} must be one of {sorted(side_roles)}, got {role!r}.")
+        if self.front_left_camera_role == self.rear_right_camera_role:
+            raise ValueError("VEHICLE_BOX_FRONT_LEFT_CAMERA and VEHICLE_BOX_REAR_RIGHT_CAMERA must differ.")
+
+    @property
+    def front_left_role(self) -> "CameraRole":
+        return CameraRole(self.front_left_camera_role)
+
+    @property
+    def rear_right_role(self) -> "CameraRole":
+        return CameraRole(self.rear_right_camera_role)
+
+
+@dataclass(frozen=True)
 class RawStorageConfig:
     enabled: bool = False
     local_dir: Path = Path("artifacts/raw")
@@ -48,6 +123,15 @@ class RawStorageConfig:
     media_segment_seconds: float = 2.0
     media_clip_part_seconds: float = 300.0
     media_gstreamer_python: Path = Path("/usr/bin/python3")
+    # Radar (LD2410) raw logging — analysis only, never a safety-gate input.
+    ld2410_sample_interval_seconds: float = 1.0  # 0 disables the 1 Hz sample and the radar window
+    radar_window_min_seconds: float = 3.0
+    radar_window_clear_seconds: float = 5.0
+    # How long into a radar window to keep recording camera state (0 disables radar_sample).
+    radar_sample_seconds: float = 60.0
+    media_radar_evidence: bool = True
+    media_radar_min_interval_seconds: float = 60.0
+    media_radar_clip_max_seconds: float = 30.0
     nas_host: str = ""
     nas_port: int = 22
     nas_username: str = ""
@@ -84,6 +168,20 @@ class RawStorageConfig:
                 raise ValueError(f"{name} must be positive.")
         if self.media_clip_part_seconds < self.media_segment_seconds:
             raise ValueError("RAW_MEDIA_CLIP_PART_SECONDS must be at least RAW_MEDIA_SEGMENT_SECONDS.")
+        if self.radar_sample_seconds < 0:
+            raise ValueError("RAW_DATA_RADAR_SAMPLE_SECONDS must be non-negative.")
+        if self.ld2410_sample_interval_seconds < 0:
+            raise ValueError("RAW_DATA_LD2410_SAMPLE_INTERVAL_SECONDS must be zero or positive.")
+        for name, value in (
+            ("RAW_DATA_RADAR_WINDOW_MIN_SECONDS", self.radar_window_min_seconds),
+            ("RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS", self.radar_window_clear_seconds),
+            ("RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS", self.media_radar_min_interval_seconds),
+            ("RAW_MEDIA_RADAR_CLIP_MAX_SECONDS", self.media_radar_clip_max_seconds),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.media_radar_clip_max_seconds < self.media_segment_seconds:
+            raise ValueError("RAW_MEDIA_RADAR_CLIP_MAX_SECONDS must be at least RAW_MEDIA_SEGMENT_SECONDS.")
         try:
             ZoneInfo(self.timezone_name)
         except Exception as exc:
@@ -207,6 +305,7 @@ class Settings:
     birdview_mode: BirdviewMode | str = BirdviewMode.ceiling
     raw_storage: RawStorageConfig | dict | None = None
     ld2410: LD2410Config | dict | None = None
+    vehicle_envelope: VehicleEnvelopeConfig | dict | None = None
 
     def __post_init__(self) -> None:
         self.hailo_apps_workspace = self.hailo_apps_workspace.expanduser()
@@ -228,6 +327,10 @@ class Settings:
             self.ld2410 = LD2410Config()
         elif isinstance(self.ld2410, dict):
             self.ld2410 = LD2410Config(**self.ld2410)
+        if self.vehicle_envelope is None:
+            self.vehicle_envelope = VehicleEnvelopeConfig()
+        elif isinstance(self.vehicle_envelope, dict):
+            self.vehicle_envelope = VehicleEnvelopeConfig(**self.vehicle_envelope)
         self._validate_safety_constraints()
 
     def _as_camera(self, camera: CameraConfig | dict) -> CameraConfig:

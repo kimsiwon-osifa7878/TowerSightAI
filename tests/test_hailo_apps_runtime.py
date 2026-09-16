@@ -137,3 +137,18 @@ def test_hailo_apps_pipeline_logging_redacts_rtsp_credentials():
     assert "operator" not in redacted
     assert "secret" not in redacted
     assert "rtsp://***:***@camera.local/stream1" in redacted
+
+
+def test_runtime_env_strips_the_legacy_tappas_stack(monkeypatch, tmp_path):
+    from towersightai.inference.hailo_apps_runtime import hailo_apps_runtime_env
+
+    monkeypatch.setenv("GST_PLUGIN_PATH", "/opt/hailo/tappas/lib/x86_64-linux-gnu/gstreamer-1.0:")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/hailo/tappas/lib/x86_64-linux-gnu:")
+    monkeypatch.delenv("GST_REGISTRY", raising=False)
+    env = hailo_apps_runtime_env(_settings(tmp_path))
+    assert "GST_PLUGIN_PATH" not in env
+    assert "LD_LIBRARY_PATH" not in env
+    assert env["GST_REGISTRY"].endswith("tmp/towersightai-gstreamer-5.1.registry.bin")
+
+    monkeypatch.setenv("GST_REGISTRY", "/custom/registry.bin")
+    assert hailo_apps_runtime_env(_settings(tmp_path))["GST_REGISTRY"] == "/custom/registry.bin"

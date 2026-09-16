@@ -13,11 +13,14 @@ an unhealthy device already blocks final OK through the inference path.
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 HAILO_PCI_VENDOR = "0x1e60"
 DEFAULT_DEVICE_NODE = Path("/dev/hailo0")
@@ -28,6 +31,267 @@ DEFAULT_MODULE_ROOT = Path("/sys/module")
 TempProbe = Callable[[], tuple[str, str]]
 
 _LOGGER = logging.getLogger("towersightai.hailo.health")
+
+
+@dataclass(frozen=True)
+class HailoDeviceHolder:
+    """A process that currently has ``/dev/hailo*`` open."""
+
+    pid: int
+    name: str
+    ppid: int
+    elapsed_seconds: float
+    is_descendant: bool  # child of the current process (our own inference child)
+
+    @property
+    def elapsed_text(self) -> str:
+        seconds = int(self.elapsed_seconds)
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        if days:
+            return f"{days}일 {hours}시간"
+        if hours:
+            return f"{hours}시간 {minutes}분"
+        return f"{minutes}분"
+
+    def describe(self) -> str:
+        owner = "이 앱의 자식" if self.is_descendant else "다른 프로세스(고아 가능성)"
+        return f"PID {self.pid} {self.name!r} 실행 {self.elapsed_text}, {owner}"
+
+
+def _read_proc_stat(proc_dir: Path) -> tuple[str, int, float] | None:
+    """Return (comm, ppid, starttime_ticks) from /proc/<pid>/stat, or None."""
+    try:
+        raw = (proc_dir / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        left, _, right = raw.rpartition(")")
+        comm = left.split("(", 1)[1]
+        fields = right.split()
+        ppid = int(fields[1])
+        starttime = float(fields[19])
+    except (IndexError, ValueError):
+        return None
+    return comm, ppid, starttime
+
+
+def _is_descendant(pid: int, ancestor: int, parents: dict[int, int]) -> bool:
+    seen = set()
+    current = pid
+    while current > 1 and current not in seen:
+        seen.add(current)
+        parent = parents.get(current)
+        if parent is None:
+            return False
+        if parent == ancestor:
+            return True
+        current = parent
+    return False
+
+
+def find_hailo_device_holders(
+    *,
+    proc_root: Path = Path("/proc"),
+    device_prefix: str = "/dev/hailo",
+    self_pid: int | None = None,
+    now_uptime: float | None = None,
+    clock_ticks: int | None = None,
+) -> tuple[HailoDeviceHolder, ...]:
+    """Scan /proc for processes holding the Hailo device node. Never raises."""
+    self_pid = os.getpid() if self_pid is None else self_pid
+    try:
+        ticks = clock_ticks or os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError, AttributeError):
+        ticks = 100
+    if now_uptime is None:
+        try:
+            now_uptime = float((proc_root / "uptime").read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            now_uptime = None
+    stats: dict[int, tuple[str, int, float]] = {}
+    holders_pids: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        stat = _read_proc_stat(entry)
+        if stat is None:
+            continue
+        stats[pid] = stat
+        if pid == self_pid:
+            continue
+        fd_dir = entry / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if target.startswith(device_prefix):
+                holders_pids.append(pid)
+                break
+    parents = {pid: stat[1] for pid, stat in stats.items()}
+    holders = []
+    for pid in sorted(holders_pids):
+        comm, ppid, starttime = stats[pid]
+        elapsed = 0.0 if now_uptime is None else max(0.0, now_uptime - starttime / ticks)
+        holders.append(
+            HailoDeviceHolder(
+                pid=pid,
+                name=comm,
+                ppid=ppid,
+                elapsed_seconds=elapsed,
+                is_descendant=_is_descendant(pid, self_pid, parents),
+            )
+        )
+    return tuple(holders)
+
+
+DEVICE_BUSY_MARKERS = ("HAILO_OUT_OF_PHYSICAL_DEVICES", "not enough free devices")
+# Command-line fragments of every child this application spawns and that must never outlive it.
+CHILD_CMDLINE_MARKERS = (
+    "towersightai.cli.hailo_apps_detection",
+    "towersightai/cli/event_video_recorder.py",
+)
+CHILD_COMM_MARKERS = ("Hailo Multisour",)
+
+
+def find_orphaned_children(
+    *,
+    proc_root: Path = Path("/proc"),
+    self_pid: int | None = None,
+    now_uptime: float | None = None,
+    clock_ticks: int | None = None,
+) -> tuple[HailoDeviceHolder, ...]:
+    """TowerSightAI child processes (inference, evidence recorder) that are not our descendants.
+
+    They hold Hailo and/or camera RTSP sessions, so a stale one from a dead UI starves every later
+    run (HAILO_OUT_OF_PHYSICAL_DEVICES, RTSP 400). Never raises.
+    """
+    self_pid = os.getpid() if self_pid is None else self_pid
+    try:
+        ticks = clock_ticks or os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError, AttributeError):
+        ticks = 100
+    if now_uptime is None:
+        try:
+            now_uptime = float((proc_root / "uptime").read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            now_uptime = None
+    stats: dict[int, tuple[str, int, float]] = {}
+    candidates: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        stat = _read_proc_stat(entry)
+        if stat is None:
+            continue
+        stats[pid] = stat
+        if pid == self_pid:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            cmdline = ""
+        comm = stat[0]
+        if any(marker in cmdline for marker in CHILD_CMDLINE_MARKERS) or any(
+            comm.startswith(marker) for marker in CHILD_COMM_MARKERS
+        ):
+            candidates.append(pid)
+    parents = {pid: stat[1] for pid, stat in stats.items()}
+    orphans = []
+    for pid in sorted(candidates):
+        if _is_descendant(pid, self_pid, parents):
+            continue
+        comm, ppid, starttime = stats[pid]
+        elapsed = 0.0 if now_uptime is None else max(0.0, now_uptime - starttime / ticks)
+        orphans.append(HailoDeviceHolder(pid=pid, name=comm, ppid=ppid, elapsed_seconds=elapsed, is_descendant=False))
+    return tuple(orphans)
+
+
+def find_stale_children(**kwargs: Any) -> tuple[HailoDeviceHolder, ...]:
+    """Device holders plus orphaned children, de-duplicated by pid (the health monitor's scan)."""
+    seen: dict[int, HailoDeviceHolder] = {}
+    for holder in find_hailo_device_holders(**kwargs):
+        seen[holder.pid] = holder
+    for orphan in find_orphaned_children(**{k: v for k, v in kwargs.items() if k != "device_prefix"}):
+        seen.setdefault(orphan.pid, orphan)
+    return tuple(seen[pid] for pid in sorted(seen))
+
+
+def describe_device_conflict(log_text: str, holders: tuple[HailoDeviceHolder, ...] | None = None) -> str:
+    """Operator-facing explanation when a child failed because the device was already taken."""
+    if not any(marker in log_text for marker in DEVICE_BUSY_MARKERS):
+        return ""
+    holders = find_hailo_device_holders() if holders is None else holders
+    foreign = [holder for holder in holders if not holder.is_descendant]
+    if foreign:
+        listed = "; ".join(holder.describe() for holder in foreign)
+        return (
+            f"Hailo 장치를 다른 프로세스가 점유 중입니다: {listed}. "
+            "시스템 점검 페이지의 '고아 프로세스 종료'로 정리하거나 해당 프로세스를 종료하세요"
+        )
+    if holders:
+        return "Hailo 장치를 이 앱의 다른 추론 자식이 아직 쥐고 있습니다. 이전 추론이 끝난 뒤 다시 시작하세요"
+    return "Hailo 장치가 사용 중이라고 보고되었지만 점유 프로세스를 찾지 못했습니다 (장치 재초기화 필요 가능)"
+
+
+def terminate_foreign_holders(
+    holders: tuple[HailoDeviceHolder, ...],
+    *,
+    kill: Callable[[int, int], None] = os.kill,
+    grace_seconds: float = 3.0,
+    sleep: Callable[[float], None] = time.sleep,
+    alive: Callable[[int], bool] | None = None,
+) -> tuple[int, ...]:
+    """SIGTERM (then SIGKILL) holders that are not this process's descendants. Returns pids handled."""
+
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    alive = alive or _alive
+    handled: list[int] = []
+    targets = [holder for holder in holders if not holder.is_descendant]
+    for holder in targets:
+        try:
+            kill(holder.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            _LOGGER.warning("hailo-holder-terminate-denied pid=%s name=%s", holder.pid, holder.name)
+            continue
+        handled.append(holder.pid)
+        _LOGGER.warning("hailo-holder-terminate pid=%s name=%s elapsed=%s", holder.pid, holder.name, holder.elapsed_text)
+    if handled:
+        sleep(grace_seconds)
+        for pid in handled:
+            if alive(pid):
+                try:
+                    kill(pid, signal.SIGKILL)
+                    _LOGGER.warning("hailo-holder-kill pid=%s", pid)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    return tuple(handled)
 
 
 @dataclass(frozen=True)
@@ -44,6 +308,11 @@ class HailoHealthSnapshot:
     rxerr_delta: int = 0
     chip_temperature_c: float | None = None
     detail: str = ""
+    device_holders: tuple[HailoDeviceHolder, ...] = ()
+
+    @property
+    def foreign_holders(self) -> tuple[HailoDeviceHolder, ...]:
+        return tuple(holder for holder in self.device_holders if not holder.is_descendant)
 
     @property
     def pill_text(self) -> str:
@@ -51,6 +320,8 @@ class HailoHealthSnapshot:
         if self.status == "error":
             return "HAILO 오류"
         if self.status == "degraded":
+            if self.foreign_holders:
+                return "HAILO 점유됨"
             extra = f" +{self.rxerr_delta}" if self.rxerr_delta else ""
             return f"HAILO 링크오류{extra}"
         if self.chip_temperature_c is not None:
@@ -71,6 +342,10 @@ class HailoHealthSnapshot:
             f"PCIe 링크 오류(RxErr 누적): {rxerr}",
             f"칩 온도: {temp}",
         ]
+        if self.device_holders:
+            lines.append("추론/녹화 프로세스: " + "; ".join(holder.describe() for holder in self.device_holders))
+        else:
+            lines.append("추론/녹화 프로세스: 없음")
         if self.detail:
             lines.append(f"세부: {self.detail}")
         return tuple(lines)
@@ -168,9 +443,17 @@ def collect_hailo_health(
     module_root: Path = DEFAULT_MODULE_ROOT,
     temp_probe: TempProbe | None = None,
     previous_rxerr: int | None = None,
+    holder_scan: Callable[[], tuple[HailoDeviceHolder, ...]] | None = find_stale_children,
 ) -> HailoHealthSnapshot:
     """Collect one health snapshot. Never raises; failures become the snapshot."""
     pcie_address, device_dir = find_hailo_pci_device(pci_root)
+    holders: tuple[HailoDeviceHolder, ...] = ()
+    if holder_scan is not None:
+        try:
+            holders = holder_scan()
+        except Exception:  # noqa: BLE001 - a scan failure must not break health reporting.
+            _LOGGER.exception("hailo-holder-scan-failed")
+    foreign_holders = tuple(holder for holder in holders if not holder.is_descendant)
     pcie_parent = ""
     rxerr_count: int | None = None
     if device_dir is not None:
@@ -216,6 +499,13 @@ def collect_hailo_health(
         status = "degraded"
         summary = f"PCIe 링크 오류가 증가하고 있습니다 (RxErr +{rxerr_delta}, 누적 {rxerr_count})"
         detail = "M.2 장착 상태 점검 또는 PCIe 링크 속도 하향(Gen2)을 검토하세요."
+    elif foreign_holders:
+        status = "degraded"
+        summary = (
+            f"이 앱의 자식이 아닌 추론/녹화 프로세스가 {len(foreign_holders)}개 남아 있습니다 "
+            "— Hailo 장치 또는 카메라 RTSP 세션을 점유해 추론이 시작되지 못합니다"
+        )
+        detail = "'고아 프로세스 종료' 버튼으로 정리하세요 (이 앱의 자식은 건드리지 않습니다)."
     else:
         status, summary = "ok", "정상"
         detail = "" if probe_state == "ok" else (
@@ -234,6 +524,7 @@ def collect_hailo_health(
         rxerr_delta=rxerr_delta,
         chip_temperature_c=chip_temp,
         detail=detail,
+        device_holders=holders,
     )
 
 

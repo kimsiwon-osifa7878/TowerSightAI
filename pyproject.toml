@@ -23,6 +23,9 @@ ui = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.setuptools.package-data]
+towersightai = ["analyze/static/*"]
+
 [tool.setuptools.packages.find]
 include = ["towersightai*"]
 exclude = ["refers*"]
@@ -33,3 +36,5 @@ towersightai-ai-diagnostics = "towersightai.cli.ai_diagnostics:main"
 towersightai-operator-ui = "towersightai.cli.operator_ui:main"
 towersightai-hailo-image-smoke = "towersightai.cli.hailo_image_smoke:main"
 towersightai-sync-raw-data = "towersightai.cli.raw_data_sync:main"
+towersightai-checkerboard = "towersightai.cli.checkerboard:main"
+towersightai-analyze = "towersightai.cli.analyze:main"

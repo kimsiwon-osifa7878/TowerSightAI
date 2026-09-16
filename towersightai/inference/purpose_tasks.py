@@ -26,7 +26,13 @@ from towersightai.inference.hailo_apps_runtime import (
     hailo_apps_runtime_env,
 )
 from towersightai.inference.image_smoke import NETWORK_FORMAT, NETWORK_HEIGHT, NETWORK_WIDTH, _gst_runtime_env
-from towersightai.inference.live_detection import _read_log_tail, latest_events, parse_detection_json
+from towersightai.inference.live_detection import (
+    _extract_error_lines,
+    _read_log_tail,
+    _with_device_conflict,
+    latest_events,
+    parse_detection_json,
+)
 from towersightai.runtime_logging import (
     missing_resource_paths,
     new_run_id,
@@ -51,6 +57,7 @@ FATAL_GSTREAMER_PATTERNS = (
     "파이프라인이 재생을 원하지 않음",
     "파이프라인이 PREROLL하기를 원하지 않음",
 )
+RTSP_SESSION_BUSY_MARKER = "Bad Request (400)"
 PURPOSE_VEHICLE_DETECTION = "vehicle_detection"
 PURPOSE_LPR_IMAGE = "lpr_image"
 PURPOSE_PERSON_PRESENCE = "person_presence"
@@ -81,6 +88,9 @@ class PurposeInferenceProcess:
     validate_resource_paths: bool = False
     max_consecutive_restarts: int = 0
     restart_delay_seconds: float = 1.0
+    # Tapo cameras keep a dropped RTSP session alive for tens of seconds. Restarting after a
+    # `Bad Request (400)` within a second only burns another session slot, so wait longer.
+    rtsp_busy_restart_delay_seconds: float = 10.0
     restart_stability_seconds: float = 60.0
     diagnostic_startup_timeout_seconds: float = 30.0
 
@@ -468,10 +478,18 @@ class PurposeInferenceRunner:
                             exit_code,
                             redact_sensitive_text(detail),
                         )
-                        self.on_status(
-                            f"AI 입력 스트림 복구 중 "
-                            f"({consecutive_restarts}/{self.process.max_consecutive_restarts})"
-                        )
+                        rtsp_busy = RTSP_SESSION_BUSY_MARKER in detail
+                        if rtsp_busy:
+                            self.on_status(
+                                f"카메라 RTSP 세션 한도(400): 카메라가 이전 세션을 정리할 때까지 "
+                                f"{self.process.rtsp_busy_restart_delay_seconds:.0f}초 대기 "
+                                f"({consecutive_restarts}/{self.process.max_consecutive_restarts})"
+                            )
+                        else:
+                            self.on_status(
+                                f"AI 입력 스트림 복구 중 "
+                                f"({consecutive_restarts}/{self.process.max_consecutive_restarts})"
+                            )
                         self._write_status(
                             run_id=run_id,
                             status="recovering",
@@ -487,7 +505,12 @@ class PurposeInferenceRunner:
                                 self.process.diagnostic_path,
                                 f"{run_id}.restart-{consecutive_restarts}",
                             )
-                        if not self._wait_before_restart(self.process.restart_delay_seconds):
+                        restart_delay = (
+                            self.process.rtsp_busy_restart_delay_seconds
+                            if rtsp_busy
+                            else self.process.restart_delay_seconds
+                        )
+                        if not self._wait_before_restart(restart_delay):
                             break
                         try:
                             log_fp.write(
@@ -1239,22 +1262,11 @@ def _redact_rtsp_credentials(text: str) -> str:
     return re.sub(r"(rtsp://)([^@\s/]+)@", r"\1***:***@", text)
 
 
-def _extract_error_lines(log_tail: str, *, limit: int = 3) -> str:
-    """Prefer the actual ERROR lines over pipeline-string noise in operator-facing text."""
-    markers = ("ERROR", "Bad Request", "error", "failed", "Failed")
-    lines = [
-        line.strip()
-        for line in log_tail.splitlines()
-        if any(marker in line for marker in markers) and "PIPELINE_" not in line
-    ]
-    return " · ".join(lines[-limit:])
-
-
 def _process_error_message(returncode: int | None, log_path: Path) -> str:
     log_tail = _read_log_tail(log_path)
     error_lines = _extract_error_lines(log_tail)
     if error_lines:
-        return error_lines
+        return _with_device_conflict(error_lines, log_tail)
     if log_tail:
         return log_tail
     return f"gst-launch exited with {returncode}"
@@ -1266,7 +1278,7 @@ def _fatal_log_message(log_path: Path) -> str:
         return ""
     for pattern in FATAL_GSTREAMER_PATTERNS:
         if pattern in log_tail:
-            return _extract_error_lines(log_tail) or log_tail
+            return _with_device_conflict(_extract_error_lines(log_tail) or log_tail, log_tail)
     return ""
 
 

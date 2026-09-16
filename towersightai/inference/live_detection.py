@@ -613,8 +613,33 @@ def _redact_rtsp_credentials(text: str) -> str:
     return re.sub(r"(rtsp://)([^@\s/]+)@", r"\1***:***@", text)
 
 
+def _extract_error_lines(log_tail: str, *, limit: int = 3) -> str:
+    """Prefer the actual ERROR lines over pipeline-string noise in operator-facing text."""
+    markers = ("ERROR", "Bad Request", "error", "failed", "Failed")
+    lines = [
+        line.strip()
+        for line in log_tail.splitlines()
+        if any(marker in line for marker in markers) and "PIPELINE_" not in line
+    ]
+    return " · ".join(lines[-limit:])
+
+
+def _with_device_conflict(message: str, log_tail: str) -> str:
+    """Prefix the Hailo device-holder explanation when the child lost the device race."""
+    from towersightai.inference.hailo_health import describe_device_conflict
+
+    try:
+        conflict = describe_device_conflict(log_tail)
+    except Exception:  # noqa: BLE001 - explanation is best-effort.
+        conflict = ""
+    return f"{conflict} · {message}" if conflict else message
+
+
 def _process_error_message(returncode: int | None, log_path: Path | None) -> str:
     log_tail = _read_log_tail(log_path)
+    error_lines = _extract_error_lines(log_tail)
+    if error_lines:
+        return _with_device_conflict(error_lines, log_tail)
     if log_tail:
         return log_tail
     return f"gst-launch exited with {returncode}"
@@ -626,7 +651,7 @@ def _fatal_log_message(log_path: Path | None) -> str:
         return ""
     for pattern in FATAL_GSTREAMER_PATTERNS:
         if pattern in log_tail:
-            return log_tail
+            return _with_device_conflict(_extract_error_lines(log_tail) or log_tail, log_tail)
     return ""
 
 

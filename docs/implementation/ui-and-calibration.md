@@ -53,13 +53,13 @@ action. Task run/stop controls live inside their pages, not in the sidebar.
 Current sections and entries:
 
 - `운영`: `사용자 화면`, `주차 프로세스 테스트`
-- `진단`: `전체 카메라`, `차량 감지`, `사람 감지`, `번호판 인식`, `레이더 (LD2410)`, `NAS 연결 확인`, `시스템 점검`, `실행 로그`
+- `진단`: `전체 카메라`, `차량 감지`, `사람 감지`, `번호판 인식`, `레이더 (LD2410)`, `NAS 연결 확인`, `NAS 파일 전송`, `카메라 캘리브레이션`, `시스템 점검`, `실행 로그`
 - `시스템`: `카메라 설정`, `프로그램 종료`
 
 Workspace pages share one camera grid: `전체 카메라`, `사람 감지` adopt it in the all-camera layout, and
 `차량 감지`, `번호판 인식` adopt it front-focused. Each page carries a title, purpose text, and its own
 run/stop controls (`차량 감지 시작`, `사람 감지 시작`, `정면 카메라 인식`, `이미지 LPR`, `NAS 연결 확인 실행`,
-`이전 AI Detection` on the camera page, and the driver-stage buttons plus `차량 진입 시뮬레이션` on the
+`사람 감지 시작`/`차량 감지 시작` on the camera page, and the driver-stage buttons plus `차량 진입 시뮬레이션` on the
 user-screen test page). `시스템 점검` runs DiagnosticsService tests (settings, Hailo installation, sample
 image, per-camera frames, PLC simulator, full smoke) off the UI thread with results appended to a page log;
 every result stays `safe_to_operate=False`, and the page shows a Hailo device-health panel (PCIe/driver/
@@ -80,7 +80,11 @@ two-second clip from that camera. Frame collection runs on a UI timer and the en
 thread. Missing `SYNOLOGY_NAS_*` settings must be reported in the operator status row instead of attempting a
 connection. The result is diagnostic evidence only and never authorizes final OK.
 
-`이전 AI Detection` is a regression-isolation control. It should bypass runtime model selection and launch the previous multistream detection path that uses `HAILO_HEF_PATH`, the shared detection event directory, and the same camera rotation map as the visible UI.
+`NAS 파일 전송` is a file relay for sites where the remote session cannot carry files: the operator picks local files (`파일 선택`, a native file dialog; duplicates by path are ignored) and `NAS로 보내기` uploads them flat into the single folder `<SYNOLOGY_NAS_FOLDER>/transfer/` over the same strict-host-key SFTP with atomic `.part` publication and SHA-256 read-back verification (`storage/file_transfer.py`). Uploads run on a `QThread`; per-file progress lands in the page status row; a successful batch clears the pending list while a failed batch keeps it for a retry. Missing `SYNOLOGY_NAS_*` settings or an empty selection are reported without contacting the NAS. It is relay-only: no result ever changes safety state, calibration state, or PLC output, and final OK stays blocked.
+
+`카메라 캘리브레이션` measures one camera's intrinsics with a printed checkerboard (`towersightai/calibration/`). The operator picks a camera (defaults to the `VEHICLE_BOX_FRONT_LEFT_CAMERA` role and the grid shows only that tile via the `single:<role>` layout), presses `촬영 시작`, and follows fifteen pose instructions (`CAPTURE_POSES`: centre, edges, corners, four tilts, near, far). A `CheckerboardDetectWorker` thread runs `cv2.findChessboardCornersSB` on preview frames every 400 ms; detected corners are drawn on the tile, and after two steady detections (or `지금 촬영` in manual mode) the BGR frame is saved to `data/calibration/intrinsics/sessions/<camera>-<stamp>/pose-NN-<key>.png` and the next instruction appears with a 2.5 s hold. `측정 실행` (≥10 samples) runs `cv2.calibrateCamera` on an `IntrinsicsCalibrateWorker` thread and writes `intrinsics.json` plus `data/calibration/intrinsics/<camera>.json` (camera matrix, distortion, RMS, per-view errors, image size, rotation, `reviewed: false`, `safe_to_operate: false`). Switching the camera ends the session. This produces a measurement file only; nothing here marks calibration valid for the safety gate, and final OK stays blocked. The printable board comes from `towersightai-checkerboard` (10×7 squares, 25 mm, A4 landscape: PDF/SVG/PNG under `data/calibration/checkerboard/`, gitignored). Field photos/videos for offline work go under `data/field-media/{front,rear_side,opposite_side}/` (per-camera folders, gitignored except the README).
+
+The `전체 카메라` page carries the same two manual inference controls as the task pages (`사람 감지 시작`, `차량 감지 시작`, registered in `purpose_task_extra_buttons`). Clicking one while another task or the automatic `프로세스 감시` is running stops it and starts the clicked task when the child has exited; clicking the running task stops it. The former `이전 AI Detection` regression toggle and the general multistream path were removed from the UI (2026-09-10): the console offers exactly `사람 감지` and `차량 감지` as manual inference.
 
 Purpose-specific AI controls should use fixed, known-compatible TAPPAS example model sets:
 

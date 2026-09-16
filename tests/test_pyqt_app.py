@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QRect, QSize, QThread, Qt
 from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QPushButton
 
 from towersightai.config.settings import CameraRole, LD2410Config, RawStorageConfig, Settings
 from towersightai.inference.events import BoundingBox, DetectionEvent
@@ -27,7 +27,8 @@ from towersightai.ui.driver_view import (
     OPERATOR_HOLD_MS,
     OperatorEntryHotspot,
 )
-from towersightai.storage.connection_test import NasConnectionTestResult
+from towersightai.storage.connection_test import NasConnectionTestResult, UploadedArtifact
+from towersightai.storage.file_transfer import NasFileTransferResult
 from towersightai.ui.pyqt_app import (
     NAS_TEST_CLIP_FPS,
     NAS_TEST_CLIP_SECONDS,
@@ -40,16 +41,13 @@ from towersightai.ui.pyqt_app import (
     WINDOWED_DEFAULT_WIDTH,
     WINDOWED_MAX_HEIGHT,
     WINDOWED_MAX_WIDTH,
-    LiveDetectionWorker,
     OperatorWindow,
     PurposeInferenceWorker,
     _cover_source_rect,
     _bbox_to_rect,
-    _ai_detection_label,
     _detection_label,
     _fresh_detections,
     _front_lpr_payload,
-    _legacy_ai_detection_label,
     _network_bbox_to_source_bbox,
     _prepare_operator_window,
     _purpose_detection_label,
@@ -265,19 +263,6 @@ def test_cv_fallback_frame_rotation_matches_ui_setting():
     assert rotated.shape == (1920, 1080, 3)
 
 
-def test_ai_detection_label_shows_all_target_cameras_and_counts():
-    assert _ai_detection_label(("ceiling", "front"), {"ceiling": 0, "front": 7}) == "AI 추론 ON: ceiling(0), front(7)"
-    assert "loading 1.2s" in _ai_detection_label(("ceiling",), {"ceiling": 0}, loading_seconds=1.2)
-    assert "first inference 3.4s" in _ai_detection_label(("ceiling",), {"ceiling": 2}, first_inference_seconds=3.4)
-
-
-def test_legacy_ai_detection_label_shows_counts_without_model_load_state():
-    assert _legacy_ai_detection_label(()) == "이전 AI Detection OFF"
-    assert _legacy_ai_detection_label(("ceiling", "front"), {"ceiling": 3, "front": 9}) == (
-        "이전 AI Detection ON: ceiling(3), front(9)"
-    )
-
-
 def test_purpose_detection_label_shows_task_counts_and_load_time():
     assert _purpose_detection_label("차량 감지", ("front",), {"front": 2}) == "차량 감지 ON: front(2)"
     assert "loading 1.5s" in _purpose_detection_label("번호판 이미지 인식", (), loading_seconds=1.5)
@@ -327,7 +312,7 @@ def test_operator_ui_starts_on_user_mode_with_sidebar_closed():
     assert "이전 AI Detection" not in labels
     assert "차량 진입 시뮬레이션" not in labels
     assert "EMPTY" not in labels
-    assert window.legacy_ai_detection_button.text() == "이전 AI Detection"
+    assert not hasattr(window, "legacy_ai_detection_button")
     assert window.front_lpr_button.text() == "정면 카메라 인식"
     assert window.vehicle_sim_button.text() == "차량 진입 시뮬레이션"
 
@@ -1076,121 +1061,6 @@ def test_operator_window_initializes_camera_rotation_from_settings(monkeypatch):
     window.close()
 
 
-def test_ai_detection_timeout_marks_selected_model_unconfirmed(monkeypatch):
-    _qt_app()
-    settings = _settings()
-    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
-    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
-    window = OperatorWindow(display, settings=settings)
-    window._detection_enabled = True
-    window._detection_camera_ids = ("ceiling",)
-    window._detection_event_counts = {"ceiling": 0}
-    window._detection_model_label = "selected.hef"
-    window._detection_load_started_at = 0.0
-    window._detection_first_inference_seconds = None
-    monkeypatch.setattr("towersightai.ui.pyqt_app.time.monotonic", lambda: 31.0)
-
-    window._tick()
-
-    assert "추론 미확인: selected.hef" == window.model_status_label.text()
-    assert "AI 추론 실패" in window.warning_label.text()
-    window.close()
-
-
-def test_live_detection_worker_keeps_ui_rotation_map_for_pipeline_start():
-    settings = _settings()
-
-    worker = LiveDetectionWorker(settings, ("ceiling", "front"), camera_rotations={"ceiling": 90, "front": 0}, hef_path=Path("/tmp/selected.hef"))
-
-    assert worker.camera_rotations == {"ceiling": 90, "front": 0}
-    assert worker.hef_path == Path("/tmp/selected.hef")
-
-
-def test_live_detection_worker_legacy_mode_keeps_previous_pipeline_inputs():
-    settings = _settings()
-
-    worker = LiveDetectionWorker(
-        settings,
-        ("ceiling", "front"),
-        camera_rotations={"ceiling": 90, "front": 0},
-        hef_path=Path("/tmp/selected.hef"),
-        legacy_mode=True,
-    )
-
-    assert worker.legacy_mode is True
-    assert worker.camera_rotations == {"ceiling": 90, "front": 0}
-
-
-def test_live_detection_worker_normal_mode_reuses_previous_event_path_with_selected_hef(monkeypatch):
-    settings = _settings()
-    calls = []
-
-    def fake_live_process(settings_arg, cameras_arg, **kwargs):
-        calls.append((settings_arg, cameras_arg, kwargs))
-        return SimpleNamespace(command=("gst-launch-1.0", f"hailonet hef-path={kwargs.get('hef_path') or settings_arg.hailo_hef_path}"), hef_path=kwargs.get("hef_path") or settings_arg.hailo_hef_path)
-
-    monkeypatch.setattr("towersightai.ui.pyqt_app.live_multistream_detection_process", fake_live_process)
-    worker = LiveDetectionWorker(
-        settings,
-        ("ceiling", "front"),
-        camera_rotations={"ceiling": 90, "front": 0},
-        hef_path=Path("/tmp/selected.hef"),
-    )
-
-    process = worker._build_process()
-
-    assert process.hef_path == Path("/tmp/selected.hef")
-    assert calls[0][2] == {"camera_rotations": {"ceiling": 90, "front": 0}, "hef_path": Path("/tmp/selected.hef")}
-    assert "event_dir" not in calls[0][2]
-
-
-def test_live_detection_worker_legacy_mode_uses_previous_process_without_hef_override(monkeypatch):
-    settings = _settings()
-    calls = []
-
-    def fake_live_process(settings_arg, cameras_arg, **kwargs):
-        calls.append((settings_arg, cameras_arg, kwargs))
-        return SimpleNamespace(command=("gst-launch-1.0", f"hailonet hef-path={settings_arg.hailo_hef_path}"), hef_path=settings_arg.hailo_hef_path)
-
-    monkeypatch.setattr("towersightai.ui.pyqt_app.live_multistream_detection_process", fake_live_process)
-    worker = LiveDetectionWorker(
-        settings,
-        ("ceiling", "front"),
-        camera_rotations={"ceiling": 90, "front": 0},
-        hef_path=Path("/tmp/selected.hef"),
-        legacy_mode=True,
-    )
-
-    process = worker._build_process()
-
-    assert process.hef_path == settings.hailo_hef_path
-    assert calls[0][2] == {"camera_rotations": {"ceiling": 90, "front": 0}}
-    assert "hef_path" not in calls[0][2]
-    assert "event_dir" not in calls[0][2]
-
-
-def test_legacy_ai_detection_button_starts_previous_detection_path(monkeypatch):
-    _qt_app()
-    settings = _settings()
-    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
-    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
-    monkeypatch.setattr(QThread, "start", lambda self: None)
-    window = OperatorWindow(display, settings=settings)
-    window._runtime_camera_status = {"ceiling": "정상 수신", "front": "정상 수신"}
-
-    window.legacy_ai_detection_button.click()
-
-    assert window._detection_legacy_mode is True
-    assert window.legacy_ai_detection_button.isChecked() is True
-    assert window.legacy_ai_detection_button.text() == "이전 AI Detection ON"
-    assert not hasattr(window, "ai_detection_button")
-    assert len(window._detection_workers) == 1
-    assert window._detection_workers[0].legacy_mode is True
-    assert window._detection_workers[0].hef_path is None
-    assert window.ai_detection_label.text() == "이전 AI Detection ON: ceiling(0), front(0)"
-    window.close()
-
-
 def test_vehicle_purpose_button_starts_front_only_task(monkeypatch):
     _qt_app()
     settings = _settings()
@@ -1270,7 +1140,7 @@ def test_lpr_no_result_updates_top_instruction_label(monkeypatch):
     window.close()
 
 
-def test_front_camera_lpr_runs_without_stopping_ai_detection(monkeypatch):
+def test_front_camera_lpr_runs_without_stopping_purpose_inference(monkeypatch):
     _qt_app()
     settings = _settings()
     display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
@@ -1278,22 +1148,23 @@ def test_front_camera_lpr_runs_without_stopping_ai_detection(monkeypatch):
     monkeypatch.setattr(QThread, "start", lambda self: None)
     stopped = False
 
-    def fake_stop_ai_detection(_self):
+    def fake_stop_purpose_inference(_self):
         nonlocal stopped
         stopped = True
 
-    monkeypatch.setattr(OperatorWindow, "_stop_ai_detection", fake_stop_ai_detection)
+    monkeypatch.setattr(OperatorWindow, "_stop_purpose_inference", fake_stop_purpose_inference)
     window = OperatorWindow(display, settings=settings)
     frame = QImage(64, 32, QImage.Format.Format_RGB32)
     frame.fill(QColor("#ffffff"))
     window.camera_widgets[CameraRole.front].set_frame(frame)
-    window._detection_enabled = True
-    window._detection_workers.append(object())
+    window._purpose_task_enabled = True
+    window._purpose_task_id = "person_presence"
+    window._purpose_workers.append(object())
 
     window.front_lpr_button.click()
 
     assert stopped is False
-    assert window._detection_enabled is True
+    assert window._purpose_task_enabled is True
     assert len(window._front_lpr_workers) == 1
     assert window.front_lpr_button.isChecked() is True
     assert window.front_lpr_button.text() == "정면 카메라 인식 중…"
@@ -2244,6 +2115,9 @@ def test_engine_backs_off_while_simulation_owns_display():
 
 def test_process_monitoring_autostart_waits_for_streaming_cameras(monkeypatch):
     _qt_app()
+    import towersightai.ui.pyqt_app as ui_module
+
+    monkeypatch.setattr(ui_module, "MONITORING_CAMERA_SETTLE_SECONDS", 0.0)
     model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
     window = OperatorWindow(model, settings=_settings())
     started: list[str] = []
@@ -2338,4 +2212,504 @@ def test_audio_toggle_gates_the_warning_cue(tmp_path: Path, monkeypatch):
     assert window.operator_settings.audio_enabled is False
     window._apply_engine_output(pyqt_app.EngineOutput(public_state=ParkingState.HUMAN_DETECTED, phase="exit_person_warning", audio_cue="exit_warning"))
     assert played == []
+    window.close()
+
+
+def test_nas_file_transfer_page_is_in_the_operator_menu():
+    _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras))
+    assert "NAS 파일 전송" in window.sidebar_buttons
+    assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
+    assert "NAS 파일 전송" in window.operator_pages
+    assert window.nas_transfer_send_button.isEnabled() is False  # nothing selected yet
+    window.close()
+
+
+def test_nas_file_transfer_shows_the_single_target_folder(tmp_path: Path):
+    _qt_app()
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    assert "nas.example.test:/home/site/transfer" in window.nas_transfer_target_label.text()
+    window.close()
+
+
+def test_nas_file_transfer_without_settings_reports_and_keeps_ok_blocked(tmp_path: Path):
+    app = _qt_app()
+    settings = _nas_settings(tmp_path, nas_host="", nas_username="", nas_password="", nas_folder="")
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+    payload = tmp_path / "a.txt"
+    payload.write_text("x", encoding="utf-8")
+    window._add_nas_transfer_files([payload])
+
+    window._start_nas_file_transfer()
+    app.processEvents()
+
+    assert window._nas_transfer_running is False
+    assert window._nas_transfer_workers == []
+    assert "SYNOLOGY_NAS" in window.warning_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_nas_file_transfer_requires_a_selected_file(tmp_path: Path):
+    app = _qt_app()
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+
+    window._start_nas_file_transfer()
+    app.processEvents()
+
+    assert window._nas_transfer_running is False
+    assert window._nas_transfer_workers == []
+    assert "파일을 선택" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_nas_file_transfer_uploads_selected_files_off_thread_and_keeps_ok_blocked(monkeypatch, tmp_path: Path):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+    first = tmp_path / "a.txt"
+    first.write_text("hello", encoding="utf-8")
+    second = tmp_path / "b.bin"
+    second.write_bytes(b"\x01\x02")
+
+    window._add_nas_transfer_files([first, second, first])  # the duplicate is ignored
+    assert window.nas_transfer_list.count() == 2
+    assert "2개" in window.nas_transfer_result_label.text()
+    assert window.nas_transfer_send_button.isEnabled() is True
+
+    window.nas_transfer_send_button.click()
+    app.processEvents()
+
+    assert window._nas_transfer_running is True
+    assert window.nas_transfer_send_button.isEnabled() is False
+    assert window.nas_transfer_pick_button.isEnabled() is False
+    assert len(window._nas_transfer_workers) == 1
+    worker = window._nas_transfer_workers[0]
+    assert worker.files == (first, second)
+    assert worker.config.nas_folder == "/home/site"
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+
+    window._start_nas_file_transfer()
+    assert len(window._nas_transfer_workers) == 1
+    assert "이미 실행 중" in window.warning_label.text()
+    window.close()
+
+
+def test_nas_file_transfer_result_is_reported_and_never_authorizes_ok(tmp_path: Path):
+    _qt_app()
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+    payload = tmp_path / "a.txt"
+    payload.write_text("x", encoding="utf-8")
+    window._add_nas_transfer_files([payload])
+
+    window._set_nas_transfer_result(
+        NasFileTransferResult(
+            ok=True,
+            summary="NAS 전송 완료: 1개 파일 1B, 0.2s",
+            remote_dir="/home/site/transfer",
+            artifacts=(UploadedArtifact("a.txt", 1, "00", "text/plain"),),
+        )
+    )
+    assert "transfer" in window.instruction_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert "a.txt" in window.nas_transfer_history.toPlainText()
+    assert window._nas_transfer_files == []  # sent files leave the pending list
+    assert window.nas_transfer_list.count() == 0
+    assert window.model.can_show_final_ok is False
+
+    window._add_nas_transfer_files([payload])
+    window._set_nas_transfer_result(
+        NasFileTransferResult(ok=False, summary="NAS 파일 전송 실패", error="OSError: timed out")
+    )
+    assert window.instruction_label.text() == "NAS 파일 전송 실패"
+    assert "OSError" in window.warning_label.text()
+    assert window._nas_transfer_files == [payload]  # failed files stay selected for a retry
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+# ---- camera intrinsics calibration page -------------------------------------------------------
+
+
+def _board_frame(tmp_path: Path) -> QImage:
+    from towersightai.calibration.checkerboard import CheckerboardSpec, render_checkerboard_png
+
+    png = render_checkerboard_png(CheckerboardSpec(), "A4", tmp_path / "board.png", dpi=60)
+    frame = QImage(str(png)).convertToFormat(QImage.Format.Format_RGB888)
+    assert not frame.isNull()
+    return frame
+
+
+def _calibration_window(monkeypatch, tmp_path: Path):
+    app = _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+    window._show_operator_page("카메라 캘리브레이션")
+    return app, window
+
+
+def test_calibration_page_is_in_the_menu_and_defaults_to_the_front_left_camera(monkeypatch, tmp_path: Path):
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    assert "카메라 캘리브레이션" in window.sidebar_buttons
+    assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
+    # VEHICLE_BOX_FRONT_LEFT_CAMERA defaults to rear_side, so that camera is preselected and shown alone.
+    assert window.calibration_camera_box.currentData() == "rear_side"
+    assert window._camera_page_layouts["카메라 캘리브레이션"] == "single:rear_side"
+    assert not window.camera_widgets[CameraRole.rear_side].isHidden()
+    assert window.camera_widgets[CameraRole.front].isHidden()
+    assert window.calibration_run_button.isEnabled() is False
+    assert window.calibration_capture_button.isEnabled() is False
+    window.close()
+
+
+def test_calibration_refuses_to_start_without_a_streaming_camera(monkeypatch, tmp_path: Path):
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    window.calibration_start_button.click()
+    app.processEvents()
+    assert window._calib_running is False
+    assert "수신 중이 아닙니다" in window.calibration_status_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_calibration_auto_capture_saves_a_frame_after_steady_detection(monkeypatch, tmp_path: Path):
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    from towersightai.ui.pyqt_app import CALIBRATION_STEADY_HITS, _qimage_to_bgr
+
+    tile = window.camera_widgets[CameraRole.rear_side]
+    tile.set_frame(_board_frame(tmp_path))
+    window._runtime_camera_status["rear_side"] = "정상 수신"
+
+    window.calibration_start_button.click()
+    app.processEvents()
+    assert window._calib_running is True
+    assert window._calib_timer is not None
+    assert "[1/" in window.calibration_instruction_label.text()
+    assert window._calib_store.session_dir.parent == tmp_path / "intrinsics" / "sessions"
+
+    worker = window._calib_detect_worker
+    for _ in range(CALIBRATION_STEADY_HITS):
+        window._calibration_tick()
+        assert window._calib_detect_busy is True
+        # The worker thread is not started in tests; run the slot inline with the queued payload.
+        worker.detect(window._calib_token, _qimage_to_bgr(tile.current_frame()))
+        app.processEvents()
+
+    assert len(window._calib_samples) == 1
+    assert window._calib_samples[0].pose_key == "center"
+    assert window._calib_samples[0].image_path.is_file()
+    assert window._calib_pose_index == 1
+    assert "[2/" in window.calibration_instruction_label.text()
+    assert len(tile._marker_points) == 54
+    assert window.model.can_show_final_ok is False
+
+    # A frame without a board resets the steady counter and reports it.
+    blank = QImage(320, 240, QImage.Format.Format_RGB888)
+    blank.fill(QColor("#404040"))
+    window._calib_hold_until = 0.0
+    window._calibration_tick()
+    worker.detect(window._calib_token, _qimage_to_bgr(blank))
+    assert window._calib_hits == 0
+    assert "보이지 않습니다" in window.calibration_status_label.text()
+    window.close()
+
+
+def test_calibration_manual_capture_skip_and_run(monkeypatch, tmp_path: Path):
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    from towersightai.calibration.intrinsics import CAPTURE_POSES
+    from towersightai.ui.pyqt_app import CALIBRATION_MIN_SAMPLES, _qimage_to_bgr
+
+    tile = window.camera_widgets[CameraRole.rear_side]
+    frame = _board_frame(tmp_path)
+    tile.set_frame(frame)
+    window._runtime_camera_status["rear_side"] = "정상 수신"
+    window.calibration_auto_box.setChecked(False)
+    window.calibration_start_button.click()
+    app.processEvents()
+
+    worker = window._calib_detect_worker
+    bgr = _qimage_to_bgr(frame)
+    window._calibration_tick()
+    worker.detect(window._calib_token, bgr)
+    assert window._calib_samples == []  # auto off: detection alone does not capture
+    window.calibration_capture_button.click()
+    window._calibration_tick()
+    worker.detect(window._calib_token, bgr)
+    assert len(window._calib_samples) == 1
+
+    window.calibration_skip_button.click()
+    assert window._calib_pose_index == 2
+
+    window.calibration_run_button.click()
+    assert window._calib_calibrating is False
+    assert "샘플 부족" in window.calibration_status_label.text() or window.calibration_run_button.isEnabled() is False
+
+    from towersightai.calibration.intrinsics import detect_checkerboard
+    import cv2
+
+    detection = detect_checkerboard(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), window._calib_spec)
+    while len(window._calib_samples) < CALIBRATION_MIN_SAMPLES:
+        window._accept_calibration_sample(bgr, detection)
+    assert window.calibration_run_button.isEnabled() is True
+
+    window.calibration_run_button.click()
+    app.processEvents()
+    assert window._calib_calibrating is True
+    assert len(window._calib_workers) == 1
+    assert window._calib_timer is None
+    calibrate_worker = window._calib_workers[0]
+    assert calibrate_worker.camera_id == "rear_side"
+    assert calibrate_worker.rotation_degrees == 0
+    calibrate_worker.run()  # identical frames give a degenerate but finite solution
+    app.processEvents()
+    status = window.calibration_status_label.text()
+    assert status.startswith("측정 완료") or status.startswith("측정 실패")
+    if status.startswith("측정 완료"):
+        assert (tmp_path / "intrinsics" / "rear_side.json").is_file()
+        assert "reviewed=false" in window.calibration_history.toPlainText()
+    assert window.model.can_show_final_ok is False
+    assert len(CAPTURE_POSES) >= CALIBRATION_MIN_SAMPLES
+    window.close()
+
+
+def test_calibration_switching_camera_ends_the_session(monkeypatch, tmp_path: Path):
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    tile = window.camera_widgets[CameraRole.rear_side]
+    tile.set_frame(_board_frame(tmp_path))
+    window._runtime_camera_status["rear_side"] = "정상 수신"
+    window.calibration_start_button.click()
+    assert window._calib_running is True
+    assert window.calibration_camera_box.isEnabled() is False
+
+    window._calib_running = True
+    window._on_calibration_camera_changed()
+    assert window._calib_running is False
+    assert window._calib_timer is None
+    assert tile._marker_points == ()
+    window.close()
+
+
+def test_hailo_holder_kill_button_targets_only_orphans(monkeypatch, tmp_path: Path):
+    from towersightai.inference import hailo_health
+    from towersightai.inference.hailo_health import HailoDeviceHolder, HailoHealthSnapshot
+
+    app = _qt_app()
+    settings = _nas_settings(tmp_path)
+    window = OperatorWindow(
+        build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings
+    )
+    _open_operator_menu(window)
+    window._show_operator_page("시스템 점검")
+    assert window.hailo_holder_kill_button.isEnabled() is False
+
+    own = HailoDeviceHolder(500, "Hailo Multisource App", 100, 30, True)
+    window._set_hailo_health(HailoHealthSnapshot(status="ok", summary="정상", device_holders=(own,)))
+    assert window.hailo_holder_kill_button.isEnabled() is False
+    assert "PID 500" in window.hailo_health_label.text()
+
+    orphan = HailoDeviceHolder(440555, "Hailo Multisource App", 853, 7 * 86400, False)
+    window._set_hailo_health(
+        HailoHealthSnapshot(status="degraded", summary="점유", device_holders=(own, orphan))
+    )
+    assert window.hailo_holder_kill_button.isEnabled() is True
+    assert window.hailo_status_label.text() == "HAILO 점유됨"
+
+    seen = []
+    monkeypatch.setattr(hailo_health, "terminate_foreign_holders", lambda holders: seen.append(holders) or (440555,))
+    window.hailo_holder_kill_button.click()
+    app.processEvents()
+    assert seen == [(orphan,)]
+    assert "PID 440555" in window.warning_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.hailo_holder_kill_button.isEnabled() is False
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_process_monitoring_autostart_waits_for_the_camera_set_to_settle(monkeypatch):
+    _qt_app()
+    import towersightai.ui.pyqt_app as ui_module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(ui_module.time, "monotonic", lambda: clock["now"])
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    started: list[str] = []
+    monkeypatch.setattr(window, "_start_purpose_inference", lambda task_id: started.append(task_id))
+
+    window._runtime_camera_status["front"] = "정상 수신"
+    window._ensure_process_monitoring()
+    assert started == []  # front just appeared: wait for the set to settle
+    clock["now"] += 2.0
+    window._runtime_camera_status["opposite_side"] = "정상 수신"  # second camera arrives 2 s later
+    window._ensure_process_monitoring()
+    assert started == []  # settle window restarts on a set change
+    clock["now"] += ui_module.MONITORING_CAMERA_SETTLE_SECONDS - 0.5
+    window._ensure_process_monitoring()
+    assert started == []
+    clock["now"] += 1.0
+    window._ensure_process_monitoring()
+    assert started == ["process_monitoring"]
+    assert window._purpose_camera_ids(ui_module.PURPOSE_PROCESS_MONITORING) == ("front", "opposite_side")
+    window.close()
+
+
+def test_process_monitoring_failures_escalate_the_restart_cooldown(monkeypatch):
+    _qt_app()
+    import towersightai.ui.pyqt_app as ui_module
+
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(ui_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(ui_module, "MONITORING_CAMERA_SETTLE_SECONDS", 0.0)
+    model = build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras)
+    window = OperatorWindow(model, settings=_settings())
+    started: list[str] = []
+    monkeypatch.setattr(window, "_start_purpose_inference", lambda task_id: started.append(task_id))
+    for camera in window.settings.active_cameras:
+        window._runtime_camera_status[camera.id] = "정상 수신"
+
+    assert window._monitoring_cooldown_seconds() == ui_module.MONITORING_START_COOLDOWN_SECONDS
+    window._ensure_process_monitoring()
+    assert started == ["process_monitoring"]
+
+    def finish_run(*, failed: bool, first_result: bool):
+        window._purpose_task_enabled = True
+        window._purpose_task_id = ui_module.PURPOSE_PROCESS_MONITORING
+        window._purpose_task_label = "프로세스 감시"
+        window._detection_failed = failed
+        window._purpose_task_first_inference_seconds = 1.0 if first_result else None
+        window._cleanup_purpose_worker(QThread(), object())  # type: ignore[arg-type]
+
+    finish_run(failed=True, first_result=False)
+    assert window._monitoring_consecutive_failures == 1
+    assert window._monitoring_cooldown_seconds() == ui_module.MONITORING_FAILURE_COOLDOWN_SECONDS
+    clock["now"] += ui_module.MONITORING_START_COOLDOWN_SECONDS + 1
+    window._ensure_process_monitoring()
+    assert started == ["process_monitoring"]  # the old 10 s cooldown no longer applies
+    clock["now"] += ui_module.MONITORING_FAILURE_COOLDOWN_SECONDS
+    window._ensure_process_monitoring()
+    assert started == ["process_monitoring"] * 2
+
+    finish_run(failed=True, first_result=False)
+    assert window._monitoring_cooldown_seconds() == 2 * ui_module.MONITORING_FAILURE_COOLDOWN_SECONDS
+    for _ in range(6):
+        finish_run(failed=True, first_result=False)
+    assert window._monitoring_cooldown_seconds() == ui_module.MONITORING_FAILURE_COOLDOWN_MAX_SECONDS
+
+    # A run that produced inference results resets the escalation.
+    window._purpose_task_id = ui_module.PURPOSE_PROCESS_MONITORING
+    window._set_purpose_first_inference_ready(2.5)
+    assert window._monitoring_consecutive_failures == 0
+    finish_run(failed=False, first_result=True)
+    assert window._monitoring_cooldown_seconds() == ui_module.MONITORING_START_COOLDOWN_SECONDS
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_all_cameras_page_offers_only_person_and_vehicle_inference(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    _open_operator_menu(window)
+    window._show_operator_page("전체 카메라")
+    page = window.operator_pages["전체 카메라"]
+    texts = [b.text() for b in page.findChildren(QPushButton)]
+    assert texts == ["사람 감지 시작", "차량 감지 시작"]
+    assert not hasattr(window, "legacy_ai_detection_button")
+    assert not hasattr(window, "_detection_enabled")
+    assert set(window.purpose_task_extra_buttons) == {"person_presence", "vehicle_detection"}
+    window.close()
+
+
+def test_all_cameras_buttons_switch_inference_and_mirror_task_pages(monkeypatch):
+    _qt_app()
+    settings = _settings()
+    display = build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras)
+    monkeypatch.setattr(OperatorWindow, "_start_camera_capture", lambda self: None)
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    window = OperatorWindow(display, settings=settings)
+    _open_operator_menu(window)
+    window._show_operator_page("전체 카메라")
+    window._runtime_camera_status = {camera.id: "정상 수신" for camera in settings.cameras}
+    person_button = window.purpose_task_extra_buttons["person_presence"][0]
+    vehicle_button = window.purpose_task_extra_buttons["vehicle_detection"][0]
+
+    person_button.click()
+    assert window._purpose_task_id == "person_presence"
+    assert person_button.isChecked() and person_button.text() == "사람 감지 중지"
+    assert window.purpose_task_buttons["person_presence"].isChecked()
+    assert window.purpose_task_buttons["person_presence"].text() == "사람 감지 중지"
+    assert vehicle_button.text() == "차량 감지 시작"
+    assert len(window._purpose_workers) == 1
+
+    # Clicking the other task stops the running one and queues the clicked one.
+    vehicle_button.click()
+    assert window._pending_user_purpose_task_id == "vehicle_detection"
+    assert vehicle_button.isChecked() and not person_button.isChecked()
+    assert "중지 중" in window.warning_label.text() and "차량 감지" in window.warning_label.text()
+    worker, thread = window._purpose_workers[0], window._purpose_threads[0]
+    window._cleanup_purpose_worker(thread, worker)
+    assert window._purpose_task_id == "vehicle_detection"
+    assert vehicle_button.text() == "차량 감지 중지"
+    assert window.purpose_task_buttons["vehicle_detection"].text() == "차량 감지 중지"
+
+    # Clicking the running task's button stops it.
+    vehicle_button.click()
+    assert window._purpose_task_enabled is False or window._pending_user_purpose_task_id == ""
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_ld2410_stopped_status_closes_the_radar_window_and_keeps_ok_blocked(tmp_path: Path):
+    _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings)
+    calls: list[tuple] = []
+
+    class FakeManager:
+        _closed = False
+
+        def record_ld2410_status(self, state, details):
+            calls.append(("status", state))
+
+        def close_radar_window(self, *, reason):
+            calls.append(("close_radar_window", reason))
+            return True
+
+    window._raw_data_manager = FakeManager()  # type: ignore[assignment]
+    window._record_ld2410_status("client_disconnected", {"client_ip": "192.168.0.50"})
+    window._record_ld2410_status("stopped", {})
+    assert calls == [("status", "client_disconnected"), ("status", "stopped"), ("close_radar_window", "service_stopped")]
+    assert window.model.can_show_final_ok is False
+    window._raw_data_manager = None
     window.close()

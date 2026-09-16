@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import socket
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -103,7 +104,7 @@ class ParamikoManifestUploader:
             )
             with client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(60.0)
-                remote_dir = posixpath.join(self.config.nas_folder.rstrip("/"), "raw", day)
+                remote_dir = remote_raw_day_dir(self.config.nas_folder, day, socket.gethostname())
                 mkdirs(sftp, remote_dir)
                 remote_manifest = _read_remote_json(sftp, posixpath.join(remote_dir, "manifest.json"))
                 remote_hashes = {
@@ -131,6 +132,20 @@ class ParamikoManifestUploader:
                 return remote_dir
         finally:
             client.close()
+
+
+_HOST_SEGMENT = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def remote_raw_day_dir(nas_folder: str, day: str, source_host: str) -> str:
+    """``<folder>/raw/<source_host>/<day>`` — one sub-folder per uploading machine.
+
+    Development and field devices used to share ``raw/<day>`` and overwrote each other's
+    identically named shards and manifest; keying by host keeps every archive intact. The
+    analysis reader understands both layouts, so already-uploaded legacy days stay readable.
+    """
+    host = _HOST_SEGMENT.sub("-", source_host or "").strip("-.")[:128] or "unknown-host"
+    return posixpath.join(nas_folder.rstrip("/"), "raw", host, day)
 
 
 def sha256_path(path: Path) -> str:

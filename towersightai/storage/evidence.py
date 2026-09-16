@@ -76,6 +76,8 @@ class EvidenceCoordinator:
         self._sessions: dict[str, _Session] = {}
         self._person_session_id: str | None = None
         self._vehicle_session_id: str | None = None
+        self._radar_session_id: str | None = None
+        self._last_radar_evidence_at: datetime | None = None
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._buffer_dirs: set[Path] = set()
         self._recorder_ready: set[str] = set()
@@ -150,6 +152,16 @@ class EvidenceCoordinator:
             self._capture_snapshots(event_id, "person_end", self._healthy_camera_ids(), event_at)
             self._close_session(self._person_session_id, event_at)
             self._person_session_id = None
+        elif event_type == "radar_window_started":
+            self._handle_radar_window_started(event_id, event_at)
+        elif event_type == "radar_window_closed" and self._radar_session_id:
+            self._capture_snapshots(event_id, "radar_end", self._healthy_camera_ids(), event_at)
+            with self._lock:
+                session = self._sessions.get(self._radar_session_id)
+                bounded = session.close_at if session is not None else None
+            close_at = min(bounded, event_at) if bounded is not None else event_at
+            self._close_session(self._radar_session_id, close_at)
+            self._radar_session_id = None
         elif event_type == "plate_recognized":
             camera_id = str(payload.get("camera_id") or self._front_camera_id() or "front")
             source = payload.get("source_image_path")
@@ -161,6 +173,33 @@ class EvidenceCoordinator:
                 str(source) if source else None,
                 bbox if isinstance(bbox, Mapping) else None,
             )
+
+    def _handle_radar_window_started(self, event_id: str, event_at: datetime) -> None:
+        """Radar-only presence evidence: throttled, capped, and skipped while a camera person window
+        already owns the media (analysis reads the explicit failure reasons)."""
+        if not self.config.media_radar_evidence:
+            return
+        camera_ids = self._healthy_camera_ids()
+        if self._person_session_id:
+            for camera_id in camera_ids:
+                self._fail(event_id, "snapshot", camera_id, "person_window_active", event_at)
+            return
+        if (
+            self._last_radar_evidence_at is not None
+            and (event_at - self._last_radar_evidence_at).total_seconds() < self.config.media_radar_min_interval_seconds
+        ):
+            for camera_id in camera_ids:
+                self._fail(event_id, "snapshot", camera_id, "radar_evidence_throttled", event_at)
+            return
+        self._last_radar_evidence_at = event_at
+        self._capture_snapshots(event_id, "radar", camera_ids, event_at)
+        self._radar_session_id = self._open_session(
+            event_id,
+            "radar",
+            camera_ids,
+            event_at,
+            close_at=event_at + timedelta(seconds=self.config.media_radar_clip_max_seconds),
+        )
 
     def close(self) -> None:
         if self._closed:

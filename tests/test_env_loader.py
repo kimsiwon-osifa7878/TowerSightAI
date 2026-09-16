@@ -207,3 +207,59 @@ def test_invalid_birdview_mode_raises(tmp_path: Path):
 
     with pytest.raises(ValueError, match="synthetic_lr"):
         load_settings_from_env(env_path)
+
+
+def test_vehicle_box_keys_default_to_the_drawing_and_accept_overrides(tmp_path: Path):
+    env_path = _write_env(tmp_path / ".env")
+    settings = load_settings_from_env(env_path)
+    assert settings.vehicle_envelope.pallet_length_mm == 5350.0
+    assert settings.vehicle_envelope.front_left_camera_role == "rear_side"
+
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "\nVEHICLE_BOX_PALLET_LENGTH_MM=5400\nVEHICLE_BOX_MAX_LENGTH_MM=\n"
+        "VEHICLE_BOX_FRONT_LEFT_CAMERA=opposite_side\nVEHICLE_BOX_REAR_RIGHT_CAMERA=rear_side\n",
+        encoding="utf-8",
+    )
+    settings = load_settings_from_env(env_path)
+    assert settings.vehicle_envelope.pallet_length_mm == 5400.0
+    assert settings.vehicle_envelope.max_vehicle_length_mm == 5205.0  # blank keeps the default
+    assert settings.vehicle_envelope.front_left_camera_role == "opposite_side"
+    assert settings.vehicle_envelope.rear_right_camera_role == "rear_side"
+
+
+def test_invalid_vehicle_box_values_fail_config(tmp_path: Path):
+    env_path = _write_env(tmp_path / ".env")
+    base = env_path.read_text(encoding="utf-8")
+    env_path.write_text(base + "\nVEHICLE_BOX_MAX_WIDTH_MM=abc\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="VEHICLE_BOX_MAX_WIDTH_MM"):
+        load_settings_from_env(env_path)
+    env_path.write_text(base + "\nVEHICLE_BOX_FRONT_LEFT_CAMERA=ceiling\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="VEHICLE_BOX_FRONT_LEFT_CAMERA"):
+        load_settings_from_env(env_path)
+
+
+def test_radar_raw_logging_keys_parse_with_defaults(tmp_path: Path):
+    env_path = _write_env(tmp_path / ".env")
+    settings = load_settings_from_env(env_path)
+    raw = settings.raw_storage
+    assert (raw.ld2410_sample_interval_seconds, raw.radar_window_min_seconds, raw.radar_window_clear_seconds) == (1.0, 3.0, 5.0)
+    assert raw.media_radar_evidence is True
+    assert (raw.media_radar_min_interval_seconds, raw.media_radar_clip_max_seconds) == (60.0, 30.0)
+
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "\nRAW_DATA_LD2410_SAMPLE_INTERVAL_SECONDS=0\nRAW_DATA_RADAR_WINDOW_MIN_SECONDS=2\n"
+        "RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS=8\nRAW_MEDIA_RADAR_EVIDENCE=false\n"
+        "RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS=120\nRAW_MEDIA_RADAR_CLIP_MAX_SECONDS=45\n",
+        encoding="utf-8",
+    )
+    raw = load_settings_from_env(env_path).raw_storage
+    assert raw.ld2410_sample_interval_seconds == 0
+    assert (raw.radar_window_min_seconds, raw.radar_window_clear_seconds) == (2.0, 8.0)
+    assert raw.media_radar_evidence is False
+    assert (raw.media_radar_min_interval_seconds, raw.media_radar_clip_max_seconds) == (120.0, 45.0)
+
+    env_path.write_text(env_path.read_text(encoding="utf-8") + "\nRAW_MEDIA_RADAR_CLIP_MAX_SECONDS=1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="RAW_MEDIA_RADAR_CLIP_MAX_SECONDS"):
+        load_settings_from_env(env_path)

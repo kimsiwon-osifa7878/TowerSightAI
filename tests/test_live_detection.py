@@ -241,3 +241,30 @@ def test_parse_detection_json_and_tail_reads_only_new_events(tmp_path: Path):
     assert first[0].label == "car"
     assert second == ()
     assert parse_detection_json("not-json") is None
+
+
+def test_fatal_message_prefers_error_lines_and_explains_a_held_device(tmp_path, monkeypatch):
+    from towersightai.inference import hailo_health, live_detection
+    from towersightai.inference.hailo_health import HailoDeviceHolder
+
+    log = tmp_path / "multistream.gst.log"
+    log.write_text(
+        "rtspsrc location=rtsp://user:pw@10.0.0.1/stream1 ! queue name=q max-size-buffers=3 ! hailonet ...\n"
+        "[HailoRT] [error] CHECK failed - Failed to create vdevice. there are not enough free devices. requested: 1, found: 0\n"
+        "[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_OUT_OF_PHYSICAL_DEVICES(74)\n"
+        "PIPELINE_DIAGNOSTIC_PROBE stage=hailonet_input camera=front\n",
+        encoding="utf-8",
+    )
+    orphan = HailoDeviceHolder(440555, "Hailo Multisource App", 853, 7 * 86400, False)
+    monkeypatch.setattr(hailo_health, "find_hailo_device_holders", lambda **_kw: (orphan,))
+
+    message = live_detection._fatal_log_message(log)
+    assert message.startswith("Hailo 장치를 다른 프로세스가 점유 중입니다: PID 440555")
+    assert "HAILO_OUT_OF_PHYSICAL_DEVICES" in message
+    assert "rtspsrc" not in message and "PIPELINE_" not in message
+
+    process_message = live_detection._process_error_message(1, log)
+    assert "440555" in process_message and "rtspsrc" not in process_message
+
+    log.write_text("rtspsrc ... ! hailonet\nCaught SIGSEGV\n", encoding="utf-8")
+    assert live_detection._fatal_log_message(log) == "Caught SIGSEGV" or "SIGSEGV" in live_detection._fatal_log_message(log)

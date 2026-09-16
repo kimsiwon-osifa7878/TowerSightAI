@@ -313,3 +313,71 @@ def test_plate_above_line_ignored():
     )
     out = engine.tick(now + timedelta(seconds=1))
     assert out.public_state is ParkingState.PLATE_RECOGNITION  # nothing collected
+
+
+def test_every_plate_read_is_recorded_with_its_accept_reason():
+    """Analysis needs the rejected reads too: they are the denominator for LPR hit rate."""
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    engine.observe_lpr_attempt(*_lpr_attempt("12가3456", center_y=800))  # below the line → counted
+    engine.observe_lpr_attempt(*_lpr_attempt("99라9999", center_y=100))  # above the line → rejected
+    engine.observe_lpr_attempt({"status": "no_plate", "detections": []}, 1000)  # nothing seen
+    out = engine.tick(now + timedelta(seconds=1))
+    attempts = [event for event in out.raw_events if event.kind == "plate_attempt"]
+    assert [(a.plate_number, a.accepted, a.reason) for a in attempts] == [
+        ("12가3456", True, ""),
+        ("99라9999", False, "above_entry_line"),
+        ("", False, "no_plate_detected"),
+    ]
+    assert attempts[0].camera_id == "front"
+    assert attempts[0].bbox == {"x1": 100.0, "y1": 780.0, "x2": 300.0, "y2": 820.0}
+    assert attempts[2].bbox is None
+
+
+def test_recognized_plate_records_the_vote_size():
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    for plate in ("12가3456", "12가3456", "12가3456"):
+        engine.observe_lpr_attempt(*_lpr_attempt(plate, center_y=800))
+    out = engine.tick(now + timedelta(seconds=1))
+    plate_events = [event for event in out.raw_events if event.kind == "plate"]
+    assert len(plate_events) == 1
+    assert plate_events[0].recognized is True
+    assert plate_events[0].plate_number == "12가3456"
+    assert plate_events[0].reads == 3
+    assert plate_events[0].reason == "vote"
+
+
+def test_unrecognized_plate_is_recorded_instead_of_silence():
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    current = now
+    plate_events = []
+    while (current - now).total_seconds() <= 31:
+        current += timedelta(seconds=1)
+        engine.observe_detections(
+            "cam-right", CameraRole.opposite_side, (_event("car", 0.8, at=current),), current
+        )
+        out = engine.tick(current)
+        plate_events.extend(event for event in out.raw_events if event.kind == "plate")
+        if out.public_state is not ParkingState.PLATE_RECOGNITION:
+            break
+    assert out.plate_number == UNRECOGNIZED_PLATE
+    assert len(plate_events) == 1
+    assert plate_events[0].recognized is False
+    assert plate_events[0].plate_number == UNRECOGNIZED_PLATE
+    assert plate_events[0].reads == 0
+
+
+def test_entry_aborted_mid_vote_still_records_the_plate_outcome():
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    engine.observe_lpr_attempt(*_lpr_attempt("12가3456", center_y=800))
+    engine.observe_monitoring_health(running=False)
+    out = engine.tick(now + timedelta(seconds=1))
+    assert out.public_state is ParkingState.IDLE
+    plate_events = [event for event in out.raw_events if event.kind == "plate"]
+    assert len(plate_events) == 1
+    assert plate_events[0].plate_number == "12가3456" and plate_events[0].reads == 1
+    assert plate_events[0].reason.startswith("aborted:")
+    assert any(event.kind == "vehicle_session_end" for event in out.raw_events)

@@ -575,6 +575,7 @@ def test_purpose_runner_restarts_after_transient_child_exit(tmp_path: Path):
         camera_ids=("front",),
         max_consecutive_restarts=3,
         restart_delay_seconds=0.05,
+        rtsp_busy_restart_delay_seconds=0.05,
     )
     runner = PurposeInferenceRunner(
         process,
@@ -587,7 +588,7 @@ def test_purpose_runner_restarts_after_transient_child_exit(tmp_path: Path):
     assert runner.run() is True
     log_text = (tmp_path / "vehicle.gst.log").read_text(encoding="utf-8")
     assert "PROCESS_RESTART attempt=1 reason=child-exit returncode=1" in log_text
-    assert any("복구 중 (1/3)" in status for status in statuses)
+    assert any("RTSP 세션 한도(400)" in status and "(1/3)" in status for status in statuses)
 
 
 def test_purpose_runner_does_not_restart_a_clean_exit(tmp_path: Path):
@@ -664,3 +665,59 @@ def test_process_monitoring_process_combines_person_and_vehicle_labels(monkeypat
     for label in ("car", "truck", "bus", "motorcycle", "person"):
         assert f"--allowed-label {label}" in command
     assert f"--min-confidence {PROCESS_MONITORING_MIN_CONFIDENCE}" in command
+
+
+def test_purpose_fatal_message_explains_a_held_device(tmp_path, monkeypatch):
+    from towersightai.inference import hailo_health, purpose_tasks
+    from towersightai.inference.hailo_health import HailoDeviceHolder
+
+    log = tmp_path / "vehicle.gst.log"
+    log.write_text(
+        "rtspsrc location=rtsp://user:pw@10.0.0.1/stream1 ! hailonet ...\n"
+        "[HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_OUT_OF_PHYSICAL_DEVICES(74)\n"
+        "CHECK_EXPECTED failed with status=74\n",
+        encoding="utf-8",
+    )
+    orphan = HailoDeviceHolder(440555, "Hailo Multisource App", 853, 7 * 86400, False)
+    monkeypatch.setattr(hailo_health, "find_hailo_device_holders", lambda **_kw: (orphan,))
+    message = purpose_tasks._fatal_log_message(log)
+    assert "PID 440555" in message and "rtspsrc" not in message
+
+
+def test_rtsp_400_restart_uses_the_longer_session_release_delay(tmp_path: Path, monkeypatch):
+    """A `Bad Request (400)` exit waits rtsp_busy_restart_delay_seconds, not restart_delay_seconds."""
+    from towersightai.inference import purpose_tasks
+
+    marker = tmp_path / "first-attempt-done"
+    script = (
+        f"if [ ! -e {marker} ]; then touch {marker}; echo 'ERROR GStreamer: Bad Request (400)'; exit 1; "
+        "else sleep 0.2; exit 0; fi"
+    )
+    process = PurposeInferenceProcess(
+        task_id=PURPOSE_VEHICLE_DETECTION,
+        label="차량 감지",
+        command=("sh", "-c", script),
+        env=dict(os.environ),
+        log_path=tmp_path / "vehicle.gst.log",
+        event_path=tmp_path / "vehicle.jsonl",
+        model_paths=(),
+        camera_ids=("front",),
+        max_consecutive_restarts=3,
+        restart_delay_seconds=0.01,
+        rtsp_busy_restart_delay_seconds=0.3,
+    )
+    statuses: list[str] = []
+    waited: list[float] = []
+    runner = PurposeInferenceRunner(
+        process, on_events=lambda _e: None, on_error=lambda _m: None, on_status=statuses.append, poll_seconds=0.02
+    )
+    original_wait = runner._wait_before_restart
+
+    def recording_wait(delay: float) -> bool:
+        waited.append(delay)
+        return original_wait(delay)
+
+    monkeypatch.setattr(runner, "_wait_before_restart", recording_wait)
+    assert runner.run() is True
+    assert waited == [0.3]
+    assert any("RTSP 세션 한도(400)" in status for status in statuses)
