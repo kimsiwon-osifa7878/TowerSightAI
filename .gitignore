@@ -10,7 +10,9 @@ gstshark_*/
 artifacts/
 hailort*.log
 models/
-refers/SPSS_ParkIO_안내자료.pdf
+# refers/ 는 하드웨어 검증용 참조 자료 — 새 파일(승인도 PDF 등)은 올리지 않는다.
+# 이미 추적 중인 참조 코드 16개는 그대로 유지된다(.gitignore는 추적 파일에 영향 없음).
+refers/
 data/operator-settings.json
 data/field-media/*
 !data/field-media/README.md
