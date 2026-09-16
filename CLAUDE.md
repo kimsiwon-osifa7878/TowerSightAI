@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **400 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **402 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -362,6 +362,10 @@ default lane/stop guides outside calibration mode; error/NG states can never use
   `plate_recognized` carries `recognized`/`reads`/`reason` and is written for 미인식 and aborted votes too,
   and every 1 Hz front-camera read is a `plate_attempt` row (`accepted` plus a rejection reason such as
   `above_entry_line`) so the analysis dashboard can measure LPR hit rate.
+- Media filenames carry the **local** date-time plus a zone suffix — `20260916-154634-702684_kr-plate-crop-front.jpg`
+  (`_local` when `RAW_DATA_TIMEZONE` is not Asia/Seoul). Until 2026-09-16 the name used UTC while the day
+  folder used local time, so a 15:46 KST capture was named `064634` and names did not sort chronologically
+  inside a day folder; files uploaded before that change keep the old UTC names.
 - `RAW_MEDIA_ENABLED=true` captures JPEG snapshots and H.264-**passthrough** silent MKV clips (5 s pre-roll,
   10 s vehicle post-roll, 5-minute clip parts) for **real** events only. Media bytes never enter JSONL —
   `media_artifact_created` stores relative path, size, SHA-256, capture time, metadata. Failures are explicit
@@ -409,7 +413,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 400 passed, hardware-free
+pytest -q                                     # 402 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed

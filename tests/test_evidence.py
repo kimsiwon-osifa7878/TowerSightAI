@@ -394,3 +394,57 @@ def test_engine_plate_result_with_a_source_frame_stores_image_and_crop(tmp_path:
     crop = next(item for item in artifacts if item["kind"] == "plate_crop")
     assert "-plate-crop-front.jpg" in crop["relative_path"]
     assert crop["metadata"]["bbox"] == {"x1": 10, "y1": 10, "x2": 90, "y2": 45}
+
+
+def test_media_filenames_carry_the_local_date_time_and_zone_suffix(tmp_path: Path, monkeypatch):
+    """The day folder was always local while the filename was UTC, so a 15:46 KST capture was
+    named 064634 and names did not sort chronologically inside a day folder."""
+    from PyQt6.QtGui import QColor, QImage
+
+    monkeypatch.setattr(EvidenceCoordinator, "_start_recorder", lambda self, camera: None)
+    artifacts: list[dict] = []
+    now = datetime(2026, 9, 16, 6, 46, 34, 702684, tzinfo=timezone.utc)  # 15:46:34 KST
+    source = tmp_path / "frame.png"
+    image = QImage(120, 60, QImage.Format.Format_RGB32)
+    image.fill(QColor("white"))
+    assert image.save(str(source), "PNG")
+    coordinator = EvidenceCoordinator(
+        RawStorageConfig(local_dir=tmp_path / "raw", timezone_name="Asia/Seoul", media_enabled=True),
+        [_camera()],
+        artifact_callback=lambda **item: artifacts.append(item),
+        failure_callback=lambda **item: None,
+        clock=lambda: now,
+    )
+    coordinator.update_camera_status("front", "정상 수신")
+    coordinator.update_frame("front", FakeImage(), received_at=now)
+    coordinator.handle_raw_event(
+        {
+            "event_id": "plate-1",
+            "event_type": "plate_recognized",
+            "recorded_at": now.isoformat(),
+            "payload": {
+                "camera_id": "front",
+                "source_image_path": str(source),
+                "plate_bbox": {"x1": 10, "y1": 10, "x2": 90, "y2": 45},
+            },
+        }
+    )
+    coordinator.close()
+    crop = next(item for item in artifacts if item["kind"] == "plate_crop")
+    assert crop["relative_path"] == "media/images/20260916-154634-702684_kr-plate-crop-front.jpg"
+    # The day folder (KST date) and the filename now agree.
+    assert (tmp_path / "raw" / "2026-09-16" / "media" / "images").is_dir()
+
+
+def test_non_korean_timezone_is_not_labelled_kr(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(EvidenceCoordinator, "_start_recorder", lambda self, camera: None)
+    now = datetime(2026, 9, 16, 6, 46, 34, tzinfo=timezone.utc)
+    coordinator = EvidenceCoordinator(
+        RawStorageConfig(local_dir=tmp_path, timezone_name="UTC", media_enabled=True),
+        [_camera()],
+        artifact_callback=lambda **item: None,
+        failure_callback=lambda **item: None,
+        clock=lambda: now,
+    )
+    assert coordinator._stamp(now) == "20260916-064634-000000_local"
+    coordinator.close()

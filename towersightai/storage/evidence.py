@@ -280,7 +280,7 @@ class EvidenceCoordinator:
         image: Any,
         captured_at: datetime,
     ) -> None:
-        final = self._artifact_path(captured_at, "images", f"{captured_at:%H%M%S-%f}-{kind}-{camera_id}.jpg")
+        final = self._artifact_path(captured_at, "images", f"{self._stamp(captured_at)}-{kind}-{camera_id}.jpg")
         temporary = final.with_name(f".{final.name}.{os.getpid()}.part")
         final.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -301,7 +301,7 @@ class EvidenceCoordinator:
         plate_bbox: Mapping[str, Any] | None,
     ) -> None:
         suffix = source.suffix.lower() if source.suffix.lower() in {".jpg", ".jpeg", ".png"} else ".jpg"
-        final = self._artifact_path(captured_at, "images", f"{captured_at:%H%M%S-%f}-plate-{camera_id}{suffix}")
+        final = self._artifact_path(captured_at, "images", f"{self._stamp(captured_at)}-plate-{camera_id}{suffix}")
         temporary = final.with_name(f".{final.name}.{os.getpid()}.part")
         final.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -322,7 +322,7 @@ class EvidenceCoordinator:
         captured_at: datetime,
         bbox: Mapping[str, Any],
     ) -> None:
-        final = self._artifact_path(captured_at, "images", f"{captured_at:%H%M%S-%f}-plate-crop-{camera_id}.jpg")
+        final = self._artifact_path(captured_at, "images", f"{self._stamp(captured_at)}-plate-crop-{camera_id}.jpg")
         temporary = final.with_name(f".{final.name}.{os.getpid()}.part")
         try:
             from PyQt6.QtGui import QImage
@@ -503,7 +503,7 @@ class EvidenceCoordinator:
             final = self._artifact_path(
                 session.started_at,
                 "videos",
-                f"{session.started_at:%H%M%S-%f}-{session.kind}-{camera_id}-part{part_number:03d}.mkv",
+                f"{self._stamp(session.started_at)}-{session.kind}-{camera_id}-part{part_number:03d}.mkv",
             )
             final.parent.mkdir(parents=True, exist_ok=True)
             temporary = final.with_name(f".{final.name}.{os.getpid()}.part")
@@ -574,6 +574,18 @@ class EvidenceCoordinator:
         with self._lock:
             if session.finalized.issuperset(session.camera_ids):
                 self._sessions.pop(session.session_id, None)
+
+    def _stamp(self, at: datetime) -> str:
+        """Filename timestamp in the configured local time, marked as such.
+
+        The day folder has always been local (``RAW_DATA_TIMEZONE``) while the filename used UTC,
+        so a file captured at 15:46 KST was named ``064634`` and names did not even sort
+        chronologically inside a day folder. Names now carry the full local date and time plus a
+        suffix naming the zone, so a file is unambiguous on its own.
+        """
+        local = at.astimezone(self.timezone)
+        suffix = "_kr" if self.config.timezone_name == "Asia/Seoul" else "_local"
+        return f"{local:%Y%m%d-%H%M%S-%f}{suffix}"
 
     def _artifact_path(self, at: datetime, group: str, name: str) -> Path:
         local = at.astimezone(self.timezone)

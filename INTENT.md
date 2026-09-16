@@ -155,6 +155,10 @@
   수정: 판독 시간을 **전면 카메라가 차를 처음 본 시점**부터 재고, 차가 안 오면 `arrival_timeout_seconds`로 종료하며,
   정차 단축은 판독이 하나라도 있거나 `min_read_seconds` 경과 후에만 적용한다. 세 값 모두 감시 설정 페이지에서 조정.
 
+- **증거 파일명은 한국시간 + `_kr`(2026-09-16, 사용자 지시)**: 폴더 날짜는 한국시간인데 파일명만 UTC라
+  15:46 촬영분이 `064634`로 보였고 같은 날짜 폴더 안에서 이름 정렬이 시간순도 아니었다. 이제
+  `20260916-154634-702684_kr-...` 형태로 날짜·시각을 모두 넣고 시간대를 표시한다. 기존 업로드분은 UTC 이름 유지.
+
 ## 5. 미해결 항목 (다음 세션이 이어받을 것)
 
 즉시(현장):
@@ -182,6 +186,10 @@
     `cat /sys/bus/pci/devices/0000:00:1d.0/aer_dev_correctable | grep RxErr` 와 `LnkSta`(8GT/s 유지
     여부)를 주기적으로 확인. RxErr가 다시 오르거나 LnkSta가 2.5GT/s로 떨어지면 곧 행 → 현장 방문 예약.
   - health 모니터(`towersightai.hailo.health`)는 이 상태를 정확히 error로 잡고 있음(소프트웨어는 정상).
+- [ ] **Hailo 행 2차 유형(2026-09-16 14:51)**: 전조 없이 버스에서 단절. dmesg `Device disconnected while
+  opening device` 반복, LnkSta는 8 GT/s 유지, RxErr 0, 온도 67.9°C 정상 → RxErr 추세로는 예고 안 됨.
+  재열거(modprobe -r → remove → rescan → modprobe)로 즉시 복구됨(재부팅 불필요). 물리 대책은 동일:
+  전원 완전 차단 후 M.2 재장착·접점 청소·라이저 재체결. 재발 간격이 짧아지면 슬롯 변경/모듈 교체.
 - [ ] 현장 `.env`에 `CAMERA_N_RECORD_RTSP_URL` 4줄(stream2) 추가 — 안내는 완료, 적용 확인 필요.
 - [ ] 현장 `CAMERA_1_RTSP_URL`(ceiling placeholder)이 좌측면 실IP(.239) 복제 상태 — 접속 불가
   주소(`192.0.2.10`)로 교체 권고했으나 미확인.
