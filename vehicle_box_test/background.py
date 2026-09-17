@@ -18,13 +18,62 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
 
+from vehicle_box_test.undistort import load_undistorts
+
 LAB_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA = LAB_ROOT / "data"
 #: 중앙값이 배경으로 수렴하려면 최소 이 정도 장수는 있어야 한다.
 MIN_FRAMES = 8
+#: 팔레트는 턴테이블 위에 있어 **회전한다**. 회전한 프레임을 섞어 중앙값을 내면 레일이 두 겹으로
+#: 찍혀 배경도 지면 교정도 망가진다(2026-09-16 확인). 노란 레일 마스크가 가장 많은 프레임과
+#: 겹치는 자세만 남긴다 = 입고/주차 시의 홈 포지션.
+HOME_CLUSTER_MIN_IOU = 0.45
 
 
-def build_median(paths: Sequence[Path], *, max_frames: int) -> "object | None":
+def _yellow_signature(path: Path, undistort):
+    """프레임의 노란 레일 마스크 (팔레트 자세의 지문)."""
+    import cv2
+
+    from vehicle_box_test import rails as rail_detect
+
+    image = cv2.imread(str(path))
+    if image is None:
+        return None
+    if undistort is not None:
+        image = undistort.image(image)
+    mask = rail_detect.yellow_mask(image)
+    # 해상도를 낮춰 비교 비용을 줄인다 (자세 판별에는 충분).
+    return cv2.resize(mask, (160, 90), interpolation=cv2.INTER_AREA) > 0
+
+
+def home_position_frames(paths: Sequence[Path], undistort, *, min_iou: float = HOME_CLUSTER_MIN_IOU):
+    """팔레트가 같은 자세(= 가장 흔한 자세 = 홈 포지션)인 프레임만 고른다.
+
+    노란 레일 마스크의 IoU로 서로 비슷한 것끼리 묶고, 가장 큰 무리를 남긴다.
+    """
+    import numpy as np
+
+    signatures = []
+    for path in paths:
+        signature = _yellow_signature(path, undistort)
+        if signature is not None and signature.sum() > 200:
+            signatures.append((path, signature))
+    if len(signatures) < MIN_FRAMES:
+        return [path for path, _ in signatures], 0.0
+
+    masks = np.stack([signature for _, signature in signatures])
+    intersection = np.einsum("ijk,ljk->il", masks, masks).astype(float)
+    area = np.diag(intersection)
+    union = area[:, None] + area[None, :] - intersection
+    iou = np.divide(intersection, np.maximum(union, 1.0))
+    # 메도이드 = 다른 프레임과 가장 많이 겹치는 프레임 = 가장 흔한 자세의 대표
+    medoid = int(np.argmax((iou >= min_iou).sum(axis=1)))
+    keep = iou[medoid] >= min_iou
+    kept = [signatures[i][0] for i in range(len(signatures)) if keep[i]]
+    return kept, float(keep.mean())
+
+
+def build_median(paths: Sequence[Path], *, max_frames: int, undistort=None) -> "object | None":
     import cv2
     import numpy as np
 
@@ -39,6 +88,8 @@ def build_median(paths: Sequence[Path], *, max_frames: int) -> "object | None":
         image = cv2.imread(str(path))
         if image is None:
             continue
+        if undistort is not None:
+            image = undistort.image(image)
         if shape is None:
             shape = image.shape
         elif image.shape != shape:
@@ -49,7 +100,7 @@ def build_median(paths: Sequence[Path], *, max_frames: int) -> "object | None":
     return np.median(np.stack(stack), axis=0).astype("uint8")
 
 
-def _least_changed(paths: Sequence[Path], median) -> tuple[Path | None, float]:
+def _least_changed(paths: Sequence[Path], median, undistort=None) -> tuple[Path | None, float]:
     """중앙값 배경과 가장 비슷한 프레임(= 피사체가 가장 적은 프레임)을 고른다."""
     import cv2
     import numpy as np
@@ -57,6 +108,8 @@ def _least_changed(paths: Sequence[Path], median) -> tuple[Path | None, float]:
     best: tuple[Path | None, float] = (None, float("inf"))
     for path in paths:
         image = cv2.imread(str(path))
+        if image is not None and undistort is not None:
+            image = undistort.image(image)
         if image is None or image.shape != median.shape:
             continue
         score = float(np.mean(cv2.absdiff(image, median)))
@@ -80,11 +133,19 @@ def run(args: argparse.Namespace) -> int:
         if item.get("kind") == "snapshot" and item.get("local_path"):
             groups[(item["camera_id"], "snapshot")].append(data_root / item["local_path"])
 
+    undistorts = load_undistorts(sorted({camera for camera, _ in groups}))
     out_root = data_root / "background"
     out_root.mkdir(parents=True, exist_ok=True)
     summary = {}
     for (camera, source), paths in sorted(groups.items()):
-        median = build_median(sorted(paths), max_frames=args.max_frames)
+        entry = undistorts.get(camera)
+        home, ratio = home_position_frames(sorted(paths), entry)
+        if len(home) >= MIN_FRAMES:
+            print(f"  {camera:14s} {source:9s} 홈 포지션 {len(home)}/{len(paths)}장 ({ratio*100:.0f}%)")
+            paths = home
+        else:
+            print(f"  {camera:14s} {source:9s} 홈 포지션 프레임이 부족해 전체를 씁니다 ({len(home)}장)")
+        median = build_median(sorted(paths), max_frames=args.max_frames, undistort=entry)
         if median is None:
             print(f"  {camera:14s} {source:9s} 프레임 부족({len(paths)}장) — 건너뜀")
             continue
@@ -95,10 +156,13 @@ def run(args: argparse.Namespace) -> int:
 
         # 중앙값에서 가장 덜 벗어난 실제 프레임 = '가장 비어 있는' 한 장. 합성이 아니라
         # 진짜 사진이라 선명해서 캘리브레이션 기준 이미지로 쓴다.
-        empty_path, score = _least_changed(sorted(paths), median)
+        empty_path, score = _least_changed(sorted(paths), median, entry)
         if empty_path is not None:
             empty_target = out_root / f"{camera}-{source}-empty.jpg"
-            cv2.imwrite(str(empty_target), cv2.imread(str(empty_path)), [cv2.IMWRITE_JPEG_QUALITY, 95])
+            empty_image = cv2.imread(str(empty_path))
+            if entry is not None:
+                empty_image = entry.image(empty_image)
+            cv2.imwrite(str(empty_target), empty_image, [cv2.IMWRITE_JPEG_QUALITY, 95])
             summary[f"{camera}-{source}-empty"] = {
                 "source": str(empty_path.relative_to(data_root)),
                 "mean_abs_diff": round(score, 2),

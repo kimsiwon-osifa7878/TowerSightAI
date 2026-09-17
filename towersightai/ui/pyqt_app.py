@@ -8,6 +8,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Sequence
 
 from towersightai.camera.pipeline import build_preview_pipeline, normalize_rotation_degrees
 from towersightai.config.settings import CameraRole, Settings
@@ -40,12 +41,23 @@ from towersightai.inference.hailo_health import (
     log_hailo_health,
     make_subprocess_temp_probe,
 )
+from towersightai.storage.hailo_incident import HailoIncidentReporter, IncidentReport
 from towersightai.runtime_logging import DEFAULT_RUNTIME_LOG, new_run_id
 from towersightai.state_machine.core import ParkingState
 from towersightai.sensors.ld2410 import LD2410Frame, LD2410TCPService
 from towersightai.storage.connection_test import NasConnectionTestResult, run_nas_connection_test
 from towersightai.storage.file_transfer import NasFileTransferResult, upload_files_to_nas
 from towersightai.calibration.checkerboard import CheckerboardSpec
+from towersightai.calibration.ground import (
+    REQUIRED_CORNERS,
+    GroundCalibrationStore,
+    GroundPoseResult,
+    pallet_grid,
+    pallet_outline,
+    project_ground_points,
+    scale_camera_matrix,
+    solve_ground_pose,
+)
 from towersightai.calibration.intrinsics import (
     CAPTURE_POSES,
     DEFAULT_INTRINSICS_ROOT,
@@ -54,8 +66,12 @@ from towersightai.calibration.intrinsics import (
     IntrinsicsResult,
     IntrinsicsSample,
     IntrinsicsSessionStore,
+    build_verification_image,
     calibrate_intrinsics,
     detect_checkerboard,
+    evaluate_pose_fit,
+    load_intrinsics,
+    result_from_dict,
 )
 from towersightai.storage.evidence import EvidenceCoordinator
 from towersightai.storage.raw_data import RawDataManager
@@ -91,6 +107,7 @@ SIDEBAR_SECTIONS = (
             "NAS 연결 확인",
             "NAS 파일 전송",
             "카메라 캘리브레이션",
+            "지면 기준점",
             "시스템 점검",
             "실행 로그",
         ),
@@ -100,6 +117,8 @@ SIDEBAR_SECTIONS = (
 SIDEBAR_ACTION_LABELS = tuple(label for _section, labels in SIDEBAR_SECTIONS for label in labels)
 LD2410_CONSOLE_MAX_LINES = 500
 HAILO_HEALTH_INTERVAL_SECONDS = 60
+# Healthy Hailo rows in the daily JSONL are thinned to this cadence; bad rows are always kept.
+HAILO_HEALTH_RECORD_INTERVAL_SECONDS = 600
 LOG_VIEW_TAIL_BYTES = 64 * 1024
 LOG_VIEW_MAX_LINES = 1200
 NAS_TEST_CLIP_SECONDS = 2.0
@@ -111,14 +130,17 @@ MONITORING_CAMERA_SETTLE_SECONDS = 4.0
 MONITORING_START_COOLDOWN_SECONDS = 10.0
 MONITORING_FAILURE_COOLDOWN_SECONDS = 30.0
 MONITORING_FAILURE_COOLDOWN_MAX_SECONDS = 120.0
-CALIBRATION_STEADY_HITS = 2
+# The board must sit inside the pose's on-screen target box continuously for this long before a
+# frame is kept. The old "two consecutive detections anywhere in frame" rule fired within a second
+# and captured boards that were nowhere near the wanted pose (field feedback 2026-09-16).
+CALIBRATION_DWELL_SECONDS = 3.0
 CALIBRATION_HOLD_SECONDS = 2.5
 NAS_TEST_CLIP_FPS = 10
 NAS_TEST_DIR = Path("artifacts/runtime/nas-connection-test")
 
 try:
-    from PyQt6.QtCore import QObject, QRect, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-    from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen
+    from PyQt6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+    from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -155,6 +177,9 @@ from towersightai.ui.driver_view import (
 
 
 class CameraSurface(QFrame):
+    #: Normalized (x, y) inside the drawn frame, emitted only while picking is enabled.
+    picked = pyqtSignal(float, float)
+
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.title = title
@@ -168,6 +193,17 @@ class CameraSurface(QFrame):
         self._guide_overlay: tuple[float, float, float, float, float, float] | None = None
         self._plate_line: float | None = None
         self._marker_points: tuple[tuple[float, float], ...] = ()
+        # Ground-calibration picking: labelled click markers and projected polylines.
+        self._pick_markers: tuple[tuple[float, float, str], ...] = ()
+        self._ground_overlay: tuple[tuple[tuple[float, float], ...], ...] = ()
+        self._picking = False
+        # (rect|None, state, progress, caption) for the calibration target box.
+        self._target_box: tuple[tuple[float, float, float, float] | None, str, float, str] = (
+            None,
+            "waiting",
+            0.0,
+            "",
+        )
         # Pixels reserved at the bottom for an overlay that covers the tile, such as the
         # driver bottom strip. Operator layouts keep this at 0.
         self.bottom_inset = 0
@@ -196,6 +232,75 @@ class CameraSurface(QFrame):
     def set_marker_points(self, points: tuple[tuple[float, float], ...]) -> None:
         """Normalized (0..1) image points drawn as small dots, e.g. detected checkerboard corners."""
         self._marker_points = tuple(points)
+        self.update()
+
+    def image_rect(self) -> QRect:
+        """Where the frame is actually drawn inside the tile (same maths as paintEvent)."""
+        if self._instrument:
+            content = QRect(
+                1,
+                1 + self.HEADER_BAR_HEIGHT + 1,
+                self.width() - 2,
+                self.height() - self.HEADER_BAR_HEIGHT - self.FOOTER_BAR_HEIGHT - 4,
+            )
+        else:
+            content = self.rect().adjusted(10, 10, -10, -10)
+        frame = self._frame
+        if frame is None or frame.isNull() or self.display_mode == "cover":
+            return content
+        scaled = frame.size()
+        scaled.scale(content.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        rect = QRect(content)
+        rect.setSize(scaled)
+        rect.moveCenter(content.center())
+        return rect
+
+    def set_picking(self, enabled: bool) -> None:
+        """Turn click-to-pick on. Only the ground-calibration page uses this."""
+        self._picking = bool(enabled)
+        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+
+    def set_pick_markers(self, markers: Sequence[tuple[float, float, str]]) -> None:
+        """Labelled points the operator has clicked (normalized image coordinates)."""
+        self._pick_markers = tuple((float(x), float(y), str(label)) for x, y, label in markers)
+        self.update()
+
+    def set_ground_overlay(self, polylines: Sequence[Sequence[tuple[float, float]]]) -> None:
+        """Projected ground geometry (pallet outline, metric grid) in normalized coordinates."""
+        self._ground_overlay = tuple(tuple((float(x), float(y)) for x, y in line) for line in polylines)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature.
+        if self._picking and event.button() == Qt.MouseButton.LeftButton:
+            rect = self.image_rect()
+            if rect.width() > 0 and rect.height() > 0:
+                position = event.position() if hasattr(event, "position") else event.pos()
+                x = (position.x() - rect.left()) / rect.width()
+                y = (position.y() - rect.top()) / rect.height()
+                if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+                    self.picked.emit(float(x), float(y))
+                    return
+        super().mousePressEvent(event)
+
+    def set_target_box(
+        self,
+        rect: tuple[float, float, float, float] | None,
+        *,
+        state: str = "waiting",
+        progress: float = 0.0,
+        caption: str = "",
+    ) -> None:
+        """Calibration target box: put the checkerboard inside this rectangle.
+
+        ``rect`` is normalized (x0, y0, x1, y1) and is drawn at the A4-landscape aspect the
+        caller computed. ``state`` is ``waiting`` (board not in the box), ``holding``
+        (inside, counting down) or ``captured``; ``progress`` 0..1 fills the countdown bar.
+        Operator calibration page only — the driver view never sets this.
+        """
+        payload = (rect, state, round(float(progress), 3), caption)
+        if payload == self._target_box:
+            return
+        self._target_box = payload
         self.update()
 
     def clear_detections(self) -> None:
@@ -299,6 +404,68 @@ class CameraSurface(QFrame):
             painter.setPen(QPen(QColor("#94a3b8"), 1))
             painter.drawLine(center_x, content.top() + 24, center_x, content.bottom() - 24)
             painter.drawLine(content.left() + 36, center_y, content.right() - 36, center_y)
+
+        target_rect, target_state, target_progress, target_caption = self._target_box
+        if target_rect is not None and self.display_mode != "cover":
+            x0, y0, x1, y1 = target_rect
+            box = QRect(
+                image_rect.left() + int(image_rect.width() * x0),
+                image_rect.top() + int(image_rect.height() * y0),
+                max(int(image_rect.width() * (x1 - x0)), 2),
+                max(int(image_rect.height() * (y1 - y0)), 2),
+            )
+            colors = {"waiting": "#94a3b8", "holding": "#F5A623", "captured": "#3DD68C"}
+            box_color = QColor(colors.get(target_state, "#94a3b8"))
+            painter.setPen(QPen(box_color, 3, Qt.PenStyle.DashLine if target_state == "waiting" else Qt.PenStyle.SolidLine))
+            painter.drawRect(box)
+            # Corner ticks make the box readable against a busy scene.
+            tick = max(min(box.width(), box.height()) // 8, 8)
+            painter.setPen(QPen(box_color, 5))
+            for cx, cy, dx, dy in (
+                (box.left(), box.top(), 1, 1),
+                (box.right(), box.top(), -1, 1),
+                (box.left(), box.bottom(), 1, -1),
+                (box.right(), box.bottom(), -1, -1),
+            ):
+                painter.drawLine(cx, cy, cx + tick * dx, cy)
+                painter.drawLine(cx, cy, cx, cy + tick * dy)
+            if target_progress > 0.0:
+                bar = QRect(box.left(), box.bottom() + 8, int(box.width() * min(target_progress, 1.0)), 8)
+                painter.fillRect(QRect(box.left(), box.bottom() + 8, box.width(), 8), QColor(20, 26, 34, 180))
+                painter.fillRect(bar, box_color)
+            if target_caption:
+                painter.setPen(QPen(box_color, 1))
+                painter.drawText(
+                    QRect(box.left(), max(box.top() - 26, image_rect.top()), box.width(), 22),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                    target_caption,
+                )
+
+        if self._ground_overlay and self.display_mode != "cover":
+            painter.setPen(QPen(QColor("#C78BFF"), 1))
+            for line in self._ground_overlay:
+                points = [
+                    QPoint(
+                        image_rect.left() + int(x * image_rect.width()),
+                        image_rect.top() + int(y * image_rect.height()),
+                    )
+                    for x, y in line
+                ]
+                for start, end in zip(points, points[1:]):
+                    painter.drawLine(start, end)
+
+        if self._pick_markers and self.display_mode != "cover":
+            for x, y, label in self._pick_markers:
+                px = image_rect.left() + int(x * image_rect.width())
+                py = image_rect.top() + int(y * image_rect.height())
+                painter.setPen(QPen(QColor("#3DD68C"), 3))
+                painter.drawLine(px - 12, py, px + 12, py)
+                painter.drawLine(px, py - 12, px, py + 12)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(px - 7, py - 7, 14, 14)
+                if label:
+                    painter.setPen(QPen(QColor("#E6EDF5"), 1))
+                    painter.drawText(px + 14, py - 8, label)
 
         if self._marker_points and display_frame is not None and self.display_mode != "cover":
             painter.setPen(QPen(QColor("#F5A623"), 2))
@@ -812,6 +979,16 @@ def _qimage_to_bgr(frame: QImage):  # noqa: ANN202 - numpy array; numpy imported
     return np.ascontiguousarray(array[:, :, ::-1])
 
 
+def _bgr_to_qimage(array) -> QImage:  # noqa: ANN001 - numpy array; numpy imported lazily.
+    """Convert a contiguous BGR numpy array to a QImage that owns its bytes."""
+    import numpy as np
+
+    rgb = np.ascontiguousarray(array[:, :, ::-1])
+    height, width = rgb.shape[:2]
+    image = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
+    return image.copy()  # detach from the numpy buffer before it goes out of scope
+
+
 class CheckerboardDetectWorker(QObject):
     """Find checkerboard corners in preview frames off the UI thread."""
 
@@ -1033,6 +1210,7 @@ class HailoHealthWorker(QObject):
     """
 
     snapshot_ready = pyqtSignal(object)
+    incident_reported = pyqtSignal(object)
     finished = pyqtSignal()
 
     def __init__(
@@ -1040,11 +1218,13 @@ class HailoHealthWorker(QObject):
         settings: Settings,
         *,
         interval_seconds: int = HAILO_HEALTH_INTERVAL_SECONDS,
+        reporter: HailoIncidentReporter | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
         self.interval_seconds = max(5, int(interval_seconds))
+        self.reporter = reporter
         self._running = True
 
     def stop(self) -> None:
@@ -1052,6 +1232,11 @@ class HailoHealthWorker(QObject):
 
     def run(self) -> None:
         temp_probe = make_subprocess_temp_probe(self.settings.hailo_apps_python)
+        reporter = self.reporter or HailoIncidentReporter(self.settings.raw_storage)
+        if not reporter.enabled:
+            logging.getLogger("towersightai.hailo.incident").info(
+                "hailo-incident-upload disabled (RAW_DATA_ENABLED/HAILO_INCIDENT_UPLOAD_ENABLED/NAS host)"
+            )
         previous: HailoHealthSnapshot | None = None
         while self._running:
             snapshot = collect_hailo_health(
@@ -1061,6 +1246,15 @@ class HailoHealthWorker(QObject):
             log_hailo_health(snapshot, previous=previous)
             self.snapshot_ready.emit(snapshot)
             previous = snapshot
+            # Evidence upload runs on this worker thread (never the UI thread) and never raises.
+            # A worker asked to stop skips the upload so shutdown is never held by an SFTP call.
+            try:
+                report = reporter.observe(snapshot) if self._running else IncidentReport(False, "stopping")
+            except Exception:  # noqa: BLE001 - diagnostics must not stop health monitoring.
+                logging.getLogger("towersightai.hailo.incident").exception("hailo-incident-observe-failed")
+            else:
+                if report.reported:
+                    self.incident_reported.emit(report)
             for _ in range(self.interval_seconds):
                 if not self._running:
                     break
@@ -1156,12 +1350,15 @@ class OperatorWindow(QMainWindow):
         self._calib_calibrating = False
         self._calib_detect_busy = False
         self._calib_token = 0
-        self._calib_hits = 0
+        self._calib_dwell_start: float | None = None
         self._calib_hold_until = 0.0
         self._calib_capture_requested = False
         self._calib_timer: QTimer | None = None
         self._calib_detect_thread: QThread | None = None
         self._calib_detect_worker: CheckerboardDetectWorker | None = None
+        self._ground_points: list[tuple[float, float]] = []
+        self._ground_result: GroundPoseResult | None = None
+        self._ground_picking = False
         self._calib_threads: list[QThread] = []
         self._calib_workers: list[IntrinsicsCalibrateWorker] = []
         self._detection_camera_ids: tuple[str, ...] = ()
@@ -1213,6 +1410,8 @@ class OperatorWindow(QMainWindow):
         self._hailo_health_threads: list[QThread] = []
         self._hailo_health_workers: list[HailoHealthWorker] = []
         self._hailo_health_snapshot: HailoHealthSnapshot | None = None
+        self._hailo_health_recorded_status = ""
+        self._hailo_health_recorded_at: float | None = None
         # --- continuous parking-process engine (auto-started; PLC is simulated) ---
         self.operator_settings: OperatorRuntimeSettings = load_operator_settings()
         self.plc_adapter = FakePLCAdapter()
@@ -1702,6 +1901,7 @@ class OperatorWindow(QMainWindow):
         self._register_operator_page("NAS 연결 확인", self._build_nas_page())
         self._register_operator_page("NAS 파일 전송", self._build_nas_transfer_page())
         self._register_operator_page("카메라 캘리브레이션", self._build_calibration_page(), camera_layout="single:front")
+        self._register_operator_page("지면 기준점", self._build_ground_page(), camera_layout="single:front")
         self._register_operator_page("시스템 점검", self._build_system_page())
         self._register_operator_page("실행 로그", self._build_log_page())
         self._register_operator_page("주차 프로세스 테스트", self._build_driver_test_page())
@@ -1955,6 +2155,12 @@ class OperatorWindow(QMainWindow):
         self.calibration_stop_button = QPushButton("세션 종료")
         self.calibration_stop_button.clicked.connect(self._stop_calibration_session)
         controls.addWidget(self.calibration_stop_button)
+        self.calibration_verify_button = QPushButton("결과 확인")
+        self.calibration_verify_button.setToolTip(
+            "저장된 측정값으로 현재 화면의 왜곡을 보정해 원본과 나란히 보여줍니다. 확인 전용이며 최종 OK와 무관합니다."
+        )
+        self.calibration_verify_button.clicked.connect(self._verify_calibration)
+        controls.addWidget(self.calibration_verify_button)
         self.calibration_auto_box = QCheckBox("자동 촬영")
         self.calibration_auto_box.setChecked(True)
         controls.addWidget(self.calibration_auto_box)
@@ -1978,6 +2184,24 @@ class OperatorWindow(QMainWindow):
         page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
         page.camera_slot.setContentsMargins(0, 0, 0, 0)
         body.addLayout(page.camera_slot, 1)
+        self.calibration_quality_label = QLabel("측정 결과가 아직 없습니다. 촬영 후 측정 실행을 누르거나 결과 확인을 눌러 주세요.")
+        self.calibration_quality_label.setObjectName("pageSubtitleLabel")
+        self.calibration_quality_label.setWordWrap(True)
+        body.addWidget(self.calibration_quality_label)
+        self.calibration_verify_view = QLabel()
+        self.calibration_verify_view.setObjectName("calibrationVerifyView")
+        self.calibration_verify_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.calibration_verify_view.setMinimumHeight(0)
+        self.calibration_verify_view.setVisible(False)
+        body.addWidget(self.calibration_verify_view)
+        self.calibration_verify_caption = QLabel(
+            "왼쪽: 원본 · 오른쪽: 왜곡 보정 후. 노란 격자는 완벽한 직선입니다 — "
+            "보정 후 화면의 실제 직선(레일·기둥·바닥 이음매)이 격자와 나란하면 잘 된 것입니다."
+        )
+        self.calibration_verify_caption.setObjectName("pageSubtitleLabel")
+        self.calibration_verify_caption.setWordWrap(True)
+        self.calibration_verify_caption.setVisible(False)
+        body.addWidget(self.calibration_verify_caption)
         self.calibration_history = QPlainTextEdit()
         self.calibration_history.setObjectName("testLog")
         self.calibration_history.setReadOnly(True)
@@ -1987,6 +2211,384 @@ class OperatorWindow(QMainWindow):
         self._populate_calibration_cameras()
         self._refresh_calibration_buttons()
         return page
+
+
+    # ---- 지면 기준점 (외부 파라미터) -----------------------------------------------------
+    #
+    # 렌즈 내부 파라미터(체커보드)만으로는 mm를 못 만든다. 카메라가 팔레트를 기준으로 어디에
+    # 어느 각도로 있는지가 있어야 한다. 팔레트 데크의 끝단에는 자동으로 잡을 만한 특징이 없어서
+    # (긴 변만 노란 테두리, 끝은 주황 스토퍼 프레임) 운영자가 네 모서리를 찍는다.
+
+    GROUND_PICK_STEPS = (
+        "팔레트 데크의 **네 모서리**를 차례로 클릭하세요 (순서는 상관없습니다)",
+        "마지막으로 **주황색 스토퍼 프레임의 바닥**을 클릭하세요 — 이 쪽이 주차기 안쪽입니다",
+    )
+
+    def _build_ground_page(self) -> QWidget:
+        page, body, controls = self._page_scaffold(
+            "지면 기준점",
+            "팔레트 데크 네 모서리와 주황 스토퍼 위치를 찍으면 카메라가 팔레트 기준으로 어디에 "
+            "어느 각도로 있는지를 계산합니다. 측정 파일일 뿐이며 검토 전까지 캘리브레이션 유효로 "
+            "취급되지 않습니다.",
+        )
+        self.ground_camera_box = QComboBox()
+        self.ground_camera_box.currentIndexChanged.connect(self._on_ground_camera_changed)
+        controls.addWidget(QLabel("카메라"))
+        controls.addWidget(self.ground_camera_box)
+        self.ground_start_button = QPushButton("찍기 시작")
+        self.ground_start_button.setProperty("primary", "true")
+        self.ground_start_button.clicked.connect(self._start_ground_picking)
+        controls.addWidget(self.ground_start_button)
+        self.ground_undo_button = QPushButton("한 점 취소")
+        self.ground_undo_button.clicked.connect(self._undo_ground_point)
+        controls.addWidget(self.ground_undo_button)
+        self.ground_reset_button = QPushButton("다시 찍기")
+        self.ground_reset_button.clicked.connect(self._reset_ground_points)
+        controls.addWidget(self.ground_reset_button)
+        self.ground_save_button = QPushButton("저장")
+        self.ground_save_button.setProperty("primary", "true")
+        self.ground_save_button.clicked.connect(self._save_ground_pose)
+        controls.addWidget(self.ground_save_button)
+        controls.addStretch(1)
+
+        self.ground_instruction_label = QLabel("찍기 시작을 누르면 안내가 나옵니다.")
+        self.ground_instruction_label.setObjectName("pageTitleLabel")
+        self.ground_instruction_label.setWordWrap(True)
+        body.addWidget(self.ground_instruction_label)
+        self.ground_status_label = QLabel("대기 중")
+        self.ground_status_label.setObjectName("pageStatusLabel")
+        self.ground_status_label.setWordWrap(True)
+        body.addWidget(self.ground_status_label)
+        page.camera_slot = QVBoxLayout()  # type: ignore[attr-defined]
+        page.camera_slot.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(page.camera_slot, 1)
+        self.ground_quality_label = QLabel(
+            f"팔레트 {self._ground_pallet()[0]:.0f}×{self._ground_pallet()[1]:.0f} mm 기준 · "
+            "저장된 기준점이 없습니다."
+        )
+        self.ground_quality_label.setObjectName("pageSubtitleLabel")
+        self.ground_quality_label.setWordWrap(True)
+        body.addWidget(self.ground_quality_label)
+        self.ground_history = QPlainTextEdit()
+        self.ground_history.setObjectName("testLog")
+        self.ground_history.setReadOnly(True)
+        self.ground_history.setMaximumHeight(120)
+        self.ground_history.setPlaceholderText("기준점 기록이 여기에 남습니다. 측정 전용이며 최종 OK를 허용하지 않습니다.")
+        body.addWidget(self.ground_history)
+        self._populate_ground_cameras()
+        self._refresh_ground_buttons()
+        return page
+
+    def _refresh_ground_page(self) -> None:
+        """Show the selected camera's tile and whatever was measured for it before."""
+        camera = self._ground_camera()
+        page = self.operator_pages.get("지면 기준점")
+        if camera is not None:
+            self._camera_page_layouts["지면 기준점"] = f"single:{camera.role.value}"
+        if page is not None:
+            self._adopt_camera_area(page, self._camera_page_layouts["지면 기준점"])
+        if camera is not None:
+            self._show_ground_saved(camera.id)
+        self._refresh_ground_buttons()
+
+    def _ground_pallet(self) -> tuple[float, float]:
+        envelope = self.settings.vehicle_envelope if self.settings is not None else None
+        if envelope is None:
+            return (5350.0, 2200.0)
+        return (float(envelope.pallet_length_mm), float(envelope.pallet_width_mm))
+
+    def _populate_ground_cameras(self) -> None:
+        box = getattr(self, "ground_camera_box", None)
+        if box is None or self.settings is None:
+            return
+        box.blockSignals(True)
+        box.clear()
+        for camera in self.settings.active_cameras:
+            box.addItem(f"{camera.id} ({camera.role.value})", camera.id)
+        # Start on the same camera the calibration page prefers, so the two steps line up.
+        preferred = self.settings.vehicle_envelope.front_left_role
+        for camera in self.settings.active_cameras:
+            if camera.role is preferred:
+                index = box.findData(camera.id)
+                if index >= 0:
+                    box.setCurrentIndex(index)
+                break
+        box.blockSignals(False)
+        camera = self._ground_camera()
+        if camera is not None:
+            self._camera_page_layouts["지면 기준점"] = f"single:{camera.role.value}"
+
+    def _ground_camera(self):  # noqa: ANN201 - CameraConfig | None
+        box = getattr(self, "ground_camera_box", None)
+        if box is None or self.settings is None:
+            return None
+        camera_id = box.currentData()
+        for camera in self.settings.active_cameras:
+            if camera.id == camera_id:
+                return camera
+        return None
+
+    def _ground_camera_widget(self):  # noqa: ANN201
+        camera = self._ground_camera()
+        return self.camera_widgets.get(camera.role) if camera is not None else None
+
+    def _on_ground_camera_changed(self, index: int = -1) -> None:
+        del index
+        self._reset_ground_points()
+        camera = self._ground_camera()
+        if camera is not None:
+            self._camera_page_layouts["지면 기준점"] = f"single:{camera.role.value}"
+            page = self.operator_pages.get("지면 기준점")
+            if page is not None and self.operator_stack.currentWidget() is page:
+                self._adopt_camera_area(page, self._camera_page_layouts["지면 기준점"])
+            self._show_ground_saved(camera.id)
+
+    def _refresh_ground_buttons(self) -> None:
+        picking = bool(self._ground_picking)
+        points = len(self._ground_points)
+        for name, enabled in (
+            ("ground_start_button", not picking),
+            ("ground_undo_button", picking and points > 0),
+            ("ground_reset_button", points > 0),
+            ("ground_save_button", self._ground_result is not None),
+            ("ground_camera_box", not picking),
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _set_ground_status(self, message: str) -> None:
+        if hasattr(self, "ground_status_label"):
+            self.ground_status_label.setText(message)
+        self.warning_label.setText(f"{message}. 측정 전용이며 최종 OK는 차단됩니다.")
+
+    def _log_ground(self, message: str) -> None:
+        if hasattr(self, "ground_history"):
+            self.ground_history.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+    def _show_ground_instruction(self) -> None:
+        label = getattr(self, "ground_instruction_label", None)
+        if label is None:
+            return
+        count = len(self._ground_points)
+        if not self._ground_picking:
+            label.setText("찍기 시작을 누르면 안내가 나옵니다.")
+        elif count < REQUIRED_CORNERS:
+            label.setText(f"[{count + 1}/{REQUIRED_CORNERS + 1}] {self.GROUND_PICK_STEPS[0]}")
+        elif count == REQUIRED_CORNERS:
+            label.setText(f"[{REQUIRED_CORNERS + 1}/{REQUIRED_CORNERS + 1}] {self.GROUND_PICK_STEPS[1]}")
+        else:
+            label.setText("계산 완료. 투영된 팔레트와 격자가 실제와 맞는지 보고 저장하세요.")
+
+    def _start_ground_picking(self, checked: bool = False) -> None:
+        del checked
+        if not self._operator_unlocked:
+            return
+        camera = self._ground_camera()
+        widget = self._ground_camera_widget()
+        if camera is None or widget is None:
+            self._set_ground_status("설정된 카메라가 없습니다")
+            return
+        if widget.current_frame() is None:
+            self._set_ground_status(f"{camera.id} 화면이 아직 수신되지 않았습니다")
+            return
+        self._reset_ground_points()
+        self._ground_picking = True
+        widget.set_picking(True)
+        try:
+            widget.picked.disconnect(self._on_ground_point_picked)
+        except TypeError:
+            pass
+        widget.picked.connect(self._on_ground_point_picked)
+        self._show_ground_instruction()
+        self._set_ground_status(f"{camera.id} 화면을 클릭해 기준점을 찍으세요")
+        self._log_ground(f"찍기 시작 camera={camera.id}")
+        self._refresh_ground_buttons()
+
+    def _stop_ground_picking(self) -> None:
+        self._ground_picking = False
+        widget = self._ground_camera_widget()
+        if widget is not None:
+            widget.set_picking(False)
+            try:
+                widget.picked.disconnect(self._on_ground_point_picked)
+            except TypeError:
+                pass
+
+    def _ground_marker_labels(self) -> list[tuple[float, float, str]]:
+        markers: list[tuple[float, float, str]] = []
+        for index, (x, y) in enumerate(self._ground_points):
+            label = f"모서리 {index + 1}" if index < REQUIRED_CORNERS else "스토퍼"
+            markers.append((x, y, label))
+        return markers
+
+    def _on_ground_point_picked(self, x: float, y: float) -> None:
+        if not self._ground_picking:
+            return
+        self._ground_points.append((float(x), float(y)))
+        widget = self._ground_camera_widget()
+        if widget is not None:
+            widget.set_pick_markers(self._ground_marker_labels())
+        if len(self._ground_points) > REQUIRED_CORNERS:
+            self._solve_ground_pose()
+        else:
+            self._show_ground_instruction()
+            self._set_ground_status(f"{len(self._ground_points)}개 찍음")
+        self._refresh_ground_buttons()
+
+    def _undo_ground_point(self, checked: bool = False) -> None:
+        del checked
+        if not self._ground_points:
+            return
+        self._ground_points.pop()
+        self._ground_result = None
+        widget = self._ground_camera_widget()
+        if widget is not None:
+            widget.set_pick_markers(self._ground_marker_labels())
+            widget.set_ground_overlay(())
+        self._show_ground_instruction()
+        self._set_ground_status(f"{len(self._ground_points)}개 남음")
+        self._refresh_ground_buttons()
+
+    def _reset_ground_points(self, checked: bool = False) -> None:
+        del checked
+        self._ground_points = []
+        self._ground_result = None
+        self._stop_ground_picking()
+        widget = self._ground_camera_widget()
+        if widget is not None:
+            widget.set_pick_markers(())
+            widget.set_ground_overlay(())
+        self._show_ground_instruction()
+        self._refresh_ground_buttons()
+
+    def _ground_intrinsics(self, camera_id: str):  # noqa: ANN201
+        """(IntrinsicsResult, source_camera_id, borrowed) — 없으면 같은 기종의 다른 측정값을 빌린다."""
+        root = (
+            self.settings.calibration_path.parent / "intrinsics"
+            if self.settings is not None
+            else DEFAULT_INTRINSICS_ROOT
+        )
+        own = Path(root) / f"{camera_id}.json"
+        if own.is_file():
+            try:
+                return result_from_dict(load_intrinsics(own)), camera_id, False
+            except (OSError, ValueError, KeyError):
+                pass
+        for path in sorted(Path(root).glob("*.json")):
+            try:
+                return result_from_dict(load_intrinsics(path)), path.stem, True
+            except (OSError, ValueError, KeyError):
+                continue
+        return None, "", False
+
+    def _solve_ground_pose(self) -> None:
+        camera = self._ground_camera()
+        widget = self._ground_camera_widget()
+        frame = widget.current_frame() if widget is not None else None
+        if camera is None or frame is None:
+            self._set_ground_status("화면이 없어 계산할 수 없습니다")
+            return
+        intrinsics, source, borrowed = self._ground_intrinsics(camera.id)
+        if intrinsics is None:
+            self._set_ground_status(
+                "렌즈 내부 파라미터가 없습니다. 먼저 카메라 캘리브레이션에서 체커보드를 측정해 주세요"
+            )
+            self._stop_ground_picking()
+            return
+
+        size = (frame.width(), frame.height())
+        matrix = scale_camera_matrix(intrinsics.camera_matrix, (intrinsics.image_width, intrinsics.image_height), size)
+        length_mm, width_mm = self._ground_pallet()
+        try:
+            result = solve_ground_pose(
+                self._ground_points[:REQUIRED_CORNERS],
+                self._ground_points[REQUIRED_CORNERS],
+                camera_id=camera.id,
+                camera_matrix=matrix,
+                distortion=intrinsics.distortion,
+                image_size=size,
+                pallet_length_mm=length_mm,
+                pallet_width_mm=width_mm,
+                rotation_degrees=camera.rotation_degrees,
+                intrinsics_camera_id=source,
+                intrinsics_borrowed=borrowed,
+            )
+        except (ValueError, ImportError) as exc:
+            self._set_ground_status(f"계산 실패: {exc}")
+            self._log_ground(f"계산 실패 {exc}")
+            self._stop_ground_picking()
+            self._refresh_ground_buttons()
+            return
+
+        self._ground_result = result
+        self._stop_ground_picking()
+        self._show_ground_overlay(result, intrinsics, size)
+        self._show_ground_quality(result)
+        self._show_ground_instruction()
+        self._set_ground_status(f"{camera.id} 자세 계산 완료 — {result.summary()}")
+        self._log_ground(f"계산 완료 {result.summary()}")
+        self._refresh_ground_buttons()
+
+    def _show_ground_overlay(self, result: GroundPoseResult, intrinsics, size: tuple[int, int]) -> None:
+        widget = self._ground_camera_widget()
+        if widget is None:
+            return
+        matrix = scale_camera_matrix(
+            intrinsics.camera_matrix, (intrinsics.image_width, intrinsics.image_height), size
+        )
+        polylines: list[list[tuple[float, float]]] = []
+        for line in pallet_grid(result):
+            polylines.append(
+                project_ground_points(
+                    result, line, camera_matrix=matrix, distortion=intrinsics.distortion, image_size=size
+                )
+            )
+        outline = project_ground_points(
+            result, pallet_outline(result), camera_matrix=matrix, distortion=intrinsics.distortion, image_size=size
+        )
+        polylines.append(outline + [outline[0]])
+        widget.set_ground_overlay(polylines)
+
+    def _show_ground_quality(self, result: GroundPoseResult) -> None:
+        label = getattr(self, "ground_quality_label", None)
+        if label is None:
+            return
+        grade, lines = result.quality_report()
+        head = f"[{self.CALIBRATION_GRADE_TEXT.get(grade, grade)}] {result.summary()}"
+        label.setText(head + "\n" + "\n".join(lines))
+
+    def _show_ground_saved(self, camera_id: str) -> None:
+        label = getattr(self, "ground_quality_label", None)
+        if label is None:
+            return
+        saved = self._ground_store().load(camera_id)
+        length_mm, width_mm = self._ground_pallet()
+        if saved is None:
+            label.setText(f"팔레트 {length_mm:.0f}×{width_mm:.0f} mm 기준 · {camera_id} 저장된 기준점이 없습니다.")
+            return
+        self._show_ground_quality(saved)
+
+    def _ground_store(self) -> GroundCalibrationStore:
+        root = (
+            self.settings.calibration_path.parent / "ground"
+            if self.settings is not None
+            else Path("data/calibration/ground")
+        )
+        return GroundCalibrationStore(root=Path(root))
+
+    def _save_ground_pose(self, checked: bool = False) -> None:
+        del checked
+        if self._ground_result is None:
+            return
+        try:
+            path = self._ground_store().save(self._ground_result)
+        except OSError as exc:
+            self._set_ground_status(f"저장 실패: {exc}")
+            return
+        self._set_ground_status(f"저장 완료: {path} (reviewed=false — 최종 OK는 계속 차단)")
+        self._log_ground(f"저장 {path}")
+        self._refresh_ground_buttons()
 
     def _build_system_page(self) -> QWidget:
         page, body, controls = self._page_scaffold(
@@ -2403,6 +3005,8 @@ class OperatorWindow(QMainWindow):
             self.driver_preview.restore_presentation()
         elif label == "카메라 캘리브레이션":
             self._refresh_calibration_page()
+        elif label == "지면 기준점":
+            self._refresh_ground_page()
         self.update()
 
     def _adopt_camera_area(self, page: QWidget, layout_mode: str) -> None:
@@ -2425,6 +3029,7 @@ class OperatorWindow(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.snapshot_ready.connect(self._set_hailo_health)
+        worker.incident_reported.connect(self._set_hailo_incident)
         worker.finished.connect(thread.quit)
         self._hailo_health_threads.append(thread)
         self._hailo_health_workers.append(worker)
@@ -2449,6 +3054,37 @@ class OperatorWindow(QMainWindow):
             )
         if hasattr(self, "hailo_holder_kill_button"):
             self.hailo_holder_kill_button.setEnabled(bool(snapshot.foreign_holders))
+        self._record_hailo_health_row(snapshot)
+
+    def _record_hailo_health_row(self, snapshot: HailoHealthSnapshot) -> None:
+        """Put the health snapshot in the daily JSONL so the NAS day carries the failure timeline.
+
+        Every status change and every bad sample is kept; healthy samples are thinned to one per
+        HAILO_HEALTH_RECORD_INTERVAL_SECONDS so an all-day healthy run stays a few hundred rows.
+        """
+        if self._raw_data_manager is None:
+            return
+        now = time.monotonic()
+        changed = snapshot.status != self._hailo_health_recorded_status
+        bad = snapshot.status != "ok"
+        due = (
+            self._hailo_health_recorded_at is None
+            or now - self._hailo_health_recorded_at >= HAILO_HEALTH_RECORD_INTERVAL_SECONDS
+        )
+        if not (changed or bad or due):
+            return
+        self._hailo_health_recorded_status = snapshot.status
+        self._hailo_health_recorded_at = now
+        self._record_raw(self._raw_data_manager.record_hailo_health, snapshot)
+
+    def _set_hailo_incident(self, report: IncidentReport) -> None:
+        """Show the result of an automatic Hailo evidence upload. Diagnostic only."""
+        message = report.summary()
+        self.warning_label.setText(f"{message}. 진단 전용이며 최종 OK는 차단됩니다.")
+        if hasattr(self, "system_test_log"):
+            self.system_test_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        if hasattr(self, "hailo_health_label"):
+            self.hailo_health_label.setText(self.hailo_health_label.text() + f"\n{message}")
 
     def _terminate_hailo_holders(self, checked: bool = False) -> None:
         """Kill orphaned Hailo holders (never this app's own children). Diagnostic only."""
@@ -2703,6 +3339,7 @@ class OperatorWindow(QMainWindow):
                         # image and its crop for the engine's automatic entries too.
                         source_image_path=event.source_image_path or None,
                         plate_bbox=dict(event.bbox) if event.bbox else None,
+                        plate_text=event.plate_text,
                     )
                 elif event.kind == "vehicle_exit_start":
                     self._record_raw(
@@ -2722,6 +3359,7 @@ class OperatorWindow(QMainWindow):
                         accepted=event.accepted,
                         reason=event.reason,
                         plate_bbox=event.bbox,
+                        plate_text=event.plate_text,
                     )
         if output.lpr_control == "start":
             self._start_periodic_lpr()
@@ -3696,6 +4334,7 @@ class OperatorWindow(QMainWindow):
             ("calibration_run_button", len(self._calib_samples) >= CALIBRATION_MIN_SAMPLES and not calibrating),
             ("calibration_stop_button", running and not calibrating),
             ("calibration_camera_box", not running and not calibrating),
+            ("calibration_verify_button", not calibrating),
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -3710,15 +4349,49 @@ class OperatorWindow(QMainWindow):
         if hasattr(self, "calibration_history"):
             self.calibration_history.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
+    def _calibration_frame_aspect(self) -> float:
+        """height/width of the calibration camera's frame; falls back to 16:9."""
+        camera = self._calibration_camera()
+        widget = self.camera_widgets.get(camera.role) if camera is not None else None
+        frame = widget.current_frame() if widget is not None else None
+        if frame is not None and frame.width() > 0:
+            return frame.height() / float(frame.width())
+        return 9.0 / 16.0
+
+    def _paint_calibration_target(self, widget, pose, *, state: str, progress: float) -> None:  # noqa: ANN001
+        caption = {"waiting": "여기에 체커판을 맞추세요", "holding": "그대로 유지", "captured": "촬영"}.get(state, "")
+        widget.set_target_box(
+            pose.target_rect(self._calibration_frame_aspect()),
+            state=state,
+            progress=progress,
+            caption=caption,
+        )
+
+    def _clear_calibration_target(self) -> None:
+        camera = self._calibration_camera()
+        widget = self.camera_widgets.get(camera.role) if camera is not None else None
+        if widget is not None:
+            widget.set_target_box(None)
+
     def _show_calibration_pose(self) -> None:
         label = getattr(self, "calibration_instruction_label", None)
-        if label is None:
-            return
+        camera = self._calibration_camera()
+        widget = self.camera_widgets.get(camera.role) if camera is not None else None
         if self._calib_pose_index >= len(CAPTURE_POSES):
-            label.setText(f"모든 자세 완료 ({len(self._calib_samples)}장). 측정 실행을 누르세요.")
+            if widget is not None:
+                widget.set_target_box(None)
+            if label is not None:
+                label.setText(f"모든 자세 완료 ({len(self._calib_samples)}장). 측정 실행을 누르세요.")
             return
         pose = CAPTURE_POSES[self._calib_pose_index]
-        label.setText(f"[{self._calib_pose_index + 1}/{len(CAPTURE_POSES)}] {pose.instruction} — {pose.hint}")
+        if widget is not None:
+            self._paint_calibration_target(widget, pose, state="waiting", progress=0.0)
+        if label is not None:
+            hint = f" — {pose.hint}" if pose.hint else ""
+            label.setText(
+                f"[{self._calib_pose_index + 1}/{len(CAPTURE_POSES)}] {pose.instruction}{hint} "
+                f"(상자 안에서 {CALIBRATION_DWELL_SECONDS:.0f}초 유지하면 자동 촬영)"
+            )
 
     def _start_calibration_session(self, checked: bool = False) -> None:
         del checked
@@ -3739,7 +4412,7 @@ class OperatorWindow(QMainWindow):
         self._calib_samples = []
         self._calib_pose_index = 0
         self._calib_camera_id = camera.id
-        self._calib_hits = 0
+        self._calib_dwell_start = None
         self._calib_hold_until = 0.0
         self._calib_capture_requested = False
         self._calib_running = True
@@ -3789,23 +4462,52 @@ class OperatorWindow(QMainWindow):
             return
         camera = self._calibration_camera()
         widget = self.camera_widgets.get(camera.role) if camera is not None else None
+        pose = CAPTURE_POSES[self._calib_pose_index]
         if detection is None:
-            self._calib_hits = 0
+            self._calib_dwell_start = None
             if widget is not None:
                 widget.set_marker_points(())
+                self._paint_calibration_target(widget, pose, state="waiting", progress=0.0)
             self._set_calibration_status("체커보드가 보이지 않습니다. 보드 전체가 화면에 들어오게 해 주세요")
             return
         if widget is not None:
             widget.set_marker_points(detection.normalized)
-        self._calib_hits += 1
+
+        fit = evaluate_pose_fit(pose, detection, spec=self._calib_spec)
         auto = getattr(self, "calibration_auto_box", None)
         auto_enabled = auto.isChecked() if auto is not None else True
-        if self._calib_capture_requested or (auto_enabled and self._calib_hits >= CALIBRATION_STEADY_HITS):
+
+        if self._calib_capture_requested:  # 수동 촬영은 상자 조건을 건너뛴다
             self._accept_calibration_sample(bgr, detection)
-        else:
-            self._set_calibration_status(
-                f"체커보드 인식됨 ({self._calib_hits}/{CALIBRATION_STEADY_HITS}), 잠시 그대로 유지해 주세요"
-            )
+            return
+        if not auto_enabled:
+            self._calib_dwell_start = None
+            if widget is not None:
+                self._paint_calibration_target(widget, pose, state="waiting", progress=0.0)
+            self._set_calibration_status("자동 촬영이 꺼져 있습니다. '지금 촬영'을 눌러 주세요")
+            return
+        if not fit.ok:
+            self._calib_dwell_start = None
+            if widget is not None:
+                self._paint_calibration_target(widget, pose, state="waiting", progress=0.0)
+            self._set_calibration_status(f"{fit.reason} (상자 채움 {fit.fill * 100:.0f}%)")
+            return
+
+        now = time.monotonic()
+        if self._calib_dwell_start is None:
+            self._calib_dwell_start = now
+        held = now - self._calib_dwell_start
+        if held < CALIBRATION_DWELL_SECONDS:
+            remaining = CALIBRATION_DWELL_SECONDS - held
+            if widget is not None:
+                self._paint_calibration_target(
+                    widget, pose, state="holding", progress=held / CALIBRATION_DWELL_SECONDS
+                )
+            self._set_calibration_status(f"상자 안에 들어왔습니다. {remaining:.1f}초 그대로 유지")
+            return
+        if widget is not None:
+            self._paint_calibration_target(widget, pose, state="captured", progress=1.0)
+        self._accept_calibration_sample(bgr, detection)
 
     def _accept_calibration_sample(self, bgr, detection: CheckerboardDetection) -> None:  # noqa: ANN001
         if self._calib_store is None or self._calib_pose_index >= len(CAPTURE_POSES):
@@ -3818,7 +4520,7 @@ class OperatorWindow(QMainWindow):
             return
         self._calib_samples.append(sample)
         self._calib_capture_requested = False
-        self._calib_hits = 0
+        self._calib_dwell_start = None
         self._calib_hold_until = time.monotonic() + CALIBRATION_HOLD_SECONDS
         self._log_calibration(
             f"촬영 {len(self._calib_samples)} pose={pose.key} coverage={detection.coverage:.2f} {sample.image_path.name}"
@@ -3844,7 +4546,7 @@ class OperatorWindow(QMainWindow):
             return
         skipped = CAPTURE_POSES[self._calib_pose_index]
         self._calib_pose_index += 1
-        self._calib_hits = 0
+        self._calib_dwell_start = None
         self._log_calibration(f"건너뜀 pose={skipped.key}")
         self._show_calibration_pose()
         self._refresh_calibration_buttons()
@@ -3884,6 +4586,93 @@ class OperatorWindow(QMainWindow):
         self._set_calibration_status(f"측정 완료: {result.summary()} → {latest_path}")
         self._log_calibration(f"측정 완료 {result.summary()} 저장 {latest_path} (reviewed=false)")
         self.instruction_label.setText(f"카메라 캘리브레이션 측정 완료 ({result.quality})")
+        self._clear_calibration_target()
+        self._show_calibration_quality(result)
+
+    # --- 결과 확인 -------------------------------------------------------------------
+    #
+    # 측정이 '잘 됐는지'를 운영자가 판단할 두 가지 근거를 준다: 항목별 점검표(숫자)와
+    # 왜곡 보정 전후 비교 이미지(눈). 둘 다 확인 전용이며 캘리브레이션을 유효로 만들지 않는다.
+
+    CALIBRATION_GRADE_TEXT = {
+        "good": "양호",
+        "acceptable": "사용 가능",
+        "poor": "재촬영 권장",
+        "suspicious": "의심 — 다시 촬영하세요",
+    }
+
+    def _show_calibration_quality(self, result: IntrinsicsResult) -> None:
+        label = getattr(self, "calibration_quality_label", None)
+        if label is None:
+            return
+        grade, lines = result.quality_report()
+        head = f"[{self.CALIBRATION_GRADE_TEXT.get(grade, grade)}] {result.summary()}"
+        label.setText(head + "\n" + "\n".join(lines))
+        self._log_calibration(f"품질 {grade}: " + " / ".join(lines))
+
+    def _latest_intrinsics_result(self, camera_id: str) -> IntrinsicsResult | None:
+        root = (
+            self.settings.calibration_path.parent / "intrinsics"
+            if self.settings is not None
+            else DEFAULT_INTRINSICS_ROOT
+        )
+        path = Path(root) / f"{camera_id}.json"
+        if not path.is_file():
+            return None
+        try:
+            return result_from_dict(load_intrinsics(path))
+        except (OSError, ValueError, KeyError) as exc:
+            self._log_calibration(f"측정 파일을 읽지 못했습니다 {path}: {exc}")
+            return None
+
+    def _verify_calibration(self, checked: bool = False) -> None:
+        del checked
+        camera = self._calibration_camera()
+        if camera is None:
+            self._set_calibration_status("설정된 카메라가 없습니다")
+            return
+        result = self._latest_intrinsics_result(camera.id)
+        if result is None:
+            self._set_calibration_status(f"{camera.id} 측정 파일이 없습니다. 먼저 촬영하고 측정 실행을 눌러 주세요")
+            return
+        self._show_calibration_quality(result)
+
+        widget = self.camera_widgets.get(camera.role)
+        frame = widget.current_frame() if widget is not None else None
+        if frame is None:
+            self._set_calibration_status(f"{camera.id} 화면이 수신 중이 아니라 보정 비교 이미지를 만들 수 없습니다")
+            return
+        try:
+            comparison = build_verification_image(_qimage_to_bgr(frame), result)
+        except (ValueError, ImportError) as exc:
+            self._set_calibration_status(f"보정 비교 이미지를 만들지 못했습니다: {exc}")
+            return
+
+        view = getattr(self, "calibration_verify_view", None)
+        if view is not None:
+            pixmap = QPixmap.fromImage(_bgr_to_qimage(comparison))
+            width = max(view.width() or 0, 640)
+            view.setPixmap(pixmap.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation))
+            view.setVisible(True)
+        caption = getattr(self, "calibration_verify_caption", None)
+        if caption is not None:
+            caption.setVisible(True)
+
+        try:
+            import cv2
+
+            root = Path(
+                self.settings.calibration_path.parent / "intrinsics"
+                if self.settings is not None
+                else DEFAULT_INTRINSICS_ROOT
+            )
+            root.mkdir(parents=True, exist_ok=True)
+            saved = root / f"{camera.id}-verify.png"
+            cv2.imwrite(str(saved), comparison)
+            self._log_calibration(f"보정 비교 이미지 저장 {saved}")
+        except (OSError, ImportError) as exc:
+            self._log_calibration(f"보정 비교 이미지 저장 실패: {exc}")
+        self._set_calibration_status(f"{camera.id} 결과 확인 — 격자와 실제 직선이 나란한지 보세요 (확인 전용)")
 
     def _on_calibration_failed(self, error: str) -> None:
         self._set_calibration_status(f"측정 실패: {error}")
@@ -3916,6 +4705,7 @@ class OperatorWindow(QMainWindow):
         widget = self.camera_widgets.get(camera.role) if camera is not None else None
         if widget is not None:
             widget.set_marker_points(())
+            widget.set_target_box(None)
         if hasattr(self, "calibration_instruction_label") and not self._calib_calibrating:
             self.calibration_instruction_label.setText("촬영 시작을 누르면 첫 번째 자세를 안내합니다.")
         self._refresh_calibration_buttons()

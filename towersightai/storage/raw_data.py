@@ -39,6 +39,7 @@ _DURABLE_EVENTS = frozenset(
         "media_artifact_created",
         "media_capture_failed",
         "ld2410_server_status",
+        "hailo_health",
         "vehicle_exit_started",
         "vehicle_exit_ended",
         "radar_window_started",
@@ -462,6 +463,15 @@ class RawDataManager:
             at=at,
         )
 
+    def record_hailo_health(self, snapshot: Any) -> None:
+        """Append the Hailo device health snapshot so the NAS day carries the failure timeline.
+
+        Telemetry only: this row never influences the safety gate, the engine, or PLC output.
+        """
+        from towersightai.storage.hailo_incident import snapshot_to_dict
+
+        self.record("hailo_health", payload=snapshot_to_dict(snapshot))
+
     def record_ld2410_status(self, state: str, details: Mapping[str, Any] | None = None) -> None:
         self.record(
             "ld2410_server_status",
@@ -615,6 +625,7 @@ class RawDataManager:
         recognized: bool = True,
         reads: int | None = None,
         reason: str = "",
+        plate_text: str = "",
         at: datetime | None = None,
     ) -> None:
         """Plate outcome. ``recognized=False`` records a 미인식 result (an entry that produced no
@@ -630,6 +641,9 @@ class RawDataManager:
                 "recognized": recognized,
                 "reads": reads,
                 "reason": reason,
+                # Whole-plate OCR string for audit. Only plate_number (the 4-digit tail) is trusted:
+                # the global OCR model has no Hangul and mangles the middle character.
+                "plate_text": plate_text,
             },
             sink_payload={"source_image_path": source_image_path} if source_image_path else None,
             at=at,
@@ -656,6 +670,7 @@ class RawDataManager:
         accepted: bool = True,
         reason: str = "",
         plate_bbox: Mapping[str, float] | None = None,
+        plate_text: str = "",
         at: datetime | None = None,
     ) -> None:
         """One 1 Hz front-camera LPR read during a vehicle entry (analysis only).
@@ -673,6 +688,7 @@ class RawDataManager:
                 "accepted": accepted,
                 "reason": reason,
                 "plate_bbox": dict(plate_bbox) if plate_bbox else None,
+                "plate_text": plate_text,
                 "safety_effect": "raw_only",
             },
             at=at,

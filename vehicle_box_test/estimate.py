@@ -30,11 +30,18 @@ PLAUSIBLE_WIDTH_MM = (1200.0, 2600.0)
 PLAUSIBLE_HEIGHT_MM = (900.0, 2400.0)
 
 MIN_SILHOUETTE_RATIO = 0.012  # ROI 대비 실루엣 최소 비율
+#: 실루엣 면적 / 실루엣 외접 사각형 면적. 차량은 꽉 찬 덩어리다. 바닥 매트
+#: 무늬나 조명 변화를 잡으면 가늘고 흩어진 윤곽이 되어 이 값이 크게 떨어진다 —
+#: 차가 없는 프레임에서 3D 상자가 그려지던 오검출을 여기서 막는다.
+MIN_SILHOUETTE_EXTENT = 0.25
 MIN_CONTACT_SAMPLES = 25
 #: 접지선을 월드로 올릴 때 팔레트 밖으로 크게 벗어난 점은 버린다(문 밖 바닥은 평면이 다르다).
 FOOTPRINT_MARGIN_MM = 900.0
-#: 자세 복원이 호모그래피와 이만큼(화면 비율) 넘게 어긋나면 3D 상자를 그리지 않는다.
-POSE_AGREEMENT_LIMIT = 0.02
+#: 자세의 지면 잔차가 이보다 크면 3D 상자를 그리지 않는다 (mm).
+#: 체커보드 측정 전에는 자세와 호모그래피가 서로 어긋나 상자를 아예 못 그렸다. 측정 후에는
+#: 호모그래피를 자세에서 만들기 때문에 둘이 정의상 일치하고, 남는 문제는 지면 기준점의
+#: 정확도뿐이라 mm 단위로 판단한다.
+POSE_RESIDUAL_LIMIT_MM = 600.0
 
 
 @dataclass
@@ -54,6 +61,7 @@ class VehicleEstimate:
 
     # 영상 산출물
     silhouette_ratio: float = 0.0
+    silhouette_extent: float = 0.0
     contact_samples: int = 0
     truncated_front: bool = False
     truncated_rear: bool = False
@@ -181,7 +189,9 @@ def silhouette(image, background, roi):
     largest = max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
     blob = ((labels == largest).astype(np.uint8)) * 255
     ratio = float(stats[largest, cv2.CC_STAT_AREA]) / max(float(np.count_nonzero(roi)), 1.0)
-    return blob, ratio
+    box = float(stats[largest, cv2.CC_STAT_WIDTH] * stats[largest, cv2.CC_STAT_HEIGHT])
+    extent = float(stats[largest, cv2.CC_STAT_AREA]) / max(box, 1.0)
+    return blob, ratio, extent
 
 
 def contact_points(blob, roi) -> list[tuple[float, float]]:
@@ -225,13 +235,22 @@ def estimate_vehicle(
     result = VehicleEstimate(camera_id=camera_id, source=source)
     polygon = machine_roi(calib, ground, image.shape, pose)
     roi = roi_mask(image.shape, polygon)
-    blob, ratio = silhouette(image, background, roi)
+    blob, ratio, extent = silhouette(image, background, roi)
     result.silhouette_ratio = round(ratio, 4)
+    result.silhouette_extent = round(extent, 3)
 
     if ratio < MIN_SILHOUETTE_RATIO:
         result.reasons.append(
             f"주차기 영역에서 배경과 다른 덩어리를 찾지 못했습니다 (면적 {ratio*100:.1f}%)."
             " 차량이 없거나, 배경과 색이 비슷하거나, 조명이 배경 이미지와 크게 다릅니다."
+        )
+        return result, blob, polygon
+
+    if extent < MIN_SILHOUETTE_EXTENT:
+        result.reasons.append(
+            f"찾은 덩어리가 가늘고 흩어져 있습니다 "
+            f"(채움 {extent * 100:.0f}%, 차량이면 {MIN_SILHOUETTE_EXTENT * 100:.0f}% 이상)."
+            " 차량이 아니라 바닥 매트 무늬·조명 변화·그림자를 잡았을 가능성이 큽니다."
         )
         return result, blob, polygon
 
@@ -294,9 +313,14 @@ def estimate_vehicle(
         )
 
     # 높이 — 자세 복원이 호모그래피와 잘 맞을 때만
-    if pose is not None and result.pose_error <= POSE_AGREEMENT_LIMIT:
+    if pose is not None and pose.reprojection_error <= POSE_RESIDUAL_LIMIT_MM:
         centre = result.center
         if centre is not None:
+            # 위에서 내려다보는 카메라에서 실루엣의 최상단(지붕 윤곽)은 **먼 쪽 지붕 모서리**다.
+            # 중앙선이나 가까운 쪽으로 잡으면 높이가 과대평가된다.
+            camera_y = float(pose.center[1])
+            far_y = max((result.y_left, result.y_right), key=lambda y: abs(y - camera_y))
+            centre = (centre[0], far_y)
             column_x = int(np.clip(_image_column_for(calib, centre, blob.shape), 0, blob.shape[1] - 1))
             column = np.nonzero(blob[:, column_x])[0]
             if column.size:

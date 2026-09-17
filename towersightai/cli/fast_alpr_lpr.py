@@ -8,6 +8,7 @@ import os
 import statistics
 import sys
 import time
+from collections import Counter
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,18 +47,71 @@ class FastAlprSession:
         LOGGER.info("fast-alpr-session-ready init-ms=%.2f", self.init_ms)
 
     def recognize_image(self, path: Path, *, image_index: int = 0) -> dict[str, Any]:
-        """Run one recognition; errors become an ``status=error`` attempt payload."""
+        """Run one recognition; errors become an ``status=error`` attempt payload.
+
+        Each detected plate is read twice: once whole (for the audit trail) and once from a crop
+        of its right-hand side, which contains the four digits and no Hangul. Only the second read
+        is trusted for the number.
+        """
         image = ImageInput(index=image_index, path=Path(path))
         started = time.perf_counter()
         try:
-            results = self._alpr.predict(str(image.path))
+            import cv2
+
+            frame = cv2.imread(str(image.path))
+            results = self._alpr.predict(frame if frame is not None else str(image.path))
+            tails = self._read_tails(frame, results)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
-            return _attempt_payload(image=image, results=results, elapsed_ms=elapsed_ms)
+            return _attempt_payload(image=image, results=results, elapsed_ms=elapsed_ms, tails=tails)
         except Exception as exc:  # noqa: BLE001 - loop must survive any predict failure
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             payload = _error_payload(image=image, elapsed_ms=elapsed_ms, message=str(exc))
             payload["traceback"] = traceback.format_exc()
             return payload
+
+
+    def _read_tails(self, frame: Any, results: list[Any]) -> dict[int, tuple[str, str]]:
+        """Majority vote over several crops of each detected plate.
+
+        Candidates: the whole-plate text, a padded whole-plate re-read, and the right-hand part of
+        the box at several cut points (each excludes the Hangul the OCR model cannot read).
+        """
+        tails: dict[int, tuple[str, str]] = {}
+        if frame is None:
+            return tails
+        for index, result in enumerate(results):
+            detection = getattr(result, "detection", None)
+            bbox = getattr(detection, "bounding_box", None)
+            ocr_result = getattr(result, "ocr", None)
+            candidates: list[str] = []
+            whole = extract_tail_digits(getattr(ocr_result, "text", "") if ocr_result is not None else "")
+            if whole:
+                candidates.append(whole)
+            for pad in TAIL_BOX_PADS:
+                box = _plate_box(frame, bbox, pad)
+                if box is None:
+                    continue
+                x1, y1, x2, y2 = box
+                crops = [frame[y1:y2, x1:x2]] if pad else []
+                for fraction in TAIL_CROP_FRACTIONS:
+                    start = x1 + int((x2 - x1) * fraction)
+                    if x2 - start >= 8:
+                        crops.append(frame[y1:y2, start:x2])
+                for crop in crops:
+                    try:
+                        ocr = self._alpr.ocr.predict(crop)
+                    except Exception:  # noqa: BLE001 - one bad crop must not lose the read
+                        LOGGER.debug("plate tail re-read failed", exc_info=True)
+                        continue
+                    tail = extract_tail_digits(getattr(ocr, "text", "") if ocr is not None else "")
+                    if tail:
+                        candidates.append(tail)
+            if not candidates:
+                continue
+            counts = Counter(candidates)
+            tail, votes = counts.most_common(1)[0]
+            tails[index] = (tail, f"vote:{votes}/{len(candidates)}")
+        return tails
 
 
 def main() -> int:
@@ -276,8 +330,12 @@ def _discover_images(image_dir: Path) -> tuple[ImageInput, ...]:
     return tuple(ImageInput(index=index, path=path) for index, path in enumerate(paths))
 
 
-def _attempt_payload(*, image: ImageInput, results: list[Any], elapsed_ms: float) -> dict[str, Any]:
-    detections = tuple(_result_payload(result) for result in results)
+def _attempt_payload(*, image: ImageInput, results: list[Any], elapsed_ms: float, tails: dict[int, tuple[str, str]] | None = None) -> dict[str, Any]:
+    tails = tails or {}
+    detections = tuple(
+        _result_payload(result, tail=tails.get(index, ("", ""))[0], tail_source=tails.get(index, ("", ""))[1])
+        for index, result in enumerate(results)
+    )
     recognized = tuple(item for item in detections if item.get("plate_number"))
     best_plate = max(recognized, key=lambda item: item.get("confidence") or 0.0, default=None)
     return {
@@ -308,12 +366,17 @@ def _error_payload(*, image: ImageInput, elapsed_ms: float, message: str) -> dic
     }
 
 
-def _result_payload(result: Any) -> dict[str, Any]:
+def _result_payload(result: Any, *, tail: str = "", tail_source: str = "") -> dict[str, Any]:
     detection = getattr(result, "detection", None)
     ocr = getattr(result, "ocr", None)
     confidence = _ocr_confidence(getattr(ocr, "confidence", None))
+    text = _clean_plate_text(getattr(ocr, "text", "")) if ocr is not None else ""
+    if not tail:
+        tail, tail_source = extract_tail_digits(text), "full_text" if extract_tail_digits(text) else ""
     return {
-        "plate_number": _clean_plate_text(getattr(ocr, "text", "")) if ocr is not None else "",
+        "tail_digits": tail,
+        "tail_source": tail_source,
+        "plate_number": text,
         "confidence": confidence if confidence is not None else 0.0,
         "region": getattr(ocr, "region", None) if ocr is not None else None,
         "region_confidence": getattr(ocr, "region_confidence", None) if ocr is not None else None,
@@ -321,6 +384,41 @@ def _result_payload(result: Any) -> dict[str, Any]:
         "detection_confidence": getattr(detection, "confidence", None),
         "bbox": _bbox_payload(getattr(detection, "bounding_box", None)),
     }
+
+
+# Korean plates read as "<2-3 digits><Hangul><4 digits>". The global OCR model has no Hangul in
+# its alphabet, so it substitutes Latin look-alikes and sometimes drops or duplicates a character,
+# which shifts the trailing digits too (field 2026-09-17: 213가9135 → "2137I913"). Only the last
+# four digits are trusted, and they are read from a crop that excludes the Hangul entirely.
+TAIL_DIGITS = 4
+# The trailing digits are read many times from slightly different crops and the majority wins.
+# One crop is not enough: on 2026-09-17 field frames a single right-crop fixed 213가9135 but broke
+# 185다5007, while the majority of these candidates was correct on all eight plates. Measured cost
+# is ~105 ms on top of the ~111 ms detect+read, well inside the 1 Hz loop.
+TAIL_CROP_FRACTIONS = (0.30, 0.35, 0.40, 0.45, 0.50)
+# A padded re-read recovers a digit the detector box clipped (field: 1757 → "757").
+TAIL_BOX_PADS = (0.0, 0.10)
+
+
+def extract_tail_digits(text: Any) -> str:
+    """Trailing 4-digit group of an OCR string, or '' when it does not end in 4 digits."""
+    digits = "".join(character for character in str(text or "") if character.isdigit())
+    return digits[-TAIL_DIGITS:] if len(digits) >= TAIL_DIGITS else ""
+
+
+def _plate_box(image: Any, bbox: Any, pad: float) -> tuple[int, int, int, int] | None:
+    if image is None or bbox is None:
+        return None
+    height, width = image.shape[:2]
+    raw_x1, raw_y1 = int(getattr(bbox, "x1", 0)), int(getattr(bbox, "y1", 0))
+    raw_x2, raw_y2 = int(getattr(bbox, "x2", 0)), int(getattr(bbox, "y2", 0))
+    pad_x = int((raw_x2 - raw_x1) * pad)
+    pad_y = int((raw_y2 - raw_y1) * pad * 0.5)
+    x1, y1 = max(raw_x1 - pad_x, 0), max(raw_y1 - pad_y, 0)
+    x2, y2 = min(raw_x2 + pad_x, width), min(raw_y2 + pad_y, height)
+    if x2 - x1 < 8 or y2 - y1 < 4:
+        return None
+    return x1, y1, x2, y2
 
 
 def _clean_plate_text(text: Any) -> str:

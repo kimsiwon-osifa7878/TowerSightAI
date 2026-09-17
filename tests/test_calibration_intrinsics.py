@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -13,13 +14,18 @@ from towersightai.calibration.checkerboard import (
     generate_checkerboard_files,
 )
 from towersightai.calibration.intrinsics import (
+    A4_LANDSCAPE_ASPECT,
     CAPTURE_POSES,
     MIN_SAMPLES,
+    CheckerboardDetection,
     IntrinsicsSample,
     IntrinsicsSessionStore,
+    build_verification_image,
     calibrate_intrinsics,
     detect_checkerboard,
+    evaluate_pose_fit,
     load_intrinsics,
+    result_from_dict,
 )
 
 
@@ -127,9 +133,74 @@ def test_detect_returns_none_without_a_board():
 def test_capture_poses_cover_centre_edges_corners_tilts_and_distances():
     keys = [pose.key for pose in CAPTURE_POSES]
     assert len(keys) == len(set(keys)) >= MIN_SAMPLES
-    for required in ("center", "left", "right", "top", "bottom", "tilt_left", "tilt_up", "near", "far"):
+    for required in ("center", "left", "right", "top", "bottom", "tilt_h", "tilt_v", "near", "far"):
         assert required in keys
     assert all(pose.instruction for pose in CAPTURE_POSES)
+
+
+def test_every_pose_target_box_is_a4_landscape_and_inside_the_frame():
+    """The operator aims by box, so the box must look like the A4 sheet they are holding."""
+    frame_aspect = 1080 / 1920
+    for pose in CAPTURE_POSES:
+        x0, y0, x1, y1 = pose.target_rect(frame_aspect)
+        assert 0.0 <= x0 < x1 <= 1.0
+        assert 0.0 <= y0 < y1 <= 1.0
+        on_screen = ((x1 - x0) * 1920) / ((y1 - y0) * 1080)
+        assert on_screen == pytest.approx(A4_LANDSCAPE_ASPECT, rel=1e-3)
+
+
+def _detection_in(rect, *, fill=1.0, skew=(0.0, 0.0), size=(1920, 1080)):
+    """Build a synthetic detection whose corner grid fills ``rect`` by ``fill``."""
+    cols, rows = SPEC.inner_corners
+    width, height = size
+    x0, y0, x1, y1 = rect
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    half_w = (x1 - x0) / 2 * math.sqrt(fill)
+    half_h = (y1 - y0) / 2 * math.sqrt(fill)
+    horizontal, vertical = skew
+    corners = []
+    for r in range(rows):
+        for c in range(cols):
+            u = c / (cols - 1)
+            v = r / (rows - 1)
+            # Shrink one side to emulate a board rotated away from the camera. The sign picks
+            # which side recedes; both stay inside the box so the fit test isolates the tilt.
+            shrink_v = 1.0 - abs(horizontal) * (u if horizontal >= 0 else 1.0 - u)
+            shrink_h = 1.0 - abs(vertical) * (v if vertical >= 0 else 1.0 - v)
+            x = cx + (u - 0.5) * 2 * half_w * shrink_h
+            y = cy + (v - 0.5) * 2 * half_h * shrink_v
+            corners.append((x * width, y * height))
+    return CheckerboardDetection(corners=tuple(corners), image_width=width, image_height=height)
+
+
+def test_pose_fit_requires_the_board_inside_the_box_and_filling_it():
+    pose = next(p for p in CAPTURE_POSES if p.key == "center")
+    rect = pose.target_rect(1080 / 1920)
+
+    assert evaluate_pose_fit(pose, _detection_in(rect, fill=0.9), spec=SPEC).ok
+
+    tiny = evaluate_pose_fit(pose, _detection_in(rect, fill=0.05), spec=SPEC)
+    assert not tiny.ok and "작습니다" in tiny.reason
+
+    elsewhere = next(p for p in CAPTURE_POSES if p.key == "bottom_right").target_rect(1080 / 1920)
+    outside = evaluate_pose_fit(pose, _detection_in(elsewhere, fill=0.9), spec=SPEC)
+    assert not outside.ok and "밖으로" in outside.reason
+
+
+def test_tilt_poses_accept_either_direction_and_reject_a_flat_board():
+    pose = next(p for p in CAPTURE_POSES if p.key == "tilt_h")
+    rect = pose.target_rect(1080 / 1920)
+
+    flat = evaluate_pose_fit(pose, _detection_in(rect, fill=0.8), spec=SPEC)
+    assert not flat.ok and "좌우" in flat.reason
+
+    for skew in (0.3, -0.3):  # 어느 쪽으로 기울여도 인정한다
+        tilted = _detection_in(rect, fill=0.8, skew=(skew, 0.0))
+        assert evaluate_pose_fit(pose, tilted, spec=SPEC).ok
+
+    vertical_pose = next(p for p in CAPTURE_POSES if p.key == "tilt_v")
+    wrong_axis = _detection_in(vertical_pose.target_rect(1080 / 1920), fill=0.8, skew=(0.3, 0.0))
+    assert not evaluate_pose_fit(vertical_pose, wrong_axis, spec=SPEC).ok
 
 
 def test_calibration_recovers_the_synthetic_camera(tmp_path: Path):
@@ -197,3 +268,62 @@ def test_load_intrinsics_rejects_other_json(tmp_path: Path):
     path.write_text('{"kind": "site"}', encoding="utf-8")
     with pytest.raises(ValueError, match="not a camera intrinsics"):
         load_intrinsics(path)
+
+
+def _recovered_result(tmp_path: Path):
+    store = IntrinsicsSessionStore(tmp_path / "intrinsics", "front")
+    samples = []
+    for index, view in enumerate(_views(16)):
+        detection = detect_checkerboard(view, SPEC)
+        assert detection is not None
+        bgr = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
+        samples.append(store.save_sample(index + 1, CAPTURE_POSES[index % len(CAPTURE_POSES)].key, bgr, detection))
+    return store, calibrate_intrinsics(samples, SPEC, camera_id="front")
+
+
+def test_quality_report_lists_every_check_and_flags_a_missing_tilt(tmp_path: Path):
+    _store, result = _recovered_result(tmp_path)
+    grade, lines = result.quality_report()
+    assert grade in {"good", "acceptable", "poor", "suspicious"}
+    joined = "\n".join(lines)
+    for expected in ("재투영 오차", "가장 나쁜 장", "수평 화각", "샘플", "가장자리 자세", "기울임 자세"):
+        assert expected in joined
+
+    # A run without tilts cannot pin the focal length, so it must not grade as usable.
+    flat = replace(result, pose_keys=("center", "left", "right", "top", "bottom"))
+    flat_grade, _ = flat.quality_report()
+    assert flat_grade == "poor"
+
+
+def test_verification_image_pairs_original_and_undistorted(tmp_path: Path):
+    _store, result = _recovered_result(tmp_path)
+    frame = cv2.cvtColor(_views(1)[0], cv2.COLOR_GRAY2BGR)
+    comparison = build_verification_image(frame, result)
+    height, width = comparison.shape[:2]
+    assert height == frame.shape[0]
+    assert width == frame.shape[1] * 2 + 6  # two panels plus the divider
+    # The two halves must differ — otherwise no correction was applied. Most of the synthetic
+    # frame is flat background, so compare the peak difference rather than the mean.
+    left = comparison[:, : frame.shape[1]]
+    right = comparison[:, frame.shape[1] + 6 :]
+    assert int(np.max(cv2.absdiff(left, right))) > 20
+    # Both halves carry the straight reference grid the operator compares against.
+    for half in (left, right):
+        grid_pixels = np.count_nonzero((half[:, :, 0] < 120) & (half[:, :, 2] > 150))
+        assert grid_pixels > 500
+
+    with pytest.raises(ValueError):
+        build_verification_image(None, result)
+
+
+def test_saved_measurement_can_be_reloaded_for_verification(tmp_path: Path):
+    store, result = _recovered_result(tmp_path)
+    _result_path, latest = store.save_result(result)
+    restored = result_from_dict(load_intrinsics(latest))
+    assert restored.camera_matrix == result.camera_matrix
+    assert restored.distortion == result.distortion
+    assert restored.pose_keys == result.pose_keys
+    assert restored.reviewed is False
+    # Reloading is enough to re-run both verification paths.
+    assert restored.quality_report()[1]
+    build_verification_image(cv2.cvtColor(_views(1)[0], cv2.COLOR_GRAY2BGR), restored)

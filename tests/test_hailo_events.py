@@ -67,3 +67,14 @@ def test_normalize_hailo_detections_drops_low_confidence_and_invalid_boxes():
 
     assert len(events) == 1
     assert events[0].label == "car"
+
+
+def test_extract_tail_digits_takes_the_trailing_four_or_nothing():
+    from towersightai.cli.fast_alpr_lpr import extract_tail_digits
+
+    assert extract_tail_digits("40L3864") == "3864"      # Hangul read as a Latin letter
+    assert extract_tail_digits("1645943") == "5943"      # Hangul read as a digit
+    assert extract_tail_digits("12가3456") == "3456"
+    assert extract_tail_digits("757") == ""              # fewer than four digits → no guess
+    assert extract_tail_digits("") == ""
+    assert extract_tail_digits(None) == ""

@@ -132,6 +132,9 @@ class RawStorageConfig:
     media_radar_evidence: bool = True
     media_radar_min_interval_seconds: float = 60.0
     media_radar_clip_max_seconds: float = 30.0
+    # Hailo failure evidence → NAS (remote diagnosis). Diagnostic only, never a safety input.
+    hailo_incident_upload_enabled: bool = True
+    hailo_incident_min_interval_seconds: float = 1800.0
     nas_host: str = ""
     nas_port: int = 22
     nas_username: str = ""
@@ -177,6 +180,7 @@ class RawStorageConfig:
             ("RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS", self.radar_window_clear_seconds),
             ("RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS", self.media_radar_min_interval_seconds),
             ("RAW_MEDIA_RADAR_CLIP_MAX_SECONDS", self.media_radar_clip_max_seconds),
+            ("HAILO_INCIDENT_MIN_INTERVAL_SECONDS", self.hailo_incident_min_interval_seconds),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive.")

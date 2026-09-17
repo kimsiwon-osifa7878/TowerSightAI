@@ -45,8 +45,20 @@ Follow-ups queued from that work:
   ~1.5 m so it cannot see a parked car's contact line; evidence clips (stream2) have a different
   FOV from snapshots (stream1) so the calibration does not transfer; one diagonal camera alone
   cannot measure width; `rear_side` is still uncalibrated.
-  Next: calibrate `rear_side` → measure C310 intrinsics on the existing 카메라 캘리브레이션 page →
-  undistort → pose → cuboid + height → report accuracy against the ±5 cm target.
+  **Second pass, 2026-09-16 — the cuboid now draws.** The owner measured `opposite_side` with the
+  rebuilt capture flow (RMS 0.252 px, grade good) and the lab applies that model to every camera
+  (same C310; borrowed models are labelled as such in the output). The order changed: undistort
+  first, then `solvePnP` with the **measured** K instead of estimating a focal length, refine the
+  pose against the auto-detected rails, and derive the ground homography **from the pose** so
+  projection and homography agree by construction. Pose-vs-ground disagreement 16 % → 34 mm
+  residual; heights now come out on 6 images (1,163–1,488 mm). It also exposed a real error in the
+  first pass: the mat tooth pitch is ~344 mm, not the 114.8 mm measured on the distorted image
+  (autocorrelation had locked onto a sub-harmonic), which is what made the front camera's geometry
+  — and the "front only sees 1.5 m of ground" conclusion — wrong by 3×. A silhouette-extent test
+  (≥25 % fill) now rejects the mat-pattern false positives that used to draw a box on empty frames.
+  Next: calibrate `rear_side` (two diagonals → width, yaw, height) → per-camera intrinsics instead
+  of the borrowed model → operator point-picking UI for the far pallet corners → better contact
+  line (shadows, rocker panel) → report accuracy against the ±5 cm target.
   Stage 2: `vehicle_box` stage module returning PASS/WAIT/RETRY/NG/ERROR, operator page with
   overlay, size-limit check. Stage 3: replace the bbox-stability parked heuristic and drive
   directional alignment guidance. Calibration UI gates everything (unreviewed → final OK blocked).

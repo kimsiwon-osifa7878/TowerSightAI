@@ -114,6 +114,9 @@ class GroundCalibration:
     #: (world_x_mm, world_y_mm, u_norm, v_norm) 네 쌍 이상
     correspondences: list[tuple[float, float, float, float]] = field(default_factory=list)
     note: str = ""
+    #: 측정된 내부 파라미터로 푼 카메라 자세. 있으면 호모그래피를 여기서 만든다 —
+    #: 자세와 지면 투영이 정의상 일치하므로 3D 상자를 그릴 수 있다.
+    pose: "CameraPose | None" = None
     _matrix: object | None = field(default=None, repr=False, compare=False)
 
     def matrix(self):
@@ -121,6 +124,8 @@ class GroundCalibration:
         import numpy as np
         import cv2
 
+        if self.pose is not None:
+            return self.pose.ground_homography()
         if self._matrix is None:
             if len(self.correspondences) < 4:
                 raise ValueError(f"{self.camera_id}: 대응점이 4개 미만입니다.")
@@ -158,11 +163,14 @@ class GroundCalibration:
         return [(float(x), float(y)) for x, y in projected.T]
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "camera_id": self.camera_id,
             "note": self.note,
             "correspondences": [list(c) for c in self.correspondences],
         }
+        if self.pose is not None:
+            payload["pose"] = self.pose.to_dict()
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict) -> "GroundCalibration":
@@ -170,6 +178,7 @@ class GroundCalibration:
             camera_id=str(data["camera_id"]),
             correspondences=[tuple(float(v) for v in row) for row in data.get("correspondences", [])],
             note=str(data.get("note", "")),
+            pose=CameraPose.from_dict(data["pose"]) if data.get("pose") else None,
         )
 
     def reprojection_error_mm(self) -> float:
@@ -189,6 +198,9 @@ class GroundCalibration:
 class SiteCalibration:
     ground: GroundModel = field(default_factory=GroundModel.from_envelope)
     cameras: dict[str, GroundCalibration] = field(default_factory=dict)
+    #: "distorted" = 원본 영상 좌표, "undistorted" = 렌즈 왜곡 보정 후 좌표.
+    #: 보정을 도입한 뒤로는 undistorted가 기본이며, 랩의 모든 이미지도 같은 공간에서 다룬다.
+    space: str = "distorted"
 
     @classmethod
     def load(cls, path: Path = DEFAULT_CALIB_PATH) -> "SiteCalibration":
@@ -199,7 +211,7 @@ class SiteCalibration:
         cameras = {
             key: GroundCalibration.from_dict(value) for key, value in (data.get("cameras") or {}).items()
         }
-        return cls(ground=ground, cameras=cameras)
+        return cls(ground=ground, cameras=cameras, space=str(data.get("space", "distorted")))
 
     def save(self, path: Path = DEFAULT_CALIB_PATH) -> None:
         payload = {
@@ -211,6 +223,7 @@ class SiteCalibration:
                 "turntable_offset_x_mm": self.ground.turntable_offset_x_mm,
                 "turntable_offset_y_mm": self.ground.turntable_offset_y_mm,
             },
+            "space": self.space,
             "cameras": {key: value.to_dict() for key, value in self.cameras.items()},
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -221,17 +234,73 @@ class SiteCalibration:
 
 @dataclass
 class CameraPose:
-    """지면 호모그래피에서 복원한 핀홀 카메라. 3D 점을 직접 투영할 수 있다.
+    """핀홀 카메라. 3D 점을 정규화 영상좌표로 직접 투영한다.
 
-    체커보드 측정이 없으므로 주점은 화면 중심, 화소는 정사각형으로 가정하고 초점거리만
-    호모그래피의 회전 직교 조건(r1⊥r2, |r1|=|r2|)에서 푼다. 어안 왜곡은 모델에 없다 —
-    화면 가장자리일수록 오차가 커진다는 뜻이며, 결과 이미지에 그 사실을 적는다.
+    내부 파라미터는 **운영자 콘솔에서 체커보드로 측정한 값**을 그대로 쓴다(추정하지 않는다).
+    영상은 미리 왜곡 보정된 상태여야 한다 — 그래야 이 핀홀 모델이 화면 전체에서 성립한다.
+    길이는 전부 '가로 폭 = 1'로 정규화한다.
     """
 
-    focal: float  # 정규화 단위(가로 폭 = 1)
+    fx: float
+    fy: float
+    cx: float
+    cy: float
     aspect: float  # height / width
     rotation: object  # 3x3
     translation: object  # 3
+    #: 대응점을 이 자세로 되투영했을 때의 평균 오차 (정규화 가로 폭 기준)
+    reprojection_error: float = 0.0
+    borrowed_intrinsics: str = ""
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        import cv2
+        import numpy as np
+
+        rvec, _ = cv2.Rodrigues(np.asarray(self.rotation, dtype=np.float64))
+        return {
+            "fx": self.fx,
+            "fy": self.fy,
+            "cx": self.cx,
+            "cy": self.cy,
+            "aspect": self.aspect,
+            "rvec": [float(v) for v in np.asarray(rvec).reshape(3)],
+            "tvec": [float(v) for v in np.asarray(self.translation).reshape(3)],
+            "residual_mm": round(float(self.reprojection_error), 2),
+            "borrowed_intrinsics": self.borrowed_intrinsics,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CameraPose":
+        import cv2
+        import numpy as np
+
+        rotation, _ = cv2.Rodrigues(np.array(data["rvec"], dtype=np.float64))
+        return cls(
+            fx=float(data["fx"]),
+            fy=float(data["fy"]),
+            cx=float(data["cx"]),
+            cy=float(data["cy"]),
+            aspect=float(data["aspect"]),
+            rotation=rotation,
+            translation=np.array(data["tvec"], dtype=np.float64),
+            reprojection_error=float(data.get("residual_mm", 0.0)),
+            borrowed_intrinsics=str(data.get("borrowed_intrinsics", "")),
+            note=str(data.get("note", "")),
+        )
+
+    @property
+    def focal(self) -> float:
+        """이전 코드가 쓰던 단일 초점거리 (fx, fy 평균)."""
+        return (self.fx + self.fy) / 2.0
+
+    @property
+    def center(self):
+        """월드 좌표계에서의 카메라 위치 (mm)."""
+        import numpy as np
+
+        return -np.asarray(self.rotation).T @ np.asarray(self.translation)
 
     def project(self, points_3d):
         """월드 3D(mm) → 정규화 영상좌표."""
@@ -240,9 +309,24 @@ class CameraPose:
         pts = np.asarray(points_3d, dtype=np.float64).reshape(-1, 3)
         cam = (self.rotation @ pts.T).T + self.translation
         with np.errstate(divide="ignore", invalid="ignore"):
-            u = self.focal * cam[:, 0] / cam[:, 2] + 0.5
-            v = self.focal * cam[:, 1] / cam[:, 2] + 0.5 * self.aspect
+            u = self.fx * cam[:, 0] / cam[:, 2] + self.cx
+            v = self.fy * cam[:, 1] / cam[:, 2] + self.cy
         return [(float(a), float(b / self.aspect)) for a, b in zip(u, v)]
+
+    def ground_homography(self):
+        """월드 지면(z=0, mm) → 정규화 영상좌표 호모그래피.
+
+        자세에서 직접 만들기 때문에 투영과 **정확히 일치**한다. 손으로 찍은 대응점으로
+        따로 맞춘 호모그래피와 자세가 어긋나던 1차 검증의 문제가 여기서 사라진다.
+        """
+        import numpy as np
+
+        rotation = np.asarray(self.rotation, dtype=np.float64)
+        intrinsics = np.array([[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]])
+        matrix = intrinsics @ np.column_stack([rotation[:, 0], rotation[:, 1], np.asarray(self.translation)])
+        # v를 aspect로 나눠 정규화 영상좌표(0..1)로 맞춘다.
+        matrix = np.diag([1.0, 1.0 / self.aspect, 1.0]) @ matrix
+        return matrix / matrix[2, 2]
 
     def height_of(self, ground_xy: tuple[float, float], image_point: tuple[float, float]) -> float | None:
         """바닥 위치 (x, y)가 알려진 연직선에서, 영상의 한 점이 갖는 높이 z(mm).
@@ -264,6 +348,224 @@ class CameraPose:
             else:
                 high = mid
         return (low + high) / 2.0
+
+
+def pose_from_ground_file(camera_id: str, *, root: Path | None = None, width: int = 1920, height: int = 1080):
+    """운영자가 `지면 기준점` 페이지에서 찍어 저장한 자세를 랩으로 들여온다.
+
+    이 파일이 있으면 랩이 추정한 어떤 값보다 **우선**한다 — 사람이 팔레트 모서리를 직접
+    지정한 것이라 x 기준이 추측이 아니기 때문이다.
+    """
+    import cv2
+    import numpy as np
+
+    from towersightai.calibration.ground import GroundCalibrationStore, scale_camera_matrix
+
+    store = GroundCalibrationStore(root=Path(root) if root else Path("data/calibration/ground"))
+    result = store.load(camera_id)
+    if result is None:
+        return None
+    rotation, _ = cv2.Rodrigues(np.array(result.rvec, dtype=np.float64))
+    matrix = scale_camera_matrix(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        (result.image_width, result.image_height),
+        (width, height),
+    )
+    _ = matrix  # 아래에서 내부 파라미터는 측정 파일에서 직접 읽는다.
+    from towersightai.calibration.intrinsics import load_intrinsics, result_from_dict
+
+    intrinsics_path = Path("data/calibration/intrinsics") / f"{result.intrinsics_camera_id}.json"
+    if not intrinsics_path.is_file():
+        return None
+    intrinsics = result_from_dict(load_intrinsics(intrinsics_path))
+    scaled = scale_camera_matrix(
+        intrinsics.camera_matrix, (intrinsics.image_width, intrinsics.image_height), (width, height)
+    )
+    return CameraPose(
+        fx=float(scaled[0][0]) / width if isinstance(scaled, list) else float(scaled[0, 0]) / width,
+        fy=float(scaled[1][1]) / width if isinstance(scaled, list) else float(scaled[1, 1]) / width,
+        cx=float(scaled[0][2]) / width if isinstance(scaled, list) else float(scaled[0, 2]) / width,
+        cy=float(scaled[1][2]) / width if isinstance(scaled, list) else float(scaled[1, 2]) / width,
+        aspect=height / float(width),
+        rotation=rotation,
+        translation=np.array(result.tvec, dtype=np.float64),
+        reprojection_error=float(result.residual_mm),
+        borrowed_intrinsics=result.intrinsics_camera_id if result.intrinsics_borrowed else "",
+        note=f"운영자 `지면 기준점` 측정 ({result.measured_at}) · 잔차 {result.residual_mm:.0f} mm",
+    )
+
+
+def pose_from_intrinsics(
+    calib: GroundCalibration,
+    undistort,
+    *,
+    width: int = 1920,
+    height: int = 1080,
+) -> CameraPose | None:
+    """측정된 내부 파라미터 + 지면 대응점 → 카메라 자세 (solvePnP).
+
+    대응점은 전부 z=0 평면 위에 있으므로 평면 전용 해법(IPPE)을 쓴다. 영상은 이미 왜곡
+    보정됐다고 보고 왜곡 계수는 0을 넘긴다.
+    """
+    import cv2
+    import numpy as np
+
+    if len(calib.correspondences) < 4:
+        return None
+    object_points = np.array([[c[0], c[1], 0.0] for c in calib.correspondences], dtype=np.float64)
+    image_points = np.array([[c[2] * width, c[3] * height] for c in calib.correspondences], dtype=np.float64)
+    matrix = undistort.matrix_for(width, height)
+    flags = cv2.SOLVEPNP_IPPE if len(object_points) >= 4 else cv2.SOLVEPNP_ITERATIVE
+    ok, rvec, tvec = cv2.solvePnP(
+        object_points, image_points, matrix, np.zeros(5), flags=flags
+    )
+    if not ok:
+        return None
+    ok, rvec, tvec = cv2.solvePnP(
+        object_points, image_points, matrix, np.zeros(5), rvec=rvec, tvec=tvec,
+        useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        return None
+    rotation, _ = cv2.Rodrigues(rvec)
+    projected, _ = cv2.projectPoints(object_points, rvec, tvec, matrix, np.zeros(5))
+    error = float(np.mean(np.linalg.norm(projected.reshape(-1, 2) - image_points, axis=1))) / width
+    return CameraPose(
+        fx=float(matrix[0, 0]) / width,
+        fy=float(matrix[1, 1]) / width,
+        cx=float(matrix[0, 2]) / width,
+        cy=float(matrix[1, 2]) / width,
+        aspect=height / float(width),
+        rotation=rotation,
+        translation=np.asarray(tvec, dtype=np.float64).reshape(3),
+        reprojection_error=error,
+        borrowed_intrinsics=getattr(undistort, "borrowed_from", ""),
+    )
+
+
+def _nelder_mead(cost, seed, *, step, iterations: int = 1200, tolerance: float = 1e-9):
+    """작은 Nelder-Mead. scipy가 없는 환경이라 직접 둔다 (6개 변수, 결정적)."""
+    import numpy as np
+
+    seed = np.asarray(seed, dtype=np.float64)
+    size = seed.size
+    simplex = [seed.copy()]
+    for index in range(size):
+        point = seed.copy()
+        point[index] += step[index]
+        simplex.append(point)
+    values = [cost(point) for point in simplex]
+
+    for _ in range(iterations):
+        order = np.argsort(values)
+        simplex = [simplex[i] for i in order]
+        values = [values[i] for i in order]
+        if abs(values[-1] - values[0]) <= tolerance * (abs(values[0]) + tolerance):
+            break
+        centroid = np.mean(simplex[:-1], axis=0)
+        reflected = centroid + (centroid - simplex[-1])
+        reflected_value = cost(reflected)
+        if reflected_value < values[0]:
+            expanded = centroid + 2.0 * (centroid - simplex[-1])
+            expanded_value = cost(expanded)
+            simplex[-1], values[-1] = (
+                (expanded, expanded_value) if expanded_value < reflected_value else (reflected, reflected_value)
+            )
+        elif reflected_value < values[-2]:
+            simplex[-1], values[-1] = reflected, reflected_value
+        else:
+            contracted = centroid + 0.5 * (simplex[-1] - centroid)
+            contracted_value = cost(contracted)
+            if contracted_value < values[-1]:
+                simplex[-1], values[-1] = contracted, contracted_value
+            else:
+                for index in range(1, len(simplex)):
+                    simplex[index] = simplex[0] + 0.5 * (simplex[index] - simplex[0])
+                    values[index] = cost(simplex[index])
+    order = int(np.argmin(values))
+    return simplex[order], values[order]
+
+
+def refine_pose_with_rails(
+    pose: CameraPose,
+    rail_samples: Sequence[tuple[float, float, float]],
+    anchors: Sequence[tuple[float, float, float, float]],
+    *,
+    anchor_weight: float = 1.0,
+):
+    """레일 전체 + 소수의 기준점으로 자세를 다시 맞춘다.
+
+    ``rail_samples`` = (u_norm, v_norm, world_y) — 자동 검출한 노란 레일 위의 점들. x는
+    모르지만 y는 안다(±1100). 이 점들이 보정 후에는 **직선**이므로 화면 끝까지 믿을 수 있어,
+    손으로 읽어야 했던 팔레트 먼 쪽 모서리가 더 이상 필요 없다.
+    ``anchors`` = (world_x, world_y, u_norm, v_norm) — x 원점을 잡아 줄 확실한 점 몇 개.
+
+    반환: 새 CameraPose. 잔차는 mm 단위 RMS로 ``reprojection_error``에 mm 그대로 담는다.
+    """
+    import cv2
+    import numpy as np
+
+    if not rail_samples or not anchors:
+        return pose
+
+    rail_image = np.array([[u, v] for u, v, _y in rail_samples], dtype=np.float64)
+    rail_y = np.array([y for _u, _v, y in rail_samples], dtype=np.float64)
+    anchor_world = np.array([[a[0], a[1]] for a in anchors], dtype=np.float64)
+    anchor_image = np.array([[a[2], a[3]] for a in anchors], dtype=np.float64)
+
+    def build(params) -> CameraPose:
+        rotation, _ = cv2.Rodrigues(np.asarray(params[:3], dtype=np.float64))
+        return CameraPose(
+            fx=pose.fx,
+            fy=pose.fy,
+            cx=pose.cx,
+            cy=pose.cy,
+            aspect=pose.aspect,
+            rotation=rotation,
+            translation=np.asarray(params[3:], dtype=np.float64),
+            borrowed_intrinsics=pose.borrowed_intrinsics,
+        )
+
+    def ground_points(candidate: CameraPose, image_points):
+        matrix = np.linalg.inv(candidate.ground_homography())
+        pts = np.column_stack([image_points, np.ones(len(image_points))]).T
+        world = matrix @ pts
+        with np.errstate(divide="ignore", invalid="ignore"):
+            world = world[:2] / world[2]
+        return world.T
+
+    seed_center = np.asarray(pose.center, dtype=np.float64)
+
+    def cost(params) -> float:
+        candidate = build(params)
+        if candidate.translation[2] <= 0:
+            return 1e12
+        center = np.asarray(candidate.center, dtype=np.float64)
+        # 물리적으로 말이 안 되는 해(카메라가 바닥에 붙거나 천장을 뚫음)는 버린다. 제약이
+        # 빠듯하면 최적화가 기준점 위로 카메라를 붕괴시켜 잔차 0을 만들어 버린다.
+        if not (600.0 <= center[2] <= 6000.0):
+            return 1e12
+        try:
+            rails = ground_points(candidate, rail_image)
+            fixed = ground_points(candidate, anchor_image)
+        except np.linalg.LinAlgError:
+            return 1e12
+        if not np.all(np.isfinite(rails)) or not np.all(np.isfinite(fixed)):
+            return 1e12
+        rail_error = float(np.mean((rails[:, 1] - rail_y) ** 2))
+        anchor_error = float(np.mean(np.sum((fixed - anchor_world) ** 2, axis=1)))
+        # 씨앗(solvePnP 해)에서 너무 멀어지지 않게 하는 약한 항. 제약이 6개뿐일 때
+        # 엉뚱한 국소해로 달아나는 것을 막는다.
+        prior = float(np.sum((center - seed_center) ** 2)) * 5e-3
+        return rail_error + anchor_weight * anchor_error + prior
+
+    rvec, _ = cv2.Rodrigues(np.asarray(pose.rotation, dtype=np.float64))
+    seed = np.concatenate([np.asarray(rvec).reshape(3), np.asarray(pose.translation).reshape(3)])
+    step = np.array([0.05, 0.05, 0.05, 200.0, 200.0, 200.0])
+    best, value = _nelder_mead(cost, seed, step=step)
+    refined = build(best)
+    refined.reprojection_error = math.sqrt(max(value, 0.0))
+    return refined
 
 
 def pose_from_homography(
@@ -305,7 +607,15 @@ def pose_from_homography(
     # 가장 가까운 정규직교 행렬로 보정
     u, _, vt = np.linalg.svd(rotation)
     rotation = u @ vt
-    return CameraPose(focal=focal, aspect=aspect, rotation=rotation, translation=translation)
+    return CameraPose(
+        fx=focal,
+        fy=focal,
+        cx=0.5,
+        cy=0.5 * aspect,
+        aspect=aspect,
+        rotation=rotation,
+        translation=translation,
+    )
 
 
 # ------------------------------------------------------------------------ 3D 상자

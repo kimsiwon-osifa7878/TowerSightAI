@@ -235,6 +235,13 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
                 values.get("RAW_MEDIA_RADAR_CLIP_MAX_SECONDS", "30"),
                 "RAW_MEDIA_RADAR_CLIP_MAX_SECONDS",
             ),
+            "hailo_incident_upload_enabled": _parse_bool(
+                values.get("HAILO_INCIDENT_UPLOAD_ENABLED", "true")
+            ),
+            "hailo_incident_min_interval_seconds": _parse_float(
+                values.get("HAILO_INCIDENT_MIN_INTERVAL_SECONDS", "1800"),
+                "HAILO_INCIDENT_MIN_INTERVAL_SECONDS",
+            ),
             "nas_host": values.get("SYNOLOGY_NAS_HOST", ""),
             "nas_port": _parse_int(values.get("SYNOLOGY_NAS_PORT", "22"), "SYNOLOGY_NAS_PORT"),
             "nas_username": values.get("SYNOLOGY_NAS_ID", ""),

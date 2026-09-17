@@ -172,3 +172,13 @@ def test_radar_raw_logging_defaults_and_validation(tmp_path: Path):
         RawStorageConfig(local_dir=tmp_path, media_radar_min_interval_seconds=0)
     with pytest.raises(ValueError, match="RAW_MEDIA_RADAR_CLIP_MAX_SECONDS must be at least"):
         RawStorageConfig(local_dir=tmp_path, media_segment_seconds=2, media_radar_clip_max_seconds=1)
+
+
+def test_hailo_incident_upload_defaults_and_validation(tmp_path: Path):
+    from towersightai.config.settings import RawStorageConfig
+
+    config = RawStorageConfig(local_dir=tmp_path)
+    assert config.hailo_incident_upload_enabled is True
+    assert config.hailo_incident_min_interval_seconds == 1800.0
+    with pytest.raises(ValueError, match="HAILO_INCIDENT_MIN_INTERVAL_SECONDS"):
+        RawStorageConfig(local_dir=tmp_path, hailo_incident_min_interval_seconds=0)

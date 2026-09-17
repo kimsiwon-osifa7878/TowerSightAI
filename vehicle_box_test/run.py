@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Sequence
 
 from vehicle_box_test import draw, estimate as est
-from vehicle_box_test.geometry import DEFAULT_CALIB_PATH, SiteCalibration, pose_from_homography
+from vehicle_box_test.geometry import DEFAULT_CALIB_PATH, SiteCalibration
+from vehicle_box_test.undistort import load_undistorts
 
 LAB_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA = LAB_ROOT / "data"
@@ -50,6 +51,11 @@ def load_backgrounds(data_root: Path) -> dict[tuple[str, str], object]:
     return backgrounds
 
 
+def _on_screen(point: tuple[float, float], margin: float = 0.25) -> bool:
+    """정규화 좌표가 화면(여유 포함) 안인지."""
+    return -margin <= point[0] <= 1.0 + margin and -margin <= point[1] <= 1.0 + margin
+
+
 def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, pose, meta: dict):
     """추정 결과를 이미지에 새긴다. 실패면 한국어 사유를, 성공이면 치수를 적는다."""
     import cv2
@@ -76,9 +82,17 @@ def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, p
         if result.height_mm and result.pose_used and pose is not None:
             top = pose.project([(x, y, result.height_mm) for x, y in footprint])
             draw.polyline(canvas, base, draw.COLOR_BOX, 3, closed=True)
-            draw.polyline(canvas, top, draw.COLOR_BOX_TOP, 2, closed=True)
-            for a, b in zip(base, top):
-                draw.line(canvas, a, b, draw.COLOR_BOX_TOP, 2)
+            # 화면 밖으로 멀리 나간 윗면 모서리는 그리지 않는다 — 그리면 화면을 가로지르는
+            # 선이 되어 사람이 판단할 수 없게 된다.
+            if all(_on_screen(point) for point in top):
+                draw.polyline(canvas, top, draw.COLOR_BOX_TOP, 2, closed=True)
+                for a, b in zip(base, top):
+                    draw.line(canvas, a, b, draw.COLOR_BOX_TOP, 2)
+            else:
+                for a, b in zip(base, top):
+                    if _on_screen(b):
+                        draw.line(canvas, a, b, draw.COLOR_BOX_TOP, 2)
+                result.notes.append("직육면체 윗면 일부가 화면 밖이라 보이는 모서리만 그렸습니다.")
         else:
             draw.polyline(canvas, base, draw.COLOR_BOX, 3, closed=True)
 
@@ -124,7 +138,7 @@ def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, p
             f"높이 {result.height_mm:.0f} mm" if result.height_mm else "높이 미산출 (자세 복원 불충분)",
             f"진입쪽 끝 x {result.x_front:+.0f} mm · 안쪽 끝 x {result.x_rear:+.0f} mm",
             f"중심 치우침 y {(result.y_left + result.y_right) / 2:+.0f} mm",
-            f"접지점 {result.contact_samples}개 · 실루엣 {result.silhouette_ratio*100:.1f}%",
+            f"접지점 {result.contact_samples}개 · 실루엣 {result.silhouette_ratio*100:.1f}% (채움 {result.silhouette_extent*100:.0f}%)",
         ]
         if result.camera_id in ("rear_side", "opposite_side"):
             lines.append("※ 사선 카메라 한 대만으로는 폭이 부정확합니다 (먼 쪽 바퀴가 안 보임).")
@@ -184,8 +198,7 @@ def run(args: argparse.Namespace) -> int:
             }
         )
 
-    poses: dict[str, object] = {}
-    pose_errors: dict[str, float] = {}
+    undistorts = load_undistorts(sorted({t["camera_id"] for t in targets}))
     results: list[dict] = []
     print(f"대상 이미지 {len(targets)}장")
 
@@ -194,6 +207,9 @@ def run(args: argparse.Namespace) -> int:
         if image is None:
             continue
         camera = target["camera_id"]
+        entry = undistorts.get(camera)
+        if entry is not None:
+            image = entry.image(image)  # 랩의 모든 좌표는 왜곡 보정 후 기준
         calib = site.cameras.get(camera)
         aspect = image.shape[0] / image.shape[1]
         stem = Path(target["path"]).stem
@@ -223,36 +239,29 @@ def run(args: argparse.Namespace) -> int:
             results.append({**target, **record.to_dict()})
             continue
 
-        if camera not in poses:
-            pose = pose_from_homography(calib, aspect)
-            poses[camera] = pose
-            pose_errors[camera] = est.pose_agreement(calib, pose, site.ground)
-        pose = poses[camera]
+        pose = calib.pose
         background = backgrounds.get((camera, target["source"]))
         if background is None:
             background = backgrounds.get((camera, "snapshot"))
         if background is None:
             continue
 
-        # 자세가 지면과 크게 어긋나면 아예 쓰지 않는다 (ROI·높이 모두).
-        usable_pose = pose if pose_errors[camera] <= est.POSE_AGREEMENT_LIMIT else None
         result, blob, polygon = est.estimate_vehicle(
             image,
             background,
             calib,
             site.ground,
-            usable_pose,
+            pose,
             camera_id=camera,
             source=target["source"],
         )
-        result.pose_error = round(pose_errors[camera], 4)
-        if usable_pose is None:
+        result.pose_error = round(pose.reprojection_error, 1) if pose is not None else 0.0
+        if pose is not None and pose.borrowed_intrinsics:
             result.notes.append(
-                f"자세 복원이 지면과 {pose_errors[camera]*100:.0f}% 어긋나 3D 높이는 계산하지 않고"
-                " 바닥 사각형만 그렸습니다 (어안 왜곡 · 체커보드 미측정)."
+                f"렌즈 내부 파라미터는 {pose.borrowed_intrinsics} 카메라 측정값을 빌려 썼습니다 (동일 기종)."
             )
 
-        canvas = annotate(image, result, blob, polygon, calib, site.ground, usable_pose, target)
+        canvas = annotate(image, result, blob, polygon, calib, site.ground, pose, target)
         cv2.imwrite(str(out_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88])
         result.annotated_path = str(out_path.relative_to(out_root))
         results.append({**target, **result.to_dict()})
@@ -271,9 +280,14 @@ def run(args: argparse.Namespace) -> int:
             camera: {
                 "calibrated": camera in site.cameras,
                 "note": site.cameras[camera].note if camera in site.cameras else "",
-                "pose_error": round(pose_errors.get(camera, float("inf")), 4)
-                if camera in pose_errors
-                else None,
+                "pose_residual_mm": (
+                    round(site.cameras[camera].pose.reprojection_error, 1)
+                    if camera in site.cameras and site.cameras[camera].pose is not None
+                    else None
+                ),
+                "intrinsics": (
+                    undistorts[camera].label() if camera in undistorts else "렌즈 보정 없음"
+                ),
             }
             for camera in sorted({t["camera_id"] for t in targets})
         },

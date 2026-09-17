@@ -263,3 +263,19 @@ def test_radar_raw_logging_keys_parse_with_defaults(tmp_path: Path):
     env_path.write_text(env_path.read_text(encoding="utf-8") + "\nRAW_MEDIA_RADAR_CLIP_MAX_SECONDS=1\n", encoding="utf-8")
     with pytest.raises(ValueError, match="RAW_MEDIA_RADAR_CLIP_MAX_SECONDS"):
         load_settings_from_env(env_path)
+
+
+def test_hailo_incident_keys_parse_with_defaults(tmp_path: Path):
+    env_path = _write_env(tmp_path / ".env")
+    raw = load_settings_from_env(env_path).raw_storage
+    assert raw.hailo_incident_upload_enabled is True
+    assert raw.hailo_incident_min_interval_seconds == 1800.0
+
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "\nHAILO_INCIDENT_UPLOAD_ENABLED=false\nHAILO_INCIDENT_MIN_INTERVAL_SECONDS=300\n",
+        encoding="utf-8",
+    )
+    raw = load_settings_from_env(env_path).raw_storage
+    assert raw.hailo_incident_upload_enabled is False
+    assert raw.hailo_incident_min_interval_seconds == 300.0

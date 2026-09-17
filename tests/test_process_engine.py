@@ -69,10 +69,14 @@ def _send_trigger(engine: ParkingProcessEngine, at: datetime, *, confidence: flo
 
 
 def _lpr_attempt(plate: str, center_y: float, height: int = 1000, confidence: float = 0.9):
+    """The reader reports the whole-plate text plus the trusted 4-digit tail."""
+    from towersightai.cli.fast_alpr_lpr import extract_tail_digits
+
     return {
         "status": "recognized",
         "best_plate": {
             "plate_number": plate,
+            "tail_digits": extract_tail_digits(plate),
             "confidence": confidence,
             "bbox": {"x1": 100, "y1": center_y - 20, "x2": 300, "y2": center_y + 20},
         },
@@ -104,7 +108,7 @@ def _drive_to_safety_check(engine: ParkingProcessEngine, now: datetime) -> datet
     out = engine.tick(now)
     assert out.public_state is ParkingState.VEHICLE_ENTERING
     assert out.lpr_control == "stop"
-    assert out.plate_number == "12가3456"
+    assert out.plate_number == "3456"
     now += timedelta(seconds=1)
     out = engine.tick(now)
     assert out.public_state is ParkingState.ALIGNMENT_GUIDE
@@ -134,7 +138,7 @@ def test_full_cycle_happy_path():
     names = [r.name for r in out.plc_requests]
     assert names == ["safety_check_complete", "vehicle_parked"]
     parked = out.plc_requests[1]
-    assert parked.payload["plate_number"] == "12가3456"
+    assert parked.payload["plate_number"] == "3456"
     assert parked.payload["simulated"] is True
     now = now + timedelta(seconds=11)
     out = engine.tick(now)
@@ -354,11 +358,12 @@ def test_stationary_front_car_does_not_end_the_vote_before_the_reader_had_a_chan
     now = _drive_to_plate_reading(engine, T0)
     current, out = _drive_plate_phase(engine, now, 6, moving=False)
     assert out.public_state is ParkingState.PLATE_RECOGNITION  # would have decided immediately before
-    # A read landing lets the stationary car end the vote right away.
-    engine.observe_lpr_attempt(*_lpr_attempt("12가3456", center_y=800))
+    # Enough agreeing reads let the stationary car end the vote.
+    for _ in range(3):
+        engine.observe_lpr_attempt(*_lpr_attempt("12가3456", center_y=800))
     _current, out = _drive_plate_phase(engine, current, 2, moving=False)
     assert out.public_state is ParkingState.VEHICLE_ENTERING
-    assert out.plate_number == "12가3456"
+    assert out.plate_number == "3456"
 
 
 def test_decided_plate_carries_the_winning_frame_and_box_for_the_crop():
@@ -375,7 +380,7 @@ def test_decided_plate_carries_the_winning_frame_and_box_for_the_crop():
     engine.observe_lpr_attempt(third, height)  # min_reads_for_vote = 3
     out = engine.tick(now + timedelta(seconds=1))
     plate_event = next(event for event in out.raw_events if event.kind == "plate")
-    assert plate_event.plate_number == "12가3456"
+    assert plate_event.plate_number == "3456"
     assert plate_event.source_image_path == "/tmp/frames/frame-b.png"  # highest-confidence read
     assert plate_event.bbox == {"x1": 100.0, "y1": 790.0, "x2": 300.0, "y2": 830.0}
 
@@ -386,7 +391,7 @@ def test_plate_majority_vote():
     for plate in ("12가3456", "12가3456", "12기3456", "12가3456"):
         engine.observe_lpr_attempt(*_lpr_attempt(plate, center_y=800))
     out = engine.tick(now + timedelta(seconds=1))
-    assert out.plate_number == "12가3456"
+    assert out.plate_number == "3456"
 
 
 def test_plate_above_line_ignored():
@@ -415,8 +420,8 @@ def test_every_plate_read_is_recorded_with_its_accept_reason():
     out = engine.tick(now + timedelta(seconds=1))
     attempts = [event for event in out.raw_events if event.kind == "plate_attempt"]
     assert [(a.plate_number, a.accepted, a.reason) for a in attempts] == [
-        ("12가3456", True, ""),
-        ("99라9999", False, "above_entry_line"),
+        ("3456", True, ""),
+        ("9999", False, "above_entry_line"),
         ("", False, "no_plate_detected"),
     ]
     assert attempts[0].camera_id == "front"
@@ -433,7 +438,7 @@ def test_recognized_plate_records_the_vote_size():
     plate_events = [event for event in out.raw_events if event.kind == "plate"]
     assert len(plate_events) == 1
     assert plate_events[0].recognized is True
-    assert plate_events[0].plate_number == "12가3456"
+    assert plate_events[0].plate_number == "3456"
     assert plate_events[0].reads == 3
     assert plate_events[0].reason == "vote"
 
@@ -476,7 +481,7 @@ def test_entry_aborted_mid_vote_still_records_the_plate_outcome():
     assert out.public_state is ParkingState.IDLE
     plate_events = [event for event in out.raw_events if event.kind == "plate"]
     assert len(plate_events) == 1
-    assert plate_events[0].plate_number == "12가3456" and plate_events[0].reads == 1
+    assert plate_events[0].plate_number == "3456" and plate_events[0].reads == 1
     assert plate_events[0].reason.startswith("aborted:")
     assert any(event.kind == "vehicle_session_end" for event in out.raw_events)
 
@@ -591,3 +596,61 @@ def test_trigger_without_any_front_vehicle_returns_to_idle_quietly():
             break
     assert out.phase == "idle_monitoring"
     assert not any(r.kind in ("vehicle_entry", "vehicle_exit_start") for r in out.raw_events)
+
+
+# ---- 번호판은 뒷자리 4자리만 신뢰 -------------------------------------------------------
+
+def _lpr_tail_attempt(tail: str, text: str, center_y: float, height: int = 1000, confidence: float = 0.9):
+    return {
+        "status": "recognized",
+        "best_plate": {
+            "plate_number": text,
+            "tail_digits": tail,
+            "tail_source": "vote:10/12",
+            "confidence": confidence,
+            "bbox": {"x1": 100, "y1": center_y - 20, "x2": 300, "y2": center_y + 20},
+        },
+    }, height
+
+
+def test_only_the_four_digit_tail_is_voted_on_and_the_full_text_is_kept_for_audit():
+    """The OCR model has no Hangul, so the middle character comes back as a Latin look-alike and
+    can shift the digits around it (field 2026-09-17: 213가9135 read as '2137I913')."""
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    for text in ("2137I913", "213X9135", "2139135"):
+        engine.observe_lpr_attempt(*_lpr_tail_attempt("9135", text, center_y=800))
+    out = engine.tick(now + timedelta(seconds=1))
+    assert out.plate_number == "9135"
+    plate_event = next(event for event in out.raw_events if event.kind == "plate")
+    assert plate_event.plate_number == "9135" and plate_event.reads == 3
+    assert plate_event.plate_text == "2137I913"  # whole-plate string of the winning read
+    attempts = [event for event in out.raw_events if event.kind == "plate_attempt"]
+    assert [a.plate_number for a in attempts] == ["9135", "9135", "9135"]
+    assert attempts[0].plate_text == "2137I913"
+
+
+def test_a_read_without_four_trailing_digits_is_rejected_not_guessed():
+    engine = _engine()
+    _drive_to_plate_reading(engine, T0)
+    attempt, height = _lpr_tail_attempt("", "757", center_y=800)
+    engine.observe_lpr_attempt(attempt, height)
+    out = engine.tick(T0 + timedelta(seconds=4))
+    rejected = [event for event in out.raw_events if event.kind == "plate_attempt"]
+    assert rejected and rejected[0].accepted is False
+    assert rejected[0].reason == "no_tail_digits"
+    assert out.plate_number == ""  # still reading, nothing guessed
+
+
+def test_a_stationary_car_waits_for_enough_reads_before_the_vote_closes():
+    """One read must not close the vote: the tail needs several agreeing reads."""
+    engine = _engine()
+    now = _drive_to_plate_reading(engine, T0)
+    engine.observe_lpr_attempt(*_lpr_tail_attempt("9135", "2139135", center_y=800))
+    current, out = _drive_plate_phase(engine, now, 3, moving=False)
+    assert out.public_state is ParkingState.PLATE_RECOGNITION  # one read is not enough
+    for _ in range(2):
+        engine.observe_lpr_attempt(*_lpr_tail_attempt("9135", "2139135", center_y=800))
+    _current, out = _drive_plate_phase(engine, current, 2, moving=False)
+    assert out.public_state is ParkingState.VEHICLE_ENTERING
+    assert out.plate_number == "9135"

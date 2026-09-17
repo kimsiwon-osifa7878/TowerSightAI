@@ -33,17 +33,23 @@
 # 2. 증거 클립에서 프레임 추출
 .venv/bin/python -m vehicle_box_test.frames --interval 1.5 --max-per-clip 24
 
-# 3. 카메라별 '빈 주차기' 배경(중앙값) 만들기
+# 3. 렌즈 왜곡 보정 좌표계로 이동 (최초 1회, 체커보드 측정 후)
+.venv/bin/python -m vehicle_box_test.calibrate migrate
+
+# 4. 카메라별 '빈 주차기' 배경(중앙값) 만들기 — 보정된 영상으로 만든다
 .venv/bin/python -m vehicle_box_test.background --max-frames 200
 
-# 4. 지면 교정 — ruler로 좌표를 읽고 check로 투영해 눈으로 확인, 필요하면 반복
-.venv/bin/python -m vehicle_box_test.calibrate ruler
-.venv/bin/python -m vehicle_box_test.calibrate check
+# 5. 측정된 내부 파라미터로 카메라 자세 풀기 (지면 호모그래피가 여기서 나온다)
+.venv/bin/python -m vehicle_box_test.solve_poses
 
-# 5. 추정 + 주석 이미지 생성
+# 6. 지면 교정 확인 — check로 투영해 눈으로 본다 (ruler는 대응점을 새로 읽을 때)
+.venv/bin/python -m vehicle_box_test.calibrate check
+.venv/bin/python -m vehicle_box_test.calibrate ruler
+
+# 7. 추정 + 주석 이미지 생성
 .venv/bin/python -m vehicle_box_test.run --max-frames-per-clip 4
 
-# 6. 사람이 눈으로 판정하는 HTML 보고서
+# 8. 사람이 눈으로 판정하는 HTML 보고서
 .venv/bin/python -m vehicle_box_test.report
 xdg-open vehicle_box_test/out/report.html
 ```
@@ -59,7 +65,9 @@ xdg-open vehicle_box_test/out/report.html
 | `nas_sampler.py` | 이벤트 샤드(JSONL)를 읽어 **차량이 담긴 미디어만** 표본 추출 → 다운로드 → SHA-256 검증 |
 | `frames.py` | 증거 클립(MKV) → 일정 간격 프레임 |
 | `background.py` | 카메라별 중앙값 배경 + '가장 비어 있는 실제 프레임' |
+| `undistort.py` | 운영자 콘솔에서 측정한 내부 파라미터로 렌즈 왜곡 보정. 측정값이 없는 카메라는 동일 기종 값을 빌려 쓰고 그 사실을 표시 |
 | `rails.py` | 노란 레일 띠 자동 검출 (HSV) |
+| `solve_poses.py` | 측정된 K + 레일로 `solvePnP` → 카메라 자세를 `site_calibration.json`에 저장 |
 | `geometry.py` | 월드 모델 · 지면 호모그래피 · 호모그래피→카메라 자세 복원 · 3D 투영 |
 | `calibrate.py` | 정규화 좌표 눈금자 / 지면 모델 투영 검증 |
 | `estimate.py` | 배경차분 실루엣 → 접지선 → 월드 사각형 + **실패 사유 생성** |
@@ -99,7 +107,8 @@ vehicle_box_test/
 - y = 폭 방향 (진입 방향을 바라볼 때 왼쪽이 +)
 - z = 위, 단위 **mm**
 
-지면 호모그래피는 **z=0 평면에서만** 정확합니다. 범퍼·지붕처럼 바닥에서 뜬 점을 지면
+**모든 좌표는 렌즈 왜곡 보정 후 영상 기준**입니다 (`site_calibration.json`의 `space: undistorted`).
+지면 호모그래피는 카메라 자세에서 만들며, **z=0 평면에서만** 정확합니다. 범퍼·지붕처럼 바닥에서 뜬 점을 지면
 좌표로 바꾸면 틀리므로, 차량 위치는 **타이어 접지선에서만** 읽습니다.
 
 ---

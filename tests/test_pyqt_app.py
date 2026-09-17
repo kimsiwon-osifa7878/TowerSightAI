@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QRect, QSize, QThread, Qt
@@ -2399,45 +2401,315 @@ def test_calibration_refuses_to_start_without_a_streaming_camera(monkeypatch, tm
     window.close()
 
 
-def test_calibration_auto_capture_saves_a_frame_after_steady_detection(monkeypatch, tmp_path: Path):
+def _board_in_box(tmp_path: Path, pose, *, width: int = 640, height: int = 360, scale: float = 1.0) -> QImage:
+    """A frame with the printed A4 board placed inside ``pose``'s target box.
+
+    The rendered PNG is the whole A4 sheet, so pasting it into the box reproduces exactly what
+    the operator sees when they hold the sheet up to the on-screen rectangle.
+    """
+    import cv2
+    import numpy as np
+
+    from towersightai.calibration.checkerboard import CheckerboardSpec, render_checkerboard_png
+    from towersightai.ui.pyqt_app import _bgr_to_qimage
+
+    png = render_checkerboard_png(CheckerboardSpec(), "A4", tmp_path / "board-box.png", dpi=60)
+    sheet = cv2.imread(str(png))
+    assert sheet is not None
+    x0, y0, x1, y1 = pose.target_rect(height / width)
+    box_w = max(int((x1 - x0) * width * scale), 8)
+    box_h = max(int((y1 - y0) * height * scale), 8)
+    resized = cv2.resize(sheet, (box_w, box_h), interpolation=cv2.INTER_AREA)
+    canvas = np.full((height, width, 3), 90, dtype=np.uint8)
+    left = int(((x0 + x1) / 2) * width - box_w / 2)
+    top = int(((y0 + y1) / 2) * height - box_h / 2)
+    left = max(min(left, width - box_w), 0)
+    top = max(min(top, height - box_h), 0)
+    canvas[top : top + box_h, left : left + box_w] = resized
+    return _bgr_to_qimage(canvas)
+
+
+def test_calibration_shows_an_a4_target_box_and_waits_three_seconds_inside_it(monkeypatch, tmp_path: Path):
+    """Field feedback 2026-09-16: the old rule fired within a second, wherever the board was."""
     app, window = _calibration_window(monkeypatch, tmp_path)
-    from towersightai.ui.pyqt_app import CALIBRATION_STEADY_HITS, _qimage_to_bgr
+    from towersightai.calibration.intrinsics import CAPTURE_POSES
+    from towersightai.ui.pyqt_app import CALIBRATION_DWELL_SECONDS, _qimage_to_bgr
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("time.monotonic", lambda: clock["now"])
 
     tile = window.camera_widgets[CameraRole.rear_side]
-    tile.set_frame(_board_frame(tmp_path))
+    tile.set_frame(_board_in_box(tmp_path, CAPTURE_POSES[0]))
     window._runtime_camera_status["rear_side"] = "정상 수신"
-
     window.calibration_start_button.click()
     app.processEvents()
-    assert window._calib_running is True
-    assert window._calib_timer is not None
-    assert "[1/" in window.calibration_instruction_label.text()
-    assert window._calib_store.session_dir.parent == tmp_path / "intrinsics" / "sessions"
+
+    # The target box is drawn for the current pose, at the A4 landscape aspect.
+    rect, state, _progress, _caption = tile._target_box
+    assert rect == CAPTURE_POSES[0].target_rect(9 / 16)
+    assert state == "waiting"
 
     worker = window._calib_detect_worker
-    for _ in range(CALIBRATION_STEADY_HITS):
+
+    def observe() -> None:
         window._calibration_tick()
-        assert window._calib_detect_busy is True
-        # The worker thread is not started in tests; run the slot inline with the queued payload.
         worker.detect(window._calib_token, _qimage_to_bgr(tile.current_frame()))
         app.processEvents()
 
+    observe()
+    assert window._calib_samples == []  # inside the box, but the dwell has only just started
+    assert tile._target_box[1] == "holding"
+    assert "그대로 유지" in window.calibration_status_label.text()
+
+    clock["now"] += CALIBRATION_DWELL_SECONDS - 0.5
+    observe()
+    assert window._calib_samples == []
+
+    clock["now"] += 0.6
+    observe()
     assert len(window._calib_samples) == 1
     assert window._calib_samples[0].pose_key == "center"
     assert window._calib_samples[0].image_path.is_file()
     assert window._calib_pose_index == 1
-    assert "[2/" in window.calibration_instruction_label.text()
-    assert len(tile._marker_points) == 54
     assert window.model.can_show_final_ok is False
+    window.close()
 
-    # A frame without a board resets the steady counter and reports it.
+
+def test_calibration_does_not_capture_a_board_outside_the_target_box(monkeypatch, tmp_path: Path):
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    from towersightai.calibration.intrinsics import CAPTURE_POSES
+    from towersightai.ui.pyqt_app import _qimage_to_bgr
+
+    clock = {"now": 500.0}
+    monkeypatch.setattr("time.monotonic", lambda: clock["now"])
+
+    tile = window.camera_widgets[CameraRole.rear_side]
+    # Pose 1 wants the centre box; hold the board over the bottom-right box instead.
+    elsewhere = next(pose for pose in CAPTURE_POSES if pose.key == "bottom_right")
+    tile.set_frame(_board_in_box(tmp_path, elsewhere))
+    window._runtime_camera_status["rear_side"] = "정상 수신"
+    window.calibration_start_button.click()
+    app.processEvents()
+
+    worker = window._calib_detect_worker
+    for _ in range(3):
+        window._calibration_tick()
+        worker.detect(window._calib_token, _qimage_to_bgr(tile.current_frame()))
+        app.processEvents()
+        clock["now"] += 2.0
+
+    assert window._calib_samples == []
+    assert window._calib_dwell_start is None
+    assert tile._target_box[1] == "waiting"
+    assert "밖으로" in window.calibration_status_label.text()
+
+    # Losing the board entirely is reported differently and also keeps the dwell at zero.
     blank = QImage(320, 240, QImage.Format.Format_RGB888)
     blank.fill(QColor("#404040"))
     window._calib_hold_until = 0.0
     window._calibration_tick()
     worker.detect(window._calib_token, _qimage_to_bgr(blank))
-    assert window._calib_hits == 0
+    assert window._calib_dwell_start is None
     assert "보이지 않습니다" in window.calibration_status_label.text()
+    window.close()
+
+
+def test_calibration_verify_button_reports_quality_and_shows_a_before_after_image(monkeypatch, tmp_path: Path):
+    """The operator needs a way to tell whether the measurement actually came out right."""
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    from towersightai.calibration.intrinsics import CAPTURE_POSES
+
+    tile = window.camera_widgets[CameraRole.rear_side]
+    tile.set_frame(_board_in_box(tmp_path, CAPTURE_POSES[0]))
+
+    # No measurement yet → the button says so instead of pretending.
+    window.calibration_verify_button.click()
+    app.processEvents()
+    assert "측정 파일이 없습니다" in window.calibration_status_label.text()
+    assert window.calibration_verify_view.isHidden() is True  # window itself is never shown offscreen
+
+    import json
+
+    root = tmp_path / "intrinsics"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "rear_side.json").write_text(
+        json.dumps(
+            {
+                "kind": "camera_intrinsics",
+                "camera_id": "rear_side",
+                "image_width": 640,
+                "image_height": 360,
+                "rotation_degrees": 0,
+                "checkerboard": {"columns": 10, "rows": 7, "square_mm": 25.0},
+                "sample_count": 13,
+                "rms_reprojection_error_px": 0.31,
+                "camera_matrix": [[520.0, 0.0, 320.0], [0.0, 520.0, 180.0], [0.0, 0.0, 1.0]],
+                "distortion_coefficients": [-0.25, 0.08, 0.0, 0.0, 0.0],
+                "per_view_errors_px": [0.3] * 13,
+                "pose_keys": [pose.key for pose in CAPTURE_POSES],
+                "measured_at": "2026-09-16T00:00:00+00:00",
+                "calibration_seconds": 1.0,
+                "reviewed": False,
+                "safe_to_operate": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    window.calibration_verify_button.click()
+    app.processEvents()
+
+    quality = window.calibration_quality_label.text()
+    assert "양호" in quality
+    for expected in ("재투영 오차", "수평 화각", "가장자리 자세", "기울임 자세"):
+        assert expected in quality
+    assert window.calibration_verify_view.isHidden() is False
+    pixmap = window.calibration_verify_view.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+    assert pixmap.width() > pixmap.height()  # two panels side by side
+    assert (root / "rear_side-verify.png").is_file()
+    # Checking a measurement is never authorization.
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+# ---- ground (extrinsic) reference points -------------------------------------------------------
+
+
+def _write_intrinsics(root: Path, camera_id: str) -> None:
+    import json
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{camera_id}.json").write_text(
+        json.dumps(
+            {
+                "kind": "camera_intrinsics",
+                "camera_id": camera_id,
+                "image_width": 1920,
+                "image_height": 1080,
+                "rotation_degrees": 0,
+                "checkerboard": {"columns": 10, "rows": 7, "square_mm": 25.0},
+                "sample_count": 13,
+                "rms_reprojection_error_px": 0.25,
+                "camera_matrix": [[1356.4, 0.0, 960.0], [0.0, 1360.1, 540.0], [0.0, 0.0, 1.0]],
+                "distortion_coefficients": [-0.2941, 0.0017, -0.0006, -0.0030, 0.0485],
+                "per_view_errors_px": [0.25] * 13,
+                "pose_keys": ["center"],
+                "measured_at": "2026-09-16T00:00:00+00:00",
+                "calibration_seconds": 1.0,
+                "reviewed": False,
+                "safe_to_operate": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _ground_clicks(camera_xyz, *, stopper_x=-2400.0):
+    """Where an operator would click for a camera at ``camera_xyz`` (normalized coordinates)."""
+    import cv2
+    import numpy as np
+
+    matrix = np.array([[1356.4, 0.0, 960.0], [0.0, 1360.1, 540.0], [0.0, 0.0, 1.0]])
+    dist = np.array([-0.2941, 0.0017, -0.0006, -0.0030, 0.0485])
+    camera = np.array(camera_xyz, dtype=np.float64)
+    forward = -camera / np.linalg.norm(camera)
+    right = np.cross(forward, np.array([0.0, 0.0, 1.0]))
+    right /= np.linalg.norm(right)
+    rotation = np.stack([right, np.cross(forward, right), forward])
+    rvec, _ = cv2.Rodrigues(rotation)
+    tvec = -rotation @ camera
+    half_x, half_y = 5350.0 / 2, 2200.0 / 2
+    world = [
+        (-half_x, -half_y, 0.0),
+        (half_x, -half_y, 0.0),
+        (half_x, half_y, 0.0),
+        (-half_x, half_y, 0.0),
+        (stopper_x, 0.0, 0.0),
+    ]
+    projected, _ = cv2.projectPoints(np.array(world), rvec, tvec, matrix, dist)
+    return [(float(x) / 1920, float(y) / 1080) for x, y in projected.reshape(-1, 2)]
+
+
+def test_ground_page_solves_the_camera_pose_from_five_clicks(monkeypatch, tmp_path: Path):
+    """Four pallet corners plus the stopper landmark — no hand-typed coordinates anywhere."""
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    window._show_operator_page("지면 기준점")
+    assert "지면 기준점" in window.sidebar_buttons
+    assert tuple(button.text() for button in window.sidebar_buttons.values()) == SIDEBAR_ACTION_LABELS
+
+    _write_intrinsics(tmp_path / "intrinsics", "rear_side")
+    tile = window.camera_widgets[CameraRole.rear_side]
+    tile.set_frame(QImage(1920, 1080, QImage.Format.Format_RGB888))
+
+    window.ground_start_button.click()
+    app.processEvents()
+    assert window._ground_picking is True
+    assert tile._picking is True
+    assert "네 모서리" in window.ground_instruction_label.text()
+
+    clicks = _ground_clicks((-700.0, -3100.0, 4550.0))
+    for index, (x, y) in enumerate(clicks):
+        tile.picked.emit(x, y)
+        app.processEvents()
+        if index < 4:
+            assert window._ground_result is None  # not enough points yet
+
+    result = window._ground_result
+    assert result is not None
+    assert result.camera_position_mm == pytest.approx((-700.0, -3100.0, 4550.0), abs=40.0)
+    assert result.residual_mm < 20.0
+    assert tile._picking is False  # picking stops once solved
+    assert len(tile._pick_markers) == 5
+    assert tile._ground_overlay  # projected pallet + metric grid is shown for judging
+    assert "양호" in window.ground_quality_label.text()
+    assert "카메라 높이" in window.ground_quality_label.text()
+
+    window.ground_save_button.click()
+    app.processEvents()
+    saved = tmp_path / "ground" / "rear_side.json"
+    assert saved.is_file()
+    import json
+
+    payload = json.loads(saved.read_text(encoding="utf-8"))
+    assert payload["kind"] == "camera_ground_pose"
+    assert payload["reviewed"] is False
+    assert payload["safe_to_operate"] is False
+    # Measuring where a camera sits is never authorization.
+    assert window.model.can_show_final_ok is False
+    assert "최종 OK는 차단" in window.warning_label.text()
+    window.close()
+
+
+def test_ground_page_needs_intrinsics_and_can_undo(monkeypatch, tmp_path: Path):
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    window._show_operator_page("지면 기준점")
+    tile = window.camera_widgets[CameraRole.rear_side]
+
+    # No frame yet → refuses to start instead of collecting meaningless clicks.
+    window.ground_start_button.click()
+    app.processEvents()
+    assert window._ground_picking is False
+    assert "수신되지 않았습니다" in window.ground_status_label.text()
+
+    tile.set_frame(QImage(1920, 1080, QImage.Format.Format_RGB888))
+    window.ground_start_button.click()
+    app.processEvents()
+    clicks = _ground_clicks((-700.0, -3100.0, 4550.0))
+    for x, y in clicks:
+        tile.picked.emit(x, y)
+        app.processEvents()
+    # Intrinsics missing → says exactly what to do first, and keeps nothing half-solved.
+    assert "체커보드를 측정" in window.ground_status_label.text()
+    assert window._ground_result is None
+    assert window.ground_save_button.isEnabled() is False
+
+    window.ground_undo_button.click()  # disabled after picking stopped, so this is a no-op
+    window.ground_reset_button.click()
+    app.processEvents()
+    assert window._ground_points == []
+    assert tile._pick_markers == ()
+    assert window.model.can_show_final_ok is False
     window.close()
 
 
@@ -2747,3 +3019,112 @@ def test_ld2410_frames_never_reach_the_process_engine():
     assert not window.process_engine.tick(datetime(2026, 9, 16, 0, 0, 1, tzinfo=timezone.utc)).person_possible
     assert "192.0.2.30" in window.ld2410_connection_label.text()  # console still updates
     window.close()
+
+
+# ---- Hailo failure evidence → NAS ------------------------------------------------------------
+
+
+def test_hailo_health_rows_are_recorded_for_the_nas_day_and_thinned_when_healthy(monkeypatch, tmp_path: Path):
+    from towersightai.inference.hailo_health import HailoHealthSnapshot
+    import towersightai.ui.pyqt_app as ui_module
+
+    _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(ui_module.time, "monotonic", lambda: clock["now"])
+    recorded: list[str] = []
+
+    class FakeManager:
+        def record_hailo_health(self, snapshot):
+            recorded.append(snapshot.status)
+
+    window._raw_data_manager = FakeManager()  # type: ignore[assignment]
+
+    window._set_hailo_health(HailoHealthSnapshot(status="ok", summary="정상"))
+    assert recorded == ["ok"]  # first sample always recorded
+    clock["now"] += 60
+    window._set_hailo_health(HailoHealthSnapshot(status="ok", summary="정상"))
+    assert recorded == ["ok"]  # healthy repeats are thinned
+    clock["now"] += ui_module.HAILO_HEALTH_RECORD_INTERVAL_SECONDS
+    window._set_hailo_health(HailoHealthSnapshot(status="ok", summary="정상"))
+    assert recorded == ["ok", "ok"]  # ... until the record interval elapses
+
+    clock["now"] += 60
+    window._set_hailo_health(HailoHealthSnapshot(status="error", summary="응답 없음"))
+    clock["now"] += 60
+    window._set_hailo_health(HailoHealthSnapshot(status="error", summary="응답 없음"))
+    assert recorded[-2:] == ["error", "error"]  # every bad sample is kept
+    assert window.model.can_show_final_ok is False
+    window._raw_data_manager = None
+    window.close()
+
+
+def test_hailo_incident_upload_result_is_shown_to_the_operator(tmp_path: Path):
+    from towersightai.storage.hailo_incident import IncidentReport
+
+    _qt_app()
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings)
+    _open_operator_menu(window)
+    window._show_operator_page("시스템 점검")
+
+    window._set_hailo_incident(
+        IncidentReport(True, reason="status_change", remote_dir="/home/site/hailo-incidents/site-1", file_count=7)
+    )
+    assert "hailo-incidents/site-1" in window.warning_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert "hailo-incidents/site-1" in window.system_test_log.toPlainText()
+    assert window.model.can_show_final_ok is False
+
+    window._set_hailo_incident(IncidentReport(True, reason="status_change", error="OSError: timed out"))
+    assert "업로드 실패" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_hailo_health_worker_uploads_evidence_off_the_ui_thread(tmp_path: Path):
+    from towersightai.inference.hailo_health import HailoHealthSnapshot
+    from towersightai.storage.hailo_incident import IncidentReport
+    from towersightai.ui.pyqt_app import HailoHealthWorker
+
+    _qt_app()
+    settings = _nas_settings(tmp_path)
+    seen: list[str] = []
+    reports: list[IncidentReport] = []
+
+    class FakeReporter:
+        enabled = True
+
+        def observe(self, snapshot):
+            seen.append(snapshot.status)
+            return IncidentReport(snapshot.status != "ok", reason="status_change", remote_dir="/home/site/x")
+
+    worker = HailoHealthWorker(settings, interval_seconds=5, reporter=FakeReporter())
+    worker.incident_reported.connect(reports.append)
+
+    # Drive one loop iteration's worth of logic without the real 60 s sleep or a real device.
+    import towersightai.ui.pyqt_app as ui_module
+
+    snapshots = iter([HailoHealthSnapshot(status="error", summary="응답 없음")])
+
+    def fake_collect(**_kwargs):
+        try:
+            return next(snapshots)
+        except StopIteration:
+            worker.stop()
+            return HailoHealthSnapshot(status="ok", summary="정상")
+
+    original_collect = ui_module.collect_hailo_health
+    original_probe = ui_module.make_subprocess_temp_probe
+    ui_module.collect_hailo_health = fake_collect
+    ui_module.make_subprocess_temp_probe = lambda _python: (lambda: ("skip", ""))
+    try:
+        worker.run()
+    finally:
+        ui_module.collect_hailo_health = original_collect
+        ui_module.make_subprocess_temp_probe = original_probe
+
+    assert seen[0] == "error"
+    assert [report.reported for report in reports] == [True]
+    assert reports[0].remote_dir == "/home/site/x"

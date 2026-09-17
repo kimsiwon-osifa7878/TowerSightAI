@@ -691,3 +691,31 @@ def test_camera_state_survives_a_closed_person_window(tmp_path: Path):
     state = sampler.camera_state(start + timedelta(seconds=10))
     assert state["front"]["person_present"] is False
     assert state["front"]["last_person_detected_at"] == start.isoformat()
+
+
+def test_hailo_health_rows_reach_the_daily_jsonl_and_are_durable(tmp_path: Path):
+    from towersightai.inference.hailo_health import HailoHealthSnapshot
+    from towersightai.storage import raw_data as raw_module
+
+    start = datetime(2026, 9, 17, 5, 6, 7, tzinfo=timezone.utc)
+    manager = RawDataManager(RawStorageConfig(local_dir=tmp_path), ("front",), clock=lambda: start)
+    manager.record_hailo_health(
+        HailoHealthSnapshot(
+            status="error",
+            summary="장치가 제어 요청에 응답하지 않습니다",
+            checked_at=start,
+            pcie_address="0000:02:00.0",
+            rxerr_count=0,
+            detail="HAILO_DRIVER_OPERATION_FAILED(36)",
+        )
+    )
+    manager.close()
+
+    rows = [r for r in _records(tmp_path, "2026-09-17") if r["event_type"] == "hailo_health"]
+    assert len(rows) == 1
+    payload = rows[0]["payload"]
+    assert payload["status"] == "error"
+    assert payload["pcie_address"] == "0000:02:00.0"
+    assert payload["rxerr_count"] == 0
+    assert payload["safety_effect"] == "raw_only"
+    assert "hailo_health" in raw_module._DURABLE_EVENTS

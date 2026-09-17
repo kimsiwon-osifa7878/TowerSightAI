@@ -74,10 +74,11 @@ class PlcRequest:
 class _PlateRead:
     """One accepted 1 Hz read, kept with its frame so the winner can be cropped for evidence."""
 
-    plate: str
+    plate: str  # the trusted 4-digit tail
     confidence: float
     source_image_path: str = ""
     bbox: Mapping[str, float] | None = None
+    text: str = ""  # whole-plate OCR string, audit only (Hangul is unreliable)
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ class RawEventRequest:
     reads: int = 0
     # Winning read's frame + plate box, so the evidence layer can store the plate crop.
     source_image_path: str = ""
+    plate_text: str = ""  # whole-plate OCR string kept for audit next to the trusted 4 digits
 
 
 @dataclass(frozen=True)
@@ -281,26 +283,33 @@ class ParkingProcessEngine:
         if not isinstance(best, Mapping):
             self._queue_plate_attempt("", None, accepted=False, reason="no_plate_detected")
             return
-        plate = str(best.get("plate_number") or "").strip()
+        text = str(best.get("plate_number") or "").strip()
+        # Only the trailing four digits are trusted: the OCR model has no Hangul, so the middle
+        # character comes back as a Latin look-alike and can shift the digits around it. The
+        # reader re-reads the right-hand crop (digits only) and reports it as ``tail_digits``.
+        plate = str(best.get("tail_digits") or "").strip()
         bbox = best.get("bbox")
         confidence = float(best.get("confidence") or 0.0)
-        if not plate or not isinstance(bbox, Mapping):
-            self._queue_plate_attempt(plate, confidence, accepted=False, reason="no_plate_bbox")
+        if not plate:
+            self._queue_plate_attempt(text, confidence, accepted=False, reason="no_tail_digits", text=text)
+            return
+        if not isinstance(bbox, Mapping):
+            self._queue_plate_attempt(plate, confidence, accepted=False, reason="no_plate_bbox", text=text)
             return
         try:
             center_y = (float(bbox["y1"]) + float(bbox["y2"])) / 2.0
         except (KeyError, TypeError, ValueError):
-            self._queue_plate_attempt(plate, confidence, accepted=False, reason="invalid_bbox")
+            self._queue_plate_attempt(plate, confidence, accepted=False, reason="invalid_bbox", text=text)
             return
         line_y = self._settings.plate_zone.line_y_norm * frame_height
         normalized = self._normalized_bbox(bbox, frame_height)
         if center_y <= line_y:
             # Above the 차량진입선: the plate is outside the machine, so it never feeds the vote.
-            self._queue_plate_attempt(plate, confidence, accepted=False, reason="above_entry_line", bbox=normalized)
+            self._queue_plate_attempt(plate, confidence, accepted=False, reason="above_entry_line", bbox=normalized, text=text)
             return
         source = str(attempt.get("source_image") or "")
-        self._plate_reads.append(_PlateRead(plate, confidence, source, normalized))
-        self._queue_plate_attempt(plate, confidence, accepted=True, reason="", bbox=normalized)
+        self._plate_reads.append(_PlateRead(plate, confidence, source, normalized, text))
+        self._queue_plate_attempt(plate, confidence, accepted=True, reason="", bbox=normalized, text=text)
         self._entry_last_evidence_at = self._now or self._entry_last_evidence_at
 
     def _observe_vehicle_shape(self, event: DetectionEvent) -> None:
@@ -330,6 +339,7 @@ class ParkingProcessEngine:
         accepted: bool,
         reason: str,
         bbox: Mapping[str, float] | None = None,
+        text: str = "",
     ) -> None:
         self._queue_raw(
             RawEventRequest(
@@ -340,6 +350,7 @@ class ParkingProcessEngine:
                 accepted=accepted,
                 reason=reason,
                 bbox=bbox,
+                plate_text=text,
             )
         )
 
@@ -536,7 +547,7 @@ class ParkingProcessEngine:
     def _plate_read_minimum_met(self, now: datetime, zone) -> bool:  # noqa: ANN001 - settings dataclass
         """A stationary car may only end the vote once a read landed or the reader has had
         ``min_read_seconds`` in front of the car."""
-        if self._plate_reads:
+        if len(self._plate_reads) >= zone.min_reads_for_vote:
             return True
         reference = self._plate_front_seen_at or self._plate_started_at
         if reference is None:
@@ -592,6 +603,7 @@ class ParkingProcessEngine:
                     # Frame + box of the clearest winning read → plate image and crop evidence.
                     source_image_path=best.source_image_path,
                     bbox=best.bbox,
+                    plate_text=best.text,
                 )
             )
         _LOGGER.info(

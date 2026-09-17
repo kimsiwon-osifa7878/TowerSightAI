@@ -100,8 +100,12 @@ class ParamikoFileTransferUploader:
             client.close()
 
 
-def remote_file_transfer_dir(config: RawStorageConfig) -> str:
-    return posixpath.join(config.nas_folder.rstrip("/"), FILE_TRANSFER_ROOT)
+def remote_file_transfer_dir(config: RawStorageConfig, subdir: str = FILE_TRANSFER_ROOT) -> str:
+    parts = [part for part in str(subdir or FILE_TRANSFER_ROOT).strip("/").split("/") if part]
+    for part in parts:
+        if part in {".", ".."}:
+            raise ValueError(f"invalid NAS subdirectory: {subdir!r}")
+    return posixpath.join(config.nas_folder.rstrip("/"), *parts)
 
 
 def validate_transfer_files(files: Sequence[Path]) -> str:
@@ -127,8 +131,9 @@ def upload_files_to_nas(
     *,
     uploader: FileTransferUploader | None = None,
     progress: ProgressCallback | None = None,
+    remote_subdir: str = FILE_TRANSFER_ROOT,
 ) -> NasFileTransferResult:
-    """Send the given files into the NAS transfer folder. Never raises; failures are reported."""
+    """Send the given files into a NAS folder (default ``transfer/``). Never raises."""
     missing = [
         name
         for name, value in (
@@ -151,7 +156,10 @@ def upload_files_to_nas(
     if problem:
         return NasFileTransferResult(ok=False, summary="파일 전송 불가", error=problem)
 
-    remote_dir = remote_file_transfer_dir(config)
+    try:
+        remote_dir = remote_file_transfer_dir(config, remote_subdir)
+    except ValueError as exc:
+        return NasFileTransferResult(ok=False, summary="파일 전송 불가", error=str(exc))
     started = time.monotonic()
     try:
         active_uploader = uploader or ParamikoFileTransferUploader(config)

@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **408 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **431 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -118,7 +118,8 @@ towersightai/
 │   └── file_transfer.py       # operator file relay into <folder>/transfer/ (SHA-256 verified, relay only)
 ├── calibration/
 │   ├── checkerboard.py        # CheckerboardSpec + printable PDF/SVG/PNG (no external deps)
-│   └── intrinsics.py          # CAPTURE_POSES, detect_checkerboard, calibrate_intrinsics, IntrinsicsSessionStore
+│   ├── intrinsics.py          # CAPTURE_POSES, detect_checkerboard, calibrate_intrinsics, IntrinsicsSessionStore
+│   └── ground.py              # extrinsics: 4 clicked pallet corners + stopper landmark → camera pose
 ├── sensors/ld2410.py          # LD2410 binary frame parser, ring buffer, one-client TCP service
 ├── analyze/                   # OFFLINE analysis dashboard (dev/verification only, never runs on site):
 │   ├── config.py              #   sites.json (per-site NAS address), AnalysisPaths under data/analysis/
@@ -142,7 +143,8 @@ models/, tmp/   # gitignored
 
 There is **no `ai_stages/` module yet**. `calibration/` holds only checkerboard generation and the intrinsics
 measurement tooling; there is still no site (extrinsics) calibration, no calibration validity check, and no
-calibration UI beyond the 카메라 캘리브레이션 measurement page. `data/field-media/{front,rear_side,opposite_side}/`
+calibration UI beyond the 카메라 캘리브레이션 (intrinsics) and 지면 기준점 (extrinsics) measurement pages —
+both write measurement files only and neither marks calibration valid. `data/field-media/{front,rear_side,opposite_side}/`
 (per-camera folders, gitignored) is where real site photos/videos for the 3D vehicle-box work are collected.
 
 `vehicle_box_test/` is the **3D vehicle-box lab**, not a test suite — `pytest` never runs it and
@@ -296,7 +298,12 @@ Key facts:
   Vehicle task filters `car/truck/bus/motorcycle`; person task filters `person` only.
   **No Re-ID, no gallery matching, no identity tracking** — the safety question is person *existence*.
 - Plate recognition is a **separate CPU path**: FastALPR ONNX (`yolo-v9-t-384-license-plate-end2end` +
-  `cct-xs-v2-global-model`), not the TAPPAS LPR HEFs.
+  `cct-xs-v2-global-model`), not the TAPPAS LPR HEFs. That OCR model has **no Hangul**, so it returns a Latin
+  look-alike for the middle character and can shift the digits around it (field 2026-09-17: 213가9135 read as
+  `2137I913`). Only the **trailing four digits** are trusted: `FastAlprSession._read_tails` majority-votes the
+  tail over the whole-plate text, a padded re-read, and right-hand crops at five cut points (~105 ms on top of
+  the ~111 ms detect+read), and a read without four trailing digits is rejected rather than guessed. The whole
+  text is kept beside it as `plate_text` for audit only.
 - The callback maps `roi.get_stream_id()` (`src_N`) back to camera IDs and rotates bounding boxes to the
   UI orientation. Raw Hailo objects never reach the state machine.
 - Bounding boxes are corrected from YOLO 640×640 letterbox space back to source resolution before drawing.
@@ -339,8 +346,17 @@ Workspace pages: `전체 카메라` (landing; camera grid + `사람 감지`/`차
 `차량 감지`, `사람 감지`,
 `번호판 인식` (정면 카메라 인식 + 이미지 LPR), `레이더 (LD2410)`, `NAS 연결 확인` (`storage/connection_test.py`),
 `NAS 파일 전송` (`storage/file_transfer.py`; picked files → `<folder>/transfer/`, remote-access file relay),
-`카메라 캘리브레이션` (guided 15-pose checkerboard capture → `cv2.calibrateCamera` → `data/calibration/intrinsics/`;
-measurement file only, `reviewed=false`, never marks calibration valid),
+`카메라 캘리브레이션` (13-pose checkerboard capture aimed by an **on-screen A4-landscape target box** — the
+board must sit inside the box and hold there 3 s (`CALIBRATION_DWELL_SECONDS`) before a frame is kept, so no
+left/right wording and no instant snaps — then `cv2.calibrateCamera` → `data/calibration/intrinsics/`;
+`결과 확인` re-checks a saved measurement with a Korean quality checklist plus a straight-grid
+before/after undistortion image; measurement file only, `reviewed=false`, never marks calibration valid),
+`지면 기준점` (**extrinsics**: the operator clicks the four pallet-deck corners and then the base of the
+orange stopper frame — that landmark fixes which end is the entry without any left/right wording — and
+`calibration/ground.py` undistorts the clicks, tries every corner assignment, keeps the best reprojection
+and reports where the camera sits and how it points **relative to the pallet**, with the projected pallet
+and a 500 mm grid drawn over the live tile to judge the fit; saved to `data/calibration/ground/<camera>.json`,
+`reviewed=false`, `safe_to_operate=false`),
 `시스템 점검` (DiagnosticsService off-thread + Hailo 장치 상태 패널), `실행 로그` (runtime log tail + filter), `주차 프로세스 테스트`
 (driver-stage playback + `차량 진입 시뮬레이션`). Camera pages share ONE camera grid
 (`operator_camera_area`) that `_adopt_camera_area` reparents into the active page with an `all` or `front`
@@ -420,7 +436,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 408 passed, hardware-free
+pytest -q                                     # 449 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed
@@ -526,6 +542,15 @@ state, AI, or PLC contract exists for it yet.
   `towersightai.camera.capture`. `check-settings --health-check-cameras` uses the system `gst-launch-1.0`
   subprocess, so it can pass even when the in-process GStreamer backend is unavailable.
 - `artifacts/`, `models/`, `tmp/`, `gstshark_*/`, `hailort*.log`, and `.env` are gitignored — never add them.
+- `tools/verify_operator_ui_screenshot.sh` clicks the sidebar by **pixel**, so its coordinates drift every
+  time `SIDEBAR_SECTIONS` changes — they had silently drifted several rows before 2026-09-17 and were
+  screenshotting the wrong pages. Re-measure by rendering `OperatorWindow` offscreen at the script's
+  1920x1024 content canvas and reading each button's `mapTo(window, rect().center())`. Two traps: the
+  sidebar **scrolls**, so the 시스템 section needs `scroll_sidebar_to_bottom` first (and `xdotool click
+  --window` does not deliver wheel events to Qt — move the pointer in absolute coordinates and send the
+  wheel globally); and `click_at` now refuses coordinates outside the canvas, because a click at y=1007 on
+  a 900 px tall windowed run once landed on the browser behind the app. Run it with `fullscreen` on a
+  1920x1080 screen for the full sweep.
 - A leftover `operator_ui` process (e.g. a verify-script launch that survived SIGTERM) keeps camera RTSP
   sessions and starves later inference with RTSP 400. `pgrep -f operator_ui` before diagnosing "inference
   suddenly fails"; the verify script now force-kills after 10 s.
