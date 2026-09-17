@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **449 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **450 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -133,7 +133,7 @@ towersightai/
 ├── diagnostics.py             # DiagnosticsService: settings/hailo/image/camera/plc/full smoke
 └── runtime_logging.py         # runtime log config, credential redaction, run IDs, run-status files
 
-tests/          # 449 hardware-free unit/UI/fake-data tests (conftest forces QT_QPA_PLATFORM=offscreen)
+tests/          # 450 hardware-free unit/UI/fake-data tests (conftest forces QT_QPA_PLATFORM=offscreen)
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
 vehicle_box_test/  # 3D vehicle-box LAB (not a pytest suite, not imported by towersightai/)
 data/samples/   # sanitized sample images (test-car.png)
@@ -448,7 +448,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 449 passed, hardware-free
+pytest -q                                     # 450 passed, hardware-free
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed
