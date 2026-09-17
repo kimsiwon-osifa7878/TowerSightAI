@@ -84,6 +84,12 @@
   대책: 녹화기에도 PDEATHSIG+ppid 감시+정지 5초 강제 종료, 400 재시도 10초 대기, 감시 자동 시작은
   카메라 집합 4초 안정 후 1회 실행 + 실패 시 30/60/120초 백오프, 상태 모니터가 고아 녹화기도 표시.
   **UI가 비정상 종료되면 `ss -tn | grep :554`와 `fuser /dev/hailo0`부터 확인.**
+- **2026-09-17 Hailo 고장 자료 NAS 자동 업로드**: 현장 Hailo가 멈췄을 때 원격에서 상황을 보려면 매번
+  수동으로 로그를 받아야 했고(게다가 활성 로그를 그대로 올려 SHA-256 검증 실패), 상태 모니터 결과는
+  런타임 로그에만 남아 NAS로 가지 않았다. 이제 상태가 error/degraded로 바뀌면
+  `storage/hailo_incident.py`가 읽기 전용 증거(PCIe 링크·AER, 드라이버/노드, 점유 프로세스, 커널 메시지,
+  로그 꼬리 **복사본**, 자식 로그)를 모아 NAS `hailo-incidents/`에 올리고, `hailo_health` 행이 일별 JSONL에
+  남는다. **진단 전용, 안전 게이트·엔진·PLC와 무관**하며 복구 조치(모듈 재적재·프로세스 종료)는 하지 않는다.
 - **2026-09-10 레이더 상시 raw 기록**(`docs/implementation/radar-raw-logging.md` 명세 구현): 1 Hz `ld2410_sample`
   + 레이더 감지 창(`radar_window_started/closed`, 3초 확인·5초 해제) + 창 증거(`radar`/`radar_end` 스냅샷,
   30초 상한 클립, 60초 스로틀). **분석 전용, 엔진 입력 아님**. (2026-09-16 `observe_radar` 자체를 제거 — 아래 항목 참고)

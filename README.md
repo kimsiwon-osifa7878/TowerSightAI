@@ -150,6 +150,13 @@ H.264 클립도 함께 보관됩니다. **아카이브 성공/실패는 안전 �
 `RAW_DATA_RADAR_WINDOW_CLEAR_SECONDS`, `RAW_MEDIA_RADAR_EVIDENCE`, `RAW_MEDIA_RADAR_MIN_INTERVAL_SECONDS`,
 `RAW_MEDIA_RADAR_CLIP_MAX_SECONDS`. 모두 분석 전용이며 안전 판정에는 쓰이지 않습니다.
 
+Hailo 장치에 이상(응답 없음, 링크 오류, 고아 프로세스 점유)이 생기면 진단 자료가 자동으로
+NAS `hailo-incidents/<호스트>-<시각>/`에 올라갑니다. PCIe 링크 속도·AER 오류 카운터, 드라이버와
+`/dev/hailo0` 상태, 장치 점유 프로세스, 커널 메시지, 실행 로그 꼬리(복사본), 추론 자식 로그가 들어 있어
+현장에 가지 않고 원인을 볼 수 있습니다. 같은 고장이 이어지면 30분에 한 번만 다시 올립니다
+(`HAILO_INCIDENT_MIN_INTERVAL_SECONDS`). 끄려면 `HAILO_INCIDENT_UPLOAD_ENABLED=false`.
+수집은 **읽기 전용**이라 드라이버 재적재나 프로세스 종료 같은 조치는 하지 않습니다.
+
 **새 장비 최초 1회 — NAS 호스트 키 등록** (안 하면 `not found in known_hosts`로 업로드 실패):
 
 ```bash

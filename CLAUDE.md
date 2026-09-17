@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **431 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **449 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -115,7 +115,8 @@ towersightai/
 │   ├── evidence.py            # EvidenceCoordinator: JPEG snapshots + MKV clips for real events
 │   ├── archive.py             # manifest v2 (SHA-256 per file) + Synology SFTP atomic upload
 │   ├── connection_test.py     # operator NAS write check into <folder>/connectiontest/ (diagnostic only)
-│   └── file_transfer.py       # operator file relay into <folder>/transfer/ (SHA-256 verified, relay only)
+│   ├── file_transfer.py       # operator file relay into <folder>/transfer/ (SHA-256 verified, relay only)
+│   └── hailo_incident.py      # Hailo failure evidence bundle → <folder>/hailo-incidents/ (read-only)
 ├── calibration/
 │   ├── checkerboard.py        # CheckerboardSpec + printable PDF/SVG/PNG (no external deps)
 │   ├── intrinsics.py          # CAPTURE_POSES, detect_checkerboard, calibrate_intrinsics, IntrinsicsSessionStore
@@ -132,7 +133,7 @@ towersightai/
 ├── diagnostics.py             # DiagnosticsService: settings/hailo/image/camera/plc/full smoke
 └── runtime_logging.py         # runtime log config, credential redaction, run IDs, run-status files
 
-tests/          # 344 hardware-free unit/UI/fake-data tests
+tests/          # 449 hardware-free unit/UI/fake-data tests (conftest forces QT_QPA_PLATFORM=offscreen)
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
 vehicle_box_test/  # 3D vehicle-box LAB (not a pytest suite, not imported by towersightai/)
 data/samples/   # sanitized sample images (test-car.png)
@@ -401,6 +402,17 @@ default lane/stop guides outside calibration mode; error/NG states can never use
 - `LD2410_TCP_ENABLED=true` accepts **one** ESP32 client sending raw LD2410 frames (`F4 F3 F2 F1` header).
   Each `person_sample` embeds the newest frame at or before the sample time: ≤1 s = `fresh`, older buffered =
   `stale`, none = `unavailable`; future frames are never selected.
+- **Hailo failure evidence → NAS** (`storage/hailo_incident.py`, 2026-09-17): when the health monitor turns
+  `degraded`/`error`, `HailoIncidentReporter` (run on the health worker thread) collects read-only evidence —
+  PCIe link speed + AER counters for endpoint and upstream port, driver/device node, device holders, kernel
+  messages, a **frozen tail copy** of the runtime log, the newest inference child log — and uploads it to
+  `<SYNOLOGY_NAS_FOLDER>/hailo-incidents/<host>-<UTC stamp>/`. One bundle per transition into a bad status,
+  then at most one per `HAILO_INCIDENT_MIN_INTERVAL_SECONDS` (default 1800) while it stays bad. It runs only
+  when `RAW_DATA_ENABLED=true` **and** `HAILO_INCIDENT_UPLOAD_ENABLED=true` **and** a NAS host is set, so an
+  unconfigured or test host can never make the health thread dial out. Every health snapshot also becomes a
+  `hailo_health` row in the daily JSONL (durable; healthy rows thinned to one per 10 min, every bad row kept)
+  so the archived day carries the failure timeline. Read-only and diagnostic only: nothing here removes,
+  rescans, reloads, kills, or restarts anything, and it never touches the safety gate.
 - Radar raw logging (spec `docs/implementation/radar-raw-logging.md`, 2026-09-10): `RawDataManager.tick()` also
   records a 1 Hz `ld2410_sample` (provider snapshot minus `raw_hex`; `fresh` always, `stale` only on a new
   `received_at`, `unavailable` never, provider error once) and drives `RadarWindowTracker`
