@@ -2339,7 +2339,7 @@ class OperatorWindow(QMainWindow):
         if camera is not None:
             self._camera_page_layouts["지면 기준점"] = f"single:{camera.role.value}"
             page = self.operator_pages.get("지면 기준점")
-            if page is not None and self.operator_stack.currentWidget() is page:
+            if page is not None and self.operator_workspace_stack.currentWidget() is page:
                 self._adopt_camera_area(page, self._camera_page_layouts["지면 기준점"])
             self._show_ground_saved(camera.id)
 
@@ -3916,7 +3916,11 @@ class OperatorWindow(QMainWindow):
             self.grid.setColumnStretch(0, 1)
             self.grid.setColumnStretch(1, 1)
         self.grid.setRowStretch(0, 1)
-        self.grid.setRowStretch(1, 0 if mode == "front" else 1)
+        # Single-tile layouts only fill row 0. Leaving row 1 stretched gave the empty row half
+        # the height, so the calibration and ground-reference tiles came out ~150 px tall —
+        # far too small to click a pallet corner on (found 2026-09-17).
+        single = mode == "front" or mode.startswith("single:")
+        self.grid.setRowStretch(1, 0 if single else 1)
 
     def _toggle_purpose_inference(self, task_id: str) -> None:
         if self._purpose_task_enabled and self._purpose_task_id == task_id:

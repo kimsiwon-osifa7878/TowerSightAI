@@ -2631,6 +2631,23 @@ def _ground_clicks(camera_xyz, *, stopper_x=-2400.0):
     return [(float(x) / 1920, float(y) / 1080) for x, y in projected.reshape(-1, 2)]
 
 
+def test_single_tile_layouts_do_not_leave_an_empty_row_stretched(monkeypatch, tmp_path: Path):
+    """A stretched empty row halved the tile, leaving ~150 px to click a pallet corner on."""
+    app, window = _calibration_window(monkeypatch, tmp_path)
+
+    for page, expected_role in (("지면 기준점", CameraRole.rear_side), ("카메라 캘리브레이션", CameraRole.rear_side)):
+        window._show_operator_page(page)
+        app.processEvents()
+        assert window._camera_page_layouts[page] == f"single:{expected_role.value}"
+        assert window.grid.rowStretch(0) == 1
+        assert window.grid.rowStretch(1) == 0  # nothing lives in row 1 for a single tile
+
+    window._show_operator_page("전체 카메라")
+    app.processEvents()
+    assert window.grid.rowStretch(1) == 1  # the multi-camera grid really does use both rows
+    window.close()
+
+
 def test_ground_page_solves_the_camera_pose_from_five_clicks(monkeypatch, tmp_path: Path):
     """Four pallet corners plus the stopper landmark — no hand-typed coordinates anywhere."""
     app, window = _calibration_window(monkeypatch, tmp_path)
