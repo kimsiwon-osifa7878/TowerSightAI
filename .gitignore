@@ -16,7 +16,10 @@ refers/
 data/operator-settings.json
 data/field-media/*
 !data/field-media/README.md
-data/calibration/intrinsics/
+# Calibration: the measurement *results* are small text and belong in version control so the
+# site device can get them with a pull. The capture sessions (hundreds of PNG frames) do not.
+data/calibration/intrinsics/sessions/
+data/calibration/**/*-verify.png
 data/calibration/checkerboard/
 data/analysis/
 

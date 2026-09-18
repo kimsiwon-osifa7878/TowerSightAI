@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import signal
+import socket
 import sys
 import time
 from collections import deque
@@ -48,6 +49,14 @@ from towersightai.sensors.ld2410 import LD2410Frame, LD2410TCPService
 from towersightai.storage.connection_test import NasConnectionTestResult, run_nas_connection_test
 from towersightai.storage.file_transfer import NasFileTransferResult, upload_files_to_nas
 from towersightai.calibration.checkerboard import CheckerboardSpec
+from towersightai.calibration.share import (
+    CalibrationEntry,
+    CalibrationShareResult,
+    fetch_calibration,
+    list_remote_calibration,
+    local_entries,
+    publish_calibration,
+)
 from towersightai.calibration.ground import (
     REQUIRED_CORNERS,
     GroundCalibrationStore,
@@ -1102,6 +1111,57 @@ class NasFileTransferWorker(QObject):
         self.finished.emit()
 
 
+class CalibrationShareWorker(QObject):
+    """Publish or fetch calibration measurements over SFTP, off the UI thread.
+
+    Sharing a measurement never changes safety state: the files stay `reviewed: false` and
+    `safe_to_operate: false` wherever they land.
+    """
+
+    status_changed = pyqtSignal(str)
+    result_ready = pyqtSignal(object)
+    listing_ready = pyqtSignal(object)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        mode: str,  # "publish" | "list" | "fetch"
+        config,  # noqa: ANN001 - RawStorageConfig
+        root: Path,
+        entries: tuple = (),
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.mode = mode
+        self.config = config
+        self.root = Path(root)
+        self.entries = tuple(entries)
+
+    def run(self) -> None:
+        logger = logging.getLogger("towersightai.calibration.share")
+        try:
+            if self.mode == "publish":
+                def progress(index: int, total: int, name: str) -> None:
+                    self.status_changed.emit(f"NAS 공유: ({index}/{total}) {name}")
+
+                result = publish_calibration(self.config, self.root, progress=progress)
+                self.result_ready.emit(result)
+            elif self.mode == "list":
+                self.status_changed.emit("NAS에서 측정 파일 목록을 읽는 중")
+                self.listing_ready.emit(list_remote_calibration(self.config))
+            else:
+                def progress(index: int, total: int, name: str) -> None:
+                    self.status_changed.emit(f"NAS에서 가져오는 중: ({index}/{total}) {name}")
+
+                result = fetch_calibration(self.config, self.entries, self.root, progress=progress)
+                self.result_ready.emit(result)
+        except Exception as exc:  # noqa: BLE001 - never let a network error kill the console
+            logger.exception("calibration-share-failed mode=%s", self.mode)
+            self.result_ready.emit(CalibrationShareResult(False, "공유 작업 실패", error=str(exc)))
+        finally:
+            self.finished.emit()
+
+
 class NasConnectionTestWorker(QObject):
     """Encode the collected preview frames and write one test payload to the NAS.
 
@@ -1356,6 +1416,9 @@ class OperatorWindow(QMainWindow):
         self._calib_timer: QTimer | None = None
         self._calib_detect_thread: QThread | None = None
         self._calib_detect_worker: CheckerboardDetectWorker | None = None
+        self._calib_sharing = False
+        self._calib_share_threads: list[QThread] = []
+        self._calib_share_workers: list[object] = []
         self._ground_points: list[tuple[float, float]] = []
         self._ground_result: GroundPoseResult | None = None
         self._ground_picking = False
@@ -2155,6 +2218,18 @@ class OperatorWindow(QMainWindow):
         self.calibration_stop_button = QPushButton("세션 종료")
         self.calibration_stop_button.clicked.connect(self._stop_calibration_session)
         controls.addWidget(self.calibration_stop_button)
+        self.calibration_share_button = QPushButton("NAS로 공유")
+        self.calibration_share_button.setToolTip(
+            "이 장비에서 측정한 렌즈·지면 값을 NAS에 올려 현장 장비가 가져갈 수 있게 합니다. 측정 파일 전송일 뿐입니다."
+        )
+        self.calibration_share_button.clicked.connect(self._publish_calibration)
+        controls.addWidget(self.calibration_share_button)
+        self.calibration_fetch_button = QPushButton("NAS에서 가져오기")
+        self.calibration_fetch_button.setToolTip(
+            "다른 장비가 올린 측정값을 내려받습니다. 체커보드를 들 수 없는 현장 장비에서 씁니다."
+        )
+        self.calibration_fetch_button.clicked.connect(self._fetch_calibration)
+        controls.addWidget(self.calibration_fetch_button)
         self.calibration_verify_button = QPushButton("결과 확인")
         self.calibration_verify_button.setToolTip(
             "저장된 측정값으로 현재 화면의 왜곡을 보정해 원본과 나란히 보여줍니다. 확인 전용이며 최종 OK와 무관합니다."
@@ -2469,17 +2544,28 @@ class OperatorWindow(QMainWindow):
             if self.settings is not None
             else DEFAULT_INTRINSICS_ROOT
         )
+        host = socket.gethostname()
         own = Path(root) / f"{camera_id}.json"
         if own.is_file():
             try:
-                return result_from_dict(load_intrinsics(own)), camera_id, False
+                result = result_from_dict(load_intrinsics(own))
             except (OSError, ValueError, KeyError):
-                pass
+                result = None
+            if result is not None:
+                # A file shared from another machine keeps its original source_host. Saying
+                # "자체 측정값" for it would hide that it came from a different camera unit.
+                if result.source_host and result.source_host != host:
+                    return result, result.source_host, True
+                return result, camera_id, False
         for path in sorted(Path(root).glob("*.json")):
             try:
-                return result_from_dict(load_intrinsics(path)), path.stem, True
+                result = result_from_dict(load_intrinsics(path))
             except (OSError, ValueError, KeyError):
                 continue
+            origin = path.stem
+            if result.source_host and result.source_host != host:
+                origin = f"{path.stem}@{result.source_host}"
+            return result, origin, True
         return None, "", False
 
     def _solve_ground_pose(self) -> None:
@@ -2492,7 +2578,8 @@ class OperatorWindow(QMainWindow):
         intrinsics, source, borrowed = self._ground_intrinsics(camera.id)
         if intrinsics is None:
             self._set_ground_status(
-                "렌즈 내부 파라미터가 없습니다. 먼저 카메라 캘리브레이션에서 체커보드를 측정해 주세요"
+                "렌즈 내부 파라미터가 없습니다. 카메라 캘리브레이션에서 체커보드를 측정하거나, "
+                "그 페이지의 'NAS에서 가져오기'로 다른 장비 측정값을 받아 오세요"
             )
             self._stop_ground_picking()
             return
@@ -4339,6 +4426,8 @@ class OperatorWindow(QMainWindow):
             ("calibration_stop_button", running and not calibrating),
             ("calibration_camera_box", not running and not calibrating),
             ("calibration_verify_button", not calibrating),
+            ("calibration_share_button", not calibrating and not self._calib_sharing),
+            ("calibration_fetch_button", not calibrating and not self._calib_sharing),
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -4613,6 +4702,105 @@ class OperatorWindow(QMainWindow):
         head = f"[{self.CALIBRATION_GRADE_TEXT.get(grade, grade)}] {result.summary()}"
         label.setText(head + "\n" + "\n".join(lines))
         self._log_calibration(f"품질 {grade}: " + " / ".join(lines))
+
+
+    # ---- 캘리브레이션 공유 (NAS) -----------------------------------------------------------
+    #
+    # 체커보드는 현장에서 들 수 없다. 개발기에서 측정한 렌즈 값을 NAS에 올려 현장기가 가져간다.
+    # 가져온 파일은 원래 측정 장비 이름을 그대로 유지하므로, 아래 `_intrinsics_for_camera`가
+    # 이 장비 것이 아님을 알아보고 '빌려 씀'으로 표시한다.
+
+    def _calibration_root(self) -> Path:
+        return Path(
+            self.settings.calibration_path.parent if self.settings is not None else Path("data/calibration")
+        )
+
+    def _nas_config(self):  # noqa: ANN201 - RawStorageConfig | None
+        raw = getattr(self.settings, "raw_storage", None) if self.settings is not None else None
+        if raw is None or not getattr(raw, "nas_host", ""):
+            return None
+        return raw
+
+    def _start_calibration_share(self, mode: str, entries: tuple = ()) -> None:
+        config = self._nas_config()
+        if config is None:
+            self._set_calibration_status("NAS 설정(SYNOLOGY_NAS_*)이 없어 공유할 수 없습니다")
+            return
+        self._calib_sharing = True
+        self._refresh_calibration_buttons()
+        thread = QThread(self)
+        worker = CalibrationShareWorker(mode, config, self._calibration_root(), entries)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.status_changed.connect(self._set_calibration_status)
+        worker.result_ready.connect(self._on_calibration_share_result)
+        worker.listing_ready.connect(self._on_calibration_listing)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(
+            lambda worker=worker, thread=thread: self._cleanup_calibration_share(thread, worker)
+        )
+        self._calib_share_threads.append(thread)
+        self._calib_share_workers.append(worker)
+        thread.start()
+
+    def _cleanup_calibration_share(self, thread: QThread, worker: object) -> None:
+        if thread in self._calib_share_threads:
+            self._calib_share_threads.remove(thread)
+        if worker in self._calib_share_workers:
+            self._calib_share_workers.remove(worker)
+        if not self._calib_share_workers:
+            self._calib_sharing = False
+            self._refresh_calibration_buttons()
+
+    def _publish_calibration(self, checked: bool = False) -> None:
+        del checked
+        if not self._operator_unlocked or self._calib_sharing:
+            return
+        entries = local_entries(self._calibration_root())
+        if not entries:
+            self._set_calibration_status("공유할 측정 파일이 없습니다. 먼저 촬영하고 측정 실행을 누르세요")
+            return
+        self._log_calibration(f"NAS 공유 시작 {len(entries)}개: " + ", ".join(e.label for e in entries))
+        self._start_calibration_share("publish")
+
+    def _fetch_calibration(self, checked: bool = False) -> None:
+        del checked
+        if not self._operator_unlocked or self._calib_sharing:
+            return
+        self._start_calibration_share("list")
+
+    def _on_calibration_listing(self, entries) -> None:  # noqa: ANN001 - tuple[CalibrationEntry, ...]
+        host = socket.gethostname()
+        offered = [entry for entry in entries if entry.source_host != host]
+        if not offered:
+            self._set_calibration_status("NAS에 다른 장비가 올린 측정 파일이 없습니다")
+            self._log_calibration("NAS 가져오기: 받을 것이 없음")
+            return
+        # 카메라·종류별로 가장 최근 것 하나씩만 가져온다 (목록은 최신순).
+        latest: dict[tuple[str, str], object] = {}
+        for entry in offered:
+            latest.setdefault((entry.kind, entry.camera_id), entry)
+        chosen = tuple(latest.values())
+        self._log_calibration(
+            f"NAS 가져오기 {len(chosen)}개: " + ", ".join(entry.describe(local_host=host) for entry in chosen)
+        )
+        self._start_calibration_share("fetch", chosen)
+
+    def _on_calibration_share_result(self, result) -> None:  # noqa: ANN001 - CalibrationShareResult
+        if result.ok:
+            self._set_calibration_status(result.summary)
+        else:
+            self._set_calibration_status(f"{result.summary}: {result.error}" if result.error else result.summary)
+        self._log_calibration(f"공유 결과 ok={result.ok} {result.summary} {result.error}".strip())
+        camera = self._calibration_camera()
+        if camera is not None:
+            self._show_calibration_saved(camera.id)
+
+    def _show_calibration_saved(self, camera_id: str) -> None:
+        """Refresh the quality panel from whatever measurement is on disk for this camera."""
+        result = self._latest_intrinsics_result(camera_id)
+        if result is not None:
+            self._show_calibration_quality(result)
 
     def _latest_intrinsics_result(self, camera_id: str) -> IntrinsicsResult | None:
         root = (

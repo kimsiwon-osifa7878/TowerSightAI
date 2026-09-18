@@ -278,6 +278,9 @@ class IntrinsicsResult:
     measured_at: str
     calibration_seconds: float
     sample_paths: tuple[str, ...] = field(default_factory=tuple)
+    #: Host that ran the measurement. Kept on the result so a file shared to another machine
+    #: can be shown as borrowed instead of passing for that camera's own measurement.
+    source_host: str = ""
     # A measurement file is evidence for review, never authorization.
     reviewed: bool = False
 
@@ -332,7 +335,7 @@ class IntrinsicsResult:
             "horizontal_fov_degrees": round(self.horizontal_fov_degrees, 2),
             "measured_at": self.measured_at,
             "calibration_seconds": round(self.calibration_seconds, 3),
-            "source_host": socket.gethostname(),
+            "source_host": self.source_host or socket.gethostname(),
             "sample_paths": list(self.sample_paths),
             "reviewed": self.reviewed,
             "safe_to_operate": False,
@@ -370,6 +373,10 @@ class IntrinsicsResult:
         edges = len(edge_poses & set(self.pose_keys))
         mark = "✔" if edges >= 5 else ("△" if edges >= 3 else "✘")
         lines.append(f"{mark} 가장자리 자세 {edges}/8 (왜곡은 가장자리에서 결정됩니다)")
+
+        local_host = socket.gethostname()
+        if self.source_host and self.source_host != local_host:
+            lines.append(f"△ 이 장비가 아니라 {self.source_host}에서 측정한 값입니다 (같은 기종이면 사용 가능)")
 
         tilts = len({"tilt_h", "tilt_v"} & set(self.pose_keys))
         mark = "✔" if tilts == 2 else ("△" if tilts == 1 else "✘")
@@ -565,5 +572,6 @@ def result_from_dict(data: Mapping[str, Any]) -> IntrinsicsResult:
         measured_at=str(data.get("measured_at", "")),
         calibration_seconds=float(data.get("calibration_seconds", 0.0)),
         sample_paths=tuple(str(v) for v in data.get("sample_paths", ())),
+        source_host=str(data.get("source_host", "")),
         reviewed=bool(data.get("reviewed", False)),
     )

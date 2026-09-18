@@ -120,7 +120,8 @@ towersightai/
 ├── calibration/
 │   ├── checkerboard.py        # CheckerboardSpec + printable PDF/SVG/PNG (no external deps)
 │   ├── intrinsics.py          # CAPTURE_POSES, detect_checkerboard, calibrate_intrinsics, IntrinsicsSessionStore
-│   └── ground.py              # extrinsics: 4 clicked pallet corners + stopper landmark → camera pose
+│   ├── ground.py              # extrinsics: 4 clicked pallet corners + stopper landmark → camera pose
+│   └── share.py               # publish/fetch calibration results through the NAS (bench → site)
 ├── sensors/ld2410.py          # LD2410 binary frame parser, ring buffer, one-client TCP service
 ├── analyze/                   # OFFLINE analysis dashboard (dev/verification only, never runs on site):
 │   ├── config.py              #   sites.json (per-site NAS address), AnalysisPaths under data/analysis/
@@ -357,7 +358,17 @@ orange stopper frame — that landmark fixes which end is the entry without any 
 `calibration/ground.py` undistorts the clicks, tries every corner assignment, keeps the best reprojection
 and reports where the camera sits and how it points **relative to the pallet**, with the projected pallet
 and a 500 mm grid drawn over the live tile to judge the fit; saved to `data/calibration/ground/<camera>.json`,
-`reviewed=false`, `safe_to_operate=false`),
+`reviewed=false`, `safe_to_operate=false`).
+**Sharing between machines**: the checkerboard can only be held in front of a camera on the bench, so the site
+device cannot measure intrinsics and the `지면 기준점` page refuses to solve without them. `calibration/share.py`
+publishes the *result* JSONs (never the capture sessions) to
+`${SYNOLOGY_NAS_FOLDER}/calibration/<source_host>/<kind>/<camera>.json` over the archive's strict-host-key SFTP
+with SHA-256 verification and atomic `.part`→rename, and fetches them back on the other machine; `NAS로 공유` /
+`NAS에서 가져오기` on the 카메라 캘리브레이션 page drive it off-thread. A fetched file keeps its original
+`source_host`, and `reviewed`/`safe_to_operate` are forced false on arrival whatever the file claims — so a bench
+measurement is labelled `△ 이 장비가 아니라 …에서 측정한 값` instead of passing as this camera's own. The same
+result JSONs are now tracked in git (`data/calibration/intrinsics/sessions/` and `*-verify.png` stay ignored), so
+a `git pull` is the second route,
 `시스템 점검` (DiagnosticsService off-thread + Hailo 장치 상태 패널), `실행 로그` (runtime log tail + filter), `주차 프로세스 테스트`
 (driver-stage playback + `차량 진입 시뮬레이션`). Camera pages share ONE camera grid
 (`operator_camera_area`) that `_adopt_camera_area` reparents into the active page with an `all` or `front`

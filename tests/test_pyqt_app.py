@@ -1,4 +1,5 @@
 import os
+import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -2645,6 +2646,88 @@ def test_single_tile_layouts_do_not_leave_an_empty_row_stretched(monkeypatch, tm
     window._show_operator_page("전체 카메라")
     app.processEvents()
     assert window.grid.rowStretch(1) == 1  # the multi-camera grid really does use both rows
+    window.close()
+
+
+def test_calibration_page_shares_and_fetches_measurements_over_nas(monkeypatch, tmp_path: Path):
+    """The checkerboard cannot be held up on site, so the bench measurement has to travel."""
+    from towersightai.calibration.share import CalibrationEntry, CalibrationShareResult
+    from towersightai.ui import pyqt_app
+
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    _write_intrinsics(tmp_path / "intrinsics", "rear_side")
+
+    def drain() -> None:
+        """QThread.start is stubbed in these tests; run the queued worker inline instead."""
+        while window._calib_share_workers:
+            worker = window._calib_share_workers[0]
+            thread = window._calib_share_threads[0]
+            worker.run()
+            app.processEvents()
+            window._cleanup_calibration_share(thread, worker)
+
+    published: dict = {}
+
+    def fake_publish(config, root, **kw):
+        published["root"] = Path(root)
+        return CalibrationShareResult(True, "1개 측정 파일을 NAS에 올렸습니다 (bench-pc)")
+
+    monkeypatch.setattr(pyqt_app, "publish_calibration", fake_publish)
+    window.calibration_share_button.click()
+    app.processEvents()
+    drain()
+
+    assert published["root"] == tmp_path  # the calibration root, not the whole data dir
+    assert "NAS에 올렸습니다" in window.calibration_status_label.text()
+    assert window.model.can_show_final_ok is False
+
+    # Fetching: only another machine's measurements are offered, newest per camera.
+    offered = (
+        CalibrationEntry("intrinsics", "front", "bench-pc", "2026-09-17T00:00:00", "good", 10, "a",
+                         remote_path="/r/front.json"),
+        CalibrationEntry("intrinsics", "front", "bench-pc", "2026-09-10T00:00:00", "poor", 10, "b",
+                         remote_path="/old/front.json"),
+        CalibrationEntry("intrinsics", "front", socket.gethostname(), "2026-09-18T00:00:00", "good", 10, "c",
+                         remote_path="/mine/front.json"),
+    )
+    monkeypatch.setattr(pyqt_app, "list_remote_calibration", lambda config: offered)
+    fetched: dict = {}
+
+    def fake_fetch(config, entries, root, **kw):
+        fetched["entries"] = tuple(entries)
+        return CalibrationShareResult(True, "1개 측정 파일을 가져왔습니다.")
+
+    monkeypatch.setattr(pyqt_app, "fetch_calibration", fake_fetch)
+    window.calibration_fetch_button.click()
+    app.processEvents()
+    drain()
+
+    picked = fetched["entries"]
+    assert len(picked) == 1
+    assert picked[0].sha256 == "a"  # newest of the other machine's, never our own file
+    assert "가져왔습니다" in window.calibration_status_label.text()
+    assert window.model.can_show_final_ok is False
+    window.close()
+
+
+def test_intrinsics_measured_on_another_machine_are_labelled_borrowed(monkeypatch, tmp_path: Path):
+    """A shared file must not pass for this camera's own measurement."""
+    import json
+
+    app, window = _calibration_window(monkeypatch, tmp_path)
+    root = tmp_path / "intrinsics"
+    _write_intrinsics(root, "rear_side")
+    payload = json.loads((root / "rear_side.json").read_text(encoding="utf-8"))
+    payload["source_host"] = "some-other-bench"
+    (root / "rear_side.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result, source, borrowed = window._ground_intrinsics("rear_side")
+    assert result is not None
+    assert borrowed is True
+    assert source == "some-other-bench"
+
+    _grade, lines = result.quality_report()
+    assert any("some-other-bench" in line for line in lines)
     window.close()
 
 
