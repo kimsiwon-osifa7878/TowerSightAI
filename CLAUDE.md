@@ -24,6 +24,8 @@ Source-of-truth documents, in priority order:
 | `README.md` | Usage-focused operator manual (Korean): install, run, console pages, troubleshooting |
 | `docs/implementation/*.md` | Per-area guides (architecture, camera/config, hailo, ai-stages, ui/calibration, testing, roadmap) |
 | `docs/hailo8-ubuntu-installation.md` | Verified Ubuntu 24.04 + Hailo-8 install path (Korean) |
+| `docs/field-log-2026-09-analysis.md` | 2026-09 분석 대시보드·현장 검증 기록: 타임라인, 결정 이유, 현장 증거, 오독 교훈, 미해결 (Korean) |
+| `docs/implementation/field-status-2026-09.md` | 현장 사건 연표, 원인 가설(전원/커널/접점)과 판단 순서, 복구·배포 절차, 미해결 항목 (인수인계용) |
 
 `refers/` is hardware-tested reference code (legacy TAPPAS `hailopython` experiments, LD2410 experiments,
 `multi_stream_detection_rtsp.sh`). **Do not edit it** unless explicitly asked, and never copy its hardcoded
@@ -134,7 +136,7 @@ towersightai/
 ├── diagnostics.py             # DiagnosticsService: settings/hailo/image/camera/plc/full smoke
 └── runtime_logging.py         # runtime log config, credential redaction, run IDs, run-status files
 
-tests/          # 450 hardware-free unit/UI/fake-data tests (conftest forces QT_QPA_PLATFORM=offscreen)
+tests/          # 489 hardware-free unit/UI/fake-data tests (conftest forces offscreen + per-test gc)
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
 *_autorun.sh    # boot autostart: systemd *user* service (GUI needs graphical-session.target)
 vehicle_box_test/  # 3D vehicle-box LAB (not a pytest suite, not imported by towersightai/)
@@ -367,9 +369,8 @@ publishes the *result* JSONs (never the capture sessions) to
 with SHA-256 verification and atomic `.part`→rename, and fetches them back on the other machine; `NAS로 공유` /
 `NAS에서 가져오기` on the 카메라 캘리브레이션 page drive it off-thread. A fetched file keeps its original
 `source_host`, and `reviewed`/`safe_to_operate` are forced false on arrival whatever the file claims — so a bench
-measurement is labelled `△ 이 장비가 아니라 …에서 측정한 값` instead of passing as this camera's own. The same
-result JSONs are now tracked in git (`data/calibration/intrinsics/sessions/` and `*-verify.png` stay ignored), so
-a `git pull` is the second route,
+measurement is labelled `△ 이 장비가 아니라 …에서 측정한 값` instead of passing as this camera's own. The NAS is
+the **only** route: result JSONs are gitignored (see §12 — a tracked copy blocked the site `git pull` on 2026-09-21),
 `시스템 점검` (DiagnosticsService off-thread + Hailo 장치 상태 패널), `실행 로그` (runtime log tail + filter), `주차 프로세스 테스트`
 (driver-stage playback + `차량 진입 시뮬레이션`). Camera pages share ONE camera grid
 (`operator_camera_area`) that `_adopt_camera_area` reparents into the active page with an `all` or `front`
