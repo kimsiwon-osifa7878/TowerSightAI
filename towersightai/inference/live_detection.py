@@ -613,15 +613,29 @@ def _redact_rtsp_credentials(text: str) -> str:
     return re.sub(r"(rtsp://)([^@\s/]+)@", r"\1***:***@", text)
 
 
+# HailoRT/GStreamer warnings contain "Failed"/"error" too (e.g. "[HailoRT] [warning] Failed to
+# acquire buffer because the buffer pool is empty"). They are symptoms, not the failure, and when
+# they are the newest matching lines they used to become the whole operator message and hide the
+# real cause. Errors win; warnings are shown only when nothing else explains the stop.
+_WARNING_MARKERS = ("[warning]", "WARNING |", "warning:", " WARN ")
+
+
+def _is_warning_line(line: str) -> bool:
+    lowered = line.lower()
+    return any(marker.lower() in lowered for marker in _WARNING_MARKERS)
+
+
 def _extract_error_lines(log_tail: str, *, limit: int = 3) -> str:
-    """Prefer the actual ERROR lines over pipeline-string noise in operator-facing text."""
+    """Prefer the actual ERROR lines over warnings and pipeline-string noise."""
     markers = ("ERROR", "Bad Request", "error", "failed", "Failed")
-    lines = [
-        line.strip()
-        for line in log_tail.splitlines()
-        if any(marker in line for marker in markers) and "PIPELINE_" not in line
-    ]
-    return " · ".join(lines[-limit:])
+    errors: list[str] = []
+    warnings: list[str] = []
+    for raw_line in log_tail.splitlines():
+        line = raw_line.strip()
+        if "PIPELINE_" in line or not any(marker in line for marker in markers):
+            continue
+        (warnings if _is_warning_line(line) else errors).append(line)
+    return " · ".join((errors or warnings)[-limit:])
 
 
 def _with_device_conflict(message: str, log_tail: str) -> str:

@@ -268,3 +268,24 @@ def test_fatal_message_prefers_error_lines_and_explains_a_held_device(tmp_path, 
 
     log.write_text("rtspsrc ... ! hailonet\nCaught SIGSEGV\n", encoding="utf-8")
     assert live_detection._fatal_log_message(log) == "Caught SIGSEGV" or "SIGSEGV" in live_detection._fatal_log_message(log)
+
+
+def test_warning_lines_never_hide_the_real_error(tmp_path):
+    """A HailoRT buffer-pool warning is a symptom; it must not become the whole message."""
+    from towersightai.inference import live_detection
+
+    log = tmp_path / "child.gst.log"
+    log.write_text(
+        "[HailoRT] [error] CHECK failed - Failed to create vdevice\n"
+        "[HailoRT] [warning] Failed to acquire buffer because the buffer pool is empty.\n"
+        "[HailoRT] [warning] Failed to acquire buffer because the buffer pool is empty.\n",
+        encoding="utf-8",
+    )
+    message = live_detection._process_error_message(1, log)
+    assert "Failed to create vdevice" in message
+    assert "buffer pool" not in message
+
+    # With nothing but warnings the operator still sees them, labelled as warnings.
+    log.write_text("[HailoRT] [warning] Failed to acquire buffer because the buffer pool is empty.\n", encoding="utf-8")
+    only_warning = live_detection._process_error_message(1, log)
+    assert "buffer pool" in only_warning and "[warning]" in only_warning
