@@ -84,6 +84,10 @@
   대책: 녹화기에도 PDEATHSIG+ppid 감시+정지 5초 강제 종료, 400 재시도 10초 대기, 감시 자동 시작은
   카메라 집합 4초 안정 후 1회 실행 + 실패 시 30/60/120초 백오프, 상태 모니터가 고아 녹화기도 표시.
   **UI가 비정상 종료되면 `ss -tn | grep :554`와 `fuser /dev/hailo0`부터 확인.**
+- **2026-09-21 캘리브레이션 결과는 git에 넣지 않는다(사고 후 확정)**: 결과 JSON을 저장소에 커밋했더니
+  현장기의 자체 측정 파일과 충돌해 `git pull`이 막혔다. 공유 경로는 처음부터 NAS(`calibration/share.py`)이며
+  장비마다 측정값이 다르므로 git은 맞지 않는다. `data/calibration/{intrinsics,ground,checkerboard}/`를
+  .gitignore에 넣고 `tests/test_repo_hygiene.py`가 재발을 막는다.
 - **2026-09-21 부팅 자동 실행 서비스 추가**: 9/18과 9/19~21에 각각 3시간, 45시간 감시 공백이 났는데
   원인은 같았다. 재부팅 후 앱을 사람이 켜야 했다. `install/uninstall/start/stop_autorun.sh`로
   systemd **사용자** 서비스를 등록한다(GUI라 `graphical-session.target`에 붙임, `Restart=always`,

@@ -16,14 +16,14 @@ refers/
 data/operator-settings.json
 data/field-media/*
 !data/field-media/README.md
-# Calibration: the measurement *results* are small text and belong in version control so the
-# site device can get them with a pull. The capture sessions (hundreds of PNG frames) do not.
-data/calibration/intrinsics/sessions/
-# 캘리브레이션 결과는 git이 아니라 NAS로 공유한다(towersightai/calibration/share.py).
-# 저장소에 넣으면 장비마다 다른 현장 측정값과 충돌해 git pull이 막힌다.
+# Calibration results travel over the NAS (towersightai/calibration/share.py), never through git.
+# Each machine measures its own site, so a tracked result file collides with the local
+# measurement and makes `git pull` abort on the field device (that happened on 2026-09-21).
+# tests/test_repo_hygiene.py enforces this.
+data/calibration/intrinsics/
 data/calibration/ground/
-data/calibration/**/*-verify.png
 data/calibration/checkerboard/
+data/calibration/**/*-verify.png
 data/analysis/
 
 # 차량 감지 검증 랩 (vehicle_box_test/) — 코드만 추적, 내려받은 현장 미디어/산출물은 제외

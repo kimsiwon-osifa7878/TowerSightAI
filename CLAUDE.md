@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **467 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **472 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -460,7 +460,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 467 passed, hardware-free
+pytest -q                                     # 472 passed, hardware-free
 ./install_autorun.sh | ./start_autorun.sh | ./stop_autorun.sh | ./uninstall_autorun.sh  # 부팅 자동 실행 등록/시작/중지/해제
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
@@ -607,4 +607,10 @@ state, AI, or PLC contract exists for it yet.
   raw enhancement (`ld2410_sample` / `radar_window_*`) is deployed, radar episodes come only from
   `person_sample.ld2410` and are flagged `partial`. Days are keyed by `(source_host, day)`; host roles (현장/개발) live in `sites.json` and the dashboard
   shows field hosts only by default.
+- **Calibration results never go into git.** They travel over the NAS (`calibration/share.py`,
+  `<folder>/calibration/<source_host>/<kind>/<camera>.json`). Each machine measures its own site, so a
+  tracked result collides with the local file and makes `git pull` abort on the field device with
+  "untracked working tree files would be overwritten" (that blocked the site box on 2026-09-21).
+  `data/calibration/{intrinsics,ground,checkerboard}/` are gitignored and `tests/test_repo_hygiene.py`
+  fails if any `data/calibration/**.json` becomes tracked again.
 - Korean UI strings are part of the contract; keep the exact labels tests assert on.
