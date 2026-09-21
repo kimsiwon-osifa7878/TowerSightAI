@@ -188,3 +188,28 @@ def test_quality_report_lists_every_check():
     joined = "\n".join(lines)
     for expected in ("되맞춤 오차", "카메라 높이", "수평 거리", "위치", "방향", "내부 파라미터"):
         assert expected in joined
+
+
+def test_a_ground_pose_records_which_installation_it_describes():
+    """The pose belongs to that camera at that site, not to whichever machine holds the file.
+
+    The offline lab analyses site images on the bench, so a pose measured on the site device has
+    to stay usable there — it is labelled, not downgraded.
+    """
+    import socket
+    from dataclasses import replace
+
+    corners, stopper = _clicks(SIDE_CAMERA)
+    mine = _solve(corners, stopper)
+    assert mine.foreign is False
+    assert mine.quality == "good"
+
+    theirs = replace(mine, source_host="site-pc")
+    assert theirs.foreign is True
+    assert theirs.quality == "good"  # measured elsewhere is not measured badly
+    _grade, lines = theirs.quality_report()
+    assert any("site-pc" in line and "찍은 영상에 쓰는 값" in line for line in lines)
+
+    # Saving keeps whichever host actually measured it, and reloading preserves that.
+    assert replace(mine, source_host="").to_dict()["source_host"] == socket.gethostname()
+    assert result_from_dict(theirs.to_dict()).source_host == "site-pc"

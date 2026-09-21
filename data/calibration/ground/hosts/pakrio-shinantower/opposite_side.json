@@ -1,0 +1,80 @@
+{
+  "camera_id": "opposite_side",
+  "camera_position_mm": [
+    -2410.7375364893787,
+    -3444.449996362842,
+    2392.7628568242894
+  ],
+  "corner_points_normalized": [
+    [
+      0.0819935691318328,
+      0.30857142857142855
+    ],
+    [
+      0.6784565916398714,
+      0.23714285714285716
+    ],
+    [
+      0.8295819935691319,
+      0.4542857142857143
+    ],
+    [
+      0.10610932475884244,
+      0.7342857142857143
+    ]
+  ],
+  "corner_world_mm": [
+    [
+      -2675.0,
+      1100.0
+    ],
+    [
+      2675.0,
+      1100.0
+    ],
+    [
+      2675.0,
+      -1100.0
+    ],
+    [
+      -2675.0,
+      -1100.0
+    ]
+  ],
+  "image_height": 1080,
+  "image_width": 1920,
+  "intrinsics_borrowed": true,
+  "intrinsics_camera_id": "erumtni-NucBox-G3",
+  "kind": "camera_ground_pose",
+  "measured_at": "2026-09-18T09:37:13.649333+00:00",
+  "orientation_degrees": {
+    "pan": 50.424100538922204,
+    "roll": 12.405240095749736,
+    "tilt": 36.24586443675977
+  },
+  "pallet": {
+    "length_mm": 5350.0,
+    "width_mm": 2200.0
+  },
+  "quality": "acceptable",
+  "residual_mm": 50.111614339085584,
+  "reviewed": false,
+  "rotation_degrees": 0,
+  "rvec": [
+    2.2056765687290665,
+    -0.4713962224724836,
+    0.5280581383020861
+  ],
+  "safe_to_operate": false,
+  "schema_version": 1,
+  "source_host": "pakrio-shinantower",
+  "stopper_point_normalized": [
+    0.017684887459807074,
+    0.5142857142857142
+  ],
+  "tvec": [
+    -178.16334932675596,
+    -617.8631063532171,
+    4794.549857811995
+  ]
+}

@@ -50,8 +50,12 @@ from towersightai.storage.connection_test import NasConnectionTestResult, run_na
 from towersightai.storage.file_transfer import NasFileTransferResult, upload_files_to_nas
 from towersightai.calibration.checkerboard import CheckerboardSpec
 from towersightai.calibration.share import (
+    KIND_LABELS,
     CalibrationEntry,
     CalibrationShareResult,
+    activate_source,
+    active_source,
+    available_sources,
     fetch_calibration,
     list_remote_calibration,
     local_entries,
@@ -2218,6 +2222,16 @@ class OperatorWindow(QMainWindow):
         self.calibration_stop_button = QPushButton("세션 종료")
         self.calibration_stop_button.clicked.connect(self._stop_calibration_session)
         controls.addWidget(self.calibration_stop_button)
+        controls.addWidget(QLabel("측정 출처"))
+        self.calibration_source_box = QComboBox()
+        self.calibration_source_box.setToolTip(
+            "어느 장비에서 측정한 값을 쓸지 고릅니다. 현장 영상을 개발기에서 분석할 때는 현장기 값을 고르세요."
+        )
+        self.calibration_source_box.setMinimumWidth(240)
+        controls.addWidget(self.calibration_source_box)
+        self.calibration_source_button = QPushButton("적용")
+        self.calibration_source_button.clicked.connect(self._activate_calibration_source)
+        controls.addWidget(self.calibration_source_button)
         self.calibration_share_button = QPushButton("NAS로 공유")
         self.calibration_share_button.setToolTip(
             "이 장비에서 측정한 렌즈·지면 값을 NAS에 올려 현장 장비가 가져갈 수 있게 합니다. 측정 파일 전송일 뿐입니다."
@@ -2284,6 +2298,7 @@ class OperatorWindow(QMainWindow):
         self.calibration_history.setPlaceholderText("촬영·측정 이력이 여기에 기록됩니다. 측정 결과는 최종 OK를 허용하지 않습니다.")
         body.addWidget(self.calibration_history)
         self._populate_calibration_cameras()
+        self._refresh_calibration_sources()
         self._refresh_calibration_buttons()
         return page
 
@@ -2538,7 +2553,11 @@ class OperatorWindow(QMainWindow):
         self._refresh_ground_buttons()
 
     def _ground_intrinsics(self, camera_id: str):  # noqa: ANN201
-        """(IntrinsicsResult, source_camera_id, borrowed) — 없으면 같은 기종의 다른 측정값을 빌린다."""
+        """(IntrinsicsResult, 렌즈 카메라 id, 측정 장비, 빌려 씀) — 없으면 같은 기종의 다른 측정값을 빌린다.
+
+        카메라 id와 측정 장비는 **따로** 돌려준다. 하나로 합치면 `opposite_side@개발기` 같은
+        이름이 파일명으로 저장되어 나중에 그 파일을 못 찾는다 (2026-09-18 현장 값에서 발생).
+        """
         root = (
             self.settings.calibration_path.parent / "intrinsics"
             if self.settings is not None
@@ -2555,18 +2574,16 @@ class OperatorWindow(QMainWindow):
                 # A file shared from another machine keeps its original source_host. Saying
                 # "자체 측정값" for it would hide that it came from a different camera unit.
                 if result.source_host and result.source_host != host:
-                    return result, result.source_host, True
-                return result, camera_id, False
+                    return result, camera_id, result.source_host, True
+                return result, camera_id, "", False
         for path in sorted(Path(root).glob("*.json")):
             try:
                 result = result_from_dict(load_intrinsics(path))
             except (OSError, ValueError, KeyError):
                 continue
-            origin = path.stem
-            if result.source_host and result.source_host != host:
-                origin = f"{path.stem}@{result.source_host}"
-            return result, origin, True
-        return None, "", False
+            origin_host = result.source_host if result.source_host != host else ""
+            return result, path.stem, origin_host, True
+        return None, "", "", False
 
     def _solve_ground_pose(self) -> None:
         camera = self._ground_camera()
@@ -2575,7 +2592,7 @@ class OperatorWindow(QMainWindow):
         if camera is None or frame is None:
             self._set_ground_status("화면이 없어 계산할 수 없습니다")
             return
-        intrinsics, source, borrowed = self._ground_intrinsics(camera.id)
+        intrinsics, source, source_host, borrowed = self._ground_intrinsics(camera.id)
         if intrinsics is None:
             self._set_ground_status(
                 "렌즈 내부 파라미터가 없습니다. 카메라 캘리브레이션에서 체커보드를 측정하거나, "
@@ -2600,6 +2617,7 @@ class OperatorWindow(QMainWindow):
                 rotation_degrees=camera.rotation_degrees,
                 intrinsics_camera_id=source,
                 intrinsics_borrowed=borrowed,
+                intrinsics_source_host=source_host,
             )
         except (ValueError, ImportError) as exc:
             self._set_ground_status(f"계산 실패: {exc}")
@@ -4427,6 +4445,8 @@ class OperatorWindow(QMainWindow):
             ("calibration_camera_box", not running and not calibrating),
             ("calibration_verify_button", not calibrating),
             ("calibration_share_button", not calibrating and not self._calib_sharing),
+            ("calibration_source_box", not calibrating and not self._calib_sharing),
+            ("calibration_source_button", not calibrating and not self._calib_sharing),
             ("calibration_fetch_button", not calibrating and not self._calib_sharing),
         ):
             widget = getattr(self, name, None)
@@ -4711,9 +4731,11 @@ class OperatorWindow(QMainWindow):
     # 이 장비 것이 아님을 알아보고 '빌려 씀'으로 표시한다.
 
     def _calibration_root(self) -> Path:
-        return Path(
-            self.settings.calibration_path.parent if self.settings is not None else Path("data/calibration")
-        )
+        # `calibration_path` is a Path on a real Settings, but test doubles and fake settings
+        # objects hand over a plain string — wrap before taking `.parent`.
+        if self.settings is None:
+            return Path("data/calibration")
+        return Path(self.settings.calibration_path).parent
 
     def _nas_config(self):  # noqa: ANN201 - RawStorageConfig | None
         raw = getattr(self.settings, "raw_storage", None) if self.settings is not None else None
@@ -4792,6 +4814,51 @@ class OperatorWindow(QMainWindow):
         else:
             self._set_calibration_status(f"{result.summary}: {result.error}" if result.error else result.summary)
         self._log_calibration(f"공유 결과 ok={result.ok} {result.summary} {result.error}".strip())
+        camera = self._calibration_camera()
+        if camera is not None:
+            self._show_calibration_saved(camera.id)
+
+    def _refresh_calibration_sources(self) -> None:
+        """List every machine whose measurements are on this device, per kind."""
+        box = getattr(self, "calibration_source_box", None)
+        if box is None:
+            return
+        sources = available_sources(self._calibration_root())
+        current = box.currentData()
+        box.blockSignals(True)
+        box.clear()
+        for kind, hosts in sources.items():
+            active = active_source(self._calibration_root(), kind)
+            for host, cameras in hosts.items():
+                mark = " ←사용 중" if host == active else ""
+                box.addItem(
+                    f"{KIND_LABELS.get(kind, kind)} · {host} ({len(cameras)}대){mark}", (kind, host)
+                )
+        index = box.findData(current)
+        if index >= 0:
+            box.setCurrentIndex(index)
+        box.blockSignals(False)
+        if box.count() == 0:
+            box.addItem("측정값 없음", None)
+
+    def _activate_calibration_source(self, checked: bool = False) -> None:
+        del checked
+        box = getattr(self, "calibration_source_box", None)
+        selection = box.currentData() if box is not None else None
+        if not selection:
+            self._set_calibration_status("적용할 측정 출처가 없습니다")
+            return
+        kind, host = selection
+        try:
+            switched = activate_source(self._calibration_root(), kind, host)
+        except (ValueError, OSError) as exc:
+            self._set_calibration_status(f"적용 실패: {exc}")
+            return
+        label = KIND_LABELS.get(kind, kind)
+        self._set_calibration_status(f"{label}을 {host} 측정값으로 적용했습니다 ({', '.join(switched)})")
+        self._log_calibration(f"출처 적용 {kind}={host} cameras={list(switched)}")
+        self._refresh_calibration_sources()
+        self._refresh_calibration_sources()
         camera = self._calibration_camera()
         if camera is not None:
             self._show_calibration_saved(camera.id)

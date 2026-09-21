@@ -23,6 +23,7 @@ from vehicle_box_test import rails as rail_detect
 from vehicle_box_test.calibrate import reference_image
 from vehicle_box_test.geometry import (
     DEFAULT_CALIB_PATH,
+    GroundCalibration,
     SiteCalibration,
     pose_from_ground_file,
     pose_from_intrinsics,
@@ -84,9 +85,21 @@ def run(args: argparse.Namespace) -> int:
     site = SiteCalibration.load(calib_path)
     if site.space != "undistorted":
         raise SystemExit("먼저 `calibrate migrate`로 대응점을 보정 좌표계로 옮기세요.")
-    undistorts = load_undistorts(tuple(site.cameras) + ("rear_side",))
+    # 운영자가 `지면 기준점`에서 찍어 둔 카메라는 랩 교정 파일에 없더라도 포함한다 —
+    # 현장기가 찍은 값을 개발기에서 현장 영상 분석에 그대로 쓰기 위해서다.
+    from towersightai.calibration.share import LIBRARY_DIR
 
-    for camera, calib in site.cameras.items():
+    operator_cameras = {
+        path.stem
+        for path in Path("data/calibration/ground").glob("*.json")
+        if path.parent.name != LIBRARY_DIR
+    }
+    cameras = tuple(dict.fromkeys(tuple(site.cameras) + tuple(sorted(operator_cameras))))
+    undistorts = load_undistorts(cameras + ("rear_side",))
+
+    for camera in cameras:
+        calib = site.cameras.get(camera) or GroundCalibration(camera_id=camera)
+        site.cameras[camera] = calib
         entry = undistorts.get(camera)
         if entry is None:
             print(f"  {camera}: 내부 파라미터가 없어 건너뜁니다")

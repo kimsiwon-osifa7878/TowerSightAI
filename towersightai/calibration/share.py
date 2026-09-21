@@ -51,6 +51,10 @@ from towersightai.storage.archive import (
 from towersightai.storage.connection_test import connect_ssh_client
 
 CALIBRATION_ROOT = "calibration"
+#: Fetched measurements are kept per originating machine under this folder, so the bench can hold
+#: the site's poses and its own at the same time. One of them is copied to the *active* path
+#: (``<kind>/<camera>.json``) — that is what the console and the offline lab read.
+LIBRARY_DIR = "hosts"
 #: Sub-folder name → the "kind" recorded in each file.
 KINDS: dict[str, str] = {"intrinsics": "camera_intrinsics", "ground": "camera_ground_pose"}
 KIND_LABELS = {"intrinsics": "렌즈 내부 파라미터", "ground": "지면 기준점"}
@@ -295,6 +299,7 @@ def fetch_calibration(
     *,
     sftp_factory: SftpFactory | None = None,
     progress: ProgressCallback | None = None,
+    activate: bool = True,
 ) -> CalibrationShareResult:
     """Download the chosen measurements into ``<destination_root>/<kind>/<camera>.json``.
 
@@ -327,14 +332,15 @@ def fetch_calibration(
             # A shared measurement stays unreviewed and unauthorized, whatever the file claims.
             payload["reviewed"] = False
             payload["safe_to_operate"] = False
-            target_dir = Path(destination_root) / entry.kind
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / f"{entry.camera_id}.json"
-            temporary = target.with_suffix(".json.part")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
+            text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            # Library copy: every fetched machine's measurement is kept side by side.
+            library = Path(destination_root) / entry.kind / LIBRARY_DIR / (entry.source_host or "unknown")
+            library.mkdir(parents=True, exist_ok=True)
+            _write_atomic(library / f"{entry.camera_id}.json", text)
+            target = Path(destination_root) / entry.kind / f"{entry.camera_id}.json"
+            if activate:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _write_atomic(target, text)
             fetched.append(CalibrationEntry(**{**entry.__dict__, "local_path": target, "sha256": digest}))
     except Exception as exc:  # noqa: BLE001
         return CalibrationShareResult(
@@ -368,3 +374,63 @@ def _listdir(sftp: Any, path: str) -> list[Any]:
 
 def _is_dir(entry: Any) -> bool:
     return stat.S_ISDIR(getattr(entry, "st_mode", 0) or 0)
+
+
+def _write_atomic(target: Path, text: str) -> None:
+    temporary = target.with_suffix(target.suffix + ".part")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(target)
+
+
+def available_sources(root: Path) -> dict[str, dict[str, tuple[str, ...]]]:
+    """What can be selected: ``{kind: {host: (camera_id, ...)}}``.
+
+    Built from the per-host library plus this machine's own measurements, which sit directly in
+    ``<kind>/`` and are listed under the local hostname.
+    """
+    local = socket.gethostname()
+    found: dict[str, dict[str, list[str]]] = {}
+    for kind in KINDS:
+        folder = Path(root) / kind
+        if not folder.is_dir():
+            continue
+        by_host: dict[str, list[str]] = {}
+        for path in sorted((folder / LIBRARY_DIR).glob("*/*.json")):
+            by_host.setdefault(path.parent.name, []).append(path.stem)
+        for entry in local_entries(Path(root)):
+            if entry.kind == kind and entry.source_host == local:
+                by_host.setdefault(local, []).append(entry.camera_id)
+        if by_host:
+            found[kind] = {host: tuple(sorted(set(cameras))) for host, cameras in sorted(by_host.items())}
+    return found
+
+
+def active_source(root: Path, kind: str) -> str:
+    """Which machine's measurement is currently in use for ``kind`` (empty when mixed/none)."""
+    hosts = {entry.source_host for entry in local_entries(Path(root)) if entry.kind == kind}
+    return hosts.pop() if len(hosts) == 1 else ""
+
+
+def activate_source(root: Path, kind: str, host: str) -> tuple[str, ...]:
+    """Copy one machine's measurements into the active path. Returns the cameras switched.
+
+    The bench analyses site images, so it must be able to run on the *site's* ground poses while
+    still holding its own. Choosing is explicit rather than guessed from the hostname.
+    """
+    root = Path(root)
+    local = socket.gethostname()
+    if host == local:
+        # The machine's own measurements already live at the active path; nothing to copy.
+        return tuple(
+            entry.camera_id
+            for entry in local_entries(root)
+            if entry.kind == kind and entry.source_host == local
+        )
+    library = root / kind / LIBRARY_DIR / host
+    if not library.is_dir():
+        raise ValueError(f"{host}의 {KIND_LABELS.get(kind, kind)} 측정값이 없습니다.")
+    switched: list[str] = []
+    for path in sorted(library.glob("*.json")):
+        _write_atomic(root / kind / f"{path.name}", path.read_text(encoding="utf-8"))
+        switched.append(path.stem)
+    return tuple(switched)

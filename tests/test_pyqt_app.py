@@ -2721,10 +2721,13 @@ def test_intrinsics_measured_on_another_machine_are_labelled_borrowed(monkeypatc
     payload["source_host"] = "some-other-bench"
     (root / "rear_side.json").write_text(json.dumps(payload), encoding="utf-8")
 
-    result, source, borrowed = window._ground_intrinsics("rear_side")
+    result, source, source_host, borrowed = window._ground_intrinsics("rear_side")
     assert result is not None
     assert borrowed is True
-    assert source == "some-other-bench"
+    # The camera id stays a camera id so `intrinsics/<id>.json` still resolves; the machine
+    # that measured it travels alongside instead of being glued into the name.
+    assert source == "rear_side"
+    assert source_host == "some-other-bench"
 
     _grade, lines = result.quality_report()
     assert any("some-other-bench" in line for line in lines)

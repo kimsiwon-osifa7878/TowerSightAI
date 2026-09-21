@@ -366,16 +366,21 @@ def pose_from_ground_file(camera_id: str, *, root: Path | None = None, width: in
     if result is None:
         return None
     rotation, _ = cv2.Rodrigues(np.array(result.rvec, dtype=np.float64))
-    matrix = scale_camera_matrix(
-        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        (result.image_width, result.image_height),
-        (width, height),
-    )
-    _ = matrix  # 아래에서 내부 파라미터는 측정 파일에서 직접 읽는다.
+
     from towersightai.calibration.intrinsics import load_intrinsics, result_from_dict
 
-    intrinsics_path = Path("data/calibration/intrinsics") / f"{result.intrinsics_camera_id}.json"
-    if not intrinsics_path.is_file():
+    # 자세는 **그때 쓴 K로** 풀린 값이다. 같은 렌즈 파일을 찾아 써야 투영이 맞는다.
+    # 후보 순서: 기록된 렌즈 카메라 → 이 카메라 자신 → 폴더에 있는 유일한 측정값.
+    lens_root = Path("data/calibration/intrinsics")
+    candidates = [result.intrinsics_camera_id, camera_id]
+    available = sorted(path.stem for path in lens_root.glob("*.json"))
+    if len(available) == 1:
+        candidates.append(available[0])
+    intrinsics_path = next(
+        (lens_root / f"{name}.json" for name in candidates if name and (lens_root / f"{name}.json").is_file()),
+        None,
+    )
+    if intrinsics_path is None:
         return None
     intrinsics = result_from_dict(load_intrinsics(intrinsics_path))
     scaled = scale_camera_matrix(
@@ -390,8 +395,11 @@ def pose_from_ground_file(camera_id: str, *, root: Path | None = None, width: in
         rotation=rotation,
         translation=np.array(result.tvec, dtype=np.float64),
         reprojection_error=float(result.residual_mm),
-        borrowed_intrinsics=result.intrinsics_camera_id if result.intrinsics_borrowed else "",
-        note=f"운영자 `지면 기준점` 측정 ({result.measured_at}) · 잔차 {result.residual_mm:.0f} mm",
+        borrowed_intrinsics=intrinsics_path.stem if result.intrinsics_borrowed else "",
+        note=(
+            f"운영자 `지면 기준점` 측정 ({result.measured_at[:19]}) · 잔차 {result.residual_mm:.0f} mm · "
+            f"측정 장비 {result.source_host or '이 장비'} · 렌즈 {intrinsics_path.stem}"
+        ),
     )
 
 

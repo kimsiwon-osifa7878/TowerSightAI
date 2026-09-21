@@ -34,6 +34,13 @@ MIN_SILHOUETTE_RATIO = 0.012  # ROI 대비 실루엣 최소 비율
 #: 무늬나 조명 변화를 잡으면 가늘고 흩어진 윤곽이 되어 이 값이 크게 떨어진다 —
 #: 차가 없는 프레임에서 3D 상자가 그려지던 오검출을 여기서 막는다.
 MIN_SILHOUETTE_EXTENT = 0.25
+#: 사선 카메라 한 대는 **먼 쪽 바퀴를 절대 볼 수 없다** — 차체가 가린다. 그래서 폭은
+#: 측정 대상이 아니라 가정값이다. 보이는 가까운 쪽 바퀴선에서 이만큼 밀어 직육면체를
+#: 세운다(승인도 차량 한계 W2000의 일반 승용차 값). 이미지에는 '가정'으로 표시한다.
+ASSUMED_TRACK_WIDTH_MM = 1850.0
+SIDE_CAMERAS = frozenset({"rear_side", "opposite_side"})
+#: 검출 상자 밖 화소는 차량이 아니다. 상자를 이 비율만큼 넓혀 여유를 둔다.
+DETECTION_MARGIN = 0.02
 MIN_CONTACT_SAMPLES = 25
 #: 접지선을 월드로 올릴 때 팔레트 밖으로 크게 벗어난 점은 버린다(문 밖 바닥은 평면이 다르다).
 FOOTPRINT_MARGIN_MM = 900.0
@@ -65,6 +72,11 @@ class VehicleEstimate:
     contact_samples: int = 0
     truncated_front: bool = False
     truncated_rear: bool = False
+    #: 폭을 재지 못하고 가정값으로 세웠는가 (사선 카메라 한 대).
+    width_assumed: bool = False
+    #: 실제로 보인 접지점의 y 퍼짐 (진단용, mm).
+    contact_spread_mm: float = 0.0
+    detection_confidence: float = 0.0
     pose_used: bool = False
     pose_error: float = 0.0
     annotated_path: str = ""
@@ -151,8 +163,12 @@ def roi_mask(shape, polygon: Sequence[tuple[float, float]]):
 # --------------------------------------------------------------------- 실루엣
 
 
-def silhouette(image, background, roi):
-    """배경차분 실루엣. 밝기 차이를 보정해 조명이 다른 날도 비교 가능하게 한다."""
+def silhouette(image, background, roi, gate=None):
+    """배경차분 실루엣. 밝기 차이를 보정해 조명이 다른 날도 비교 가능하게 한다.
+
+    ``gate``(제품 AI의 차량 검출 상자)를 주면 **가장 큰** 덩어리가 아니라 **그 상자와 가장
+    많이 겹치는** 덩어리를 고른다. 바닥 매트 무늬나 문 밖 그림자가 차보다 커도 지지 않는다.
+    """
     import cv2
     import numpy as np
 
@@ -186,12 +202,27 @@ def silhouette(image, background, roi):
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     if count <= 1:
         return mask * 0, 0.0
-    largest = max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    if gate is not None:
+        overlaps = {i: int(np.count_nonzero((labels == i) & (gate > 0))) for i in range(1, count)}
+        best = max(overlaps, key=lambda i: overlaps[i])
+        largest = best if overlaps[best] > 0 else max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    else:
+        largest = max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
     blob = ((labels == largest).astype(np.uint8)) * 255
     ratio = float(stats[largest, cv2.CC_STAT_AREA]) / max(float(np.count_nonzero(roi)), 1.0)
     box = float(stats[largest, cv2.CC_STAT_WIDTH] * stats[largest, cv2.CC_STAT_HEIGHT])
     extent = float(stats[largest, cv2.CC_STAT_AREA]) / max(box, 1.0)
     return blob, ratio, extent
+
+
+def _border_columns(blob) -> tuple[bool, bool]:
+    """실루엣이 화면 좌/우 끝에 닿았는가 (왼쪽, 오른쪽)."""
+    import numpy as np
+
+    columns = np.nonzero(blob.any(axis=0))[0]
+    if not columns.size:
+        return False, False
+    return bool(columns.min() <= 2), bool(columns.max() >= blob.shape[1] - 3)
 
 
 def contact_points(blob, roi) -> list[tuple[float, float]]:
@@ -229,13 +260,27 @@ def estimate_vehicle(
     *,
     camera_id: str,
     source: str,
+    detection=None,
 ) -> tuple[VehicleEstimate, object, list[tuple[float, float]]]:
     import numpy as np
 
     result = VehicleEstimate(camera_id=camera_id, source=source)
     polygon = machine_roi(calib, ground, image.shape, pose)
     roi = roi_mask(image.shape, polygon)
-    blob, ratio, extent = silhouette(image, background, roi)
+    gate = None
+    if detection is not None:
+        # 제품이 같은 프레임에 이미 돌린 차량 검출 상자. ROI를 **자르지는 않는다** —
+        # 자르면 차체 끝과 접지선이 상자 변에서 잘려 길이가 짧아진다. 어느 덩어리가
+        # 차인지 고르는 데만 쓴다.
+        result.detection_confidence = round(float(detection.confidence), 3)
+        height, width = roi.shape[:2]
+        x0 = int(max(0.0, detection.x0 - DETECTION_MARGIN) * width)
+        x1 = int(min(1.0, detection.x1 + DETECTION_MARGIN) * width)
+        y0 = int(max(0.0, detection.y0 - DETECTION_MARGIN) * height)
+        y1 = int(min(1.0, detection.y1 + DETECTION_MARGIN) * height)
+        gate = np.zeros_like(roi)
+        gate[y0:y1, x0:x1] = 255
+    blob, ratio, extent = silhouette(image, background, roi, gate)
     result.silhouette_ratio = round(ratio, 4)
     result.silhouette_extent = round(extent, 3)
 
@@ -246,6 +291,13 @@ def estimate_vehicle(
         )
         return result, blob, polygon
 
+    if extent < MIN_SILHOUETTE_EXTENT and detection is not None:
+        result.reasons.append(
+            f"제품 AI는 이 프레임에서 차량을 찾았지만(신뢰도 {detection.confidence*100:.0f}%),"
+            f" 차체 색이 바닥과 비슷해 배경차분 실루엣이 얇게만 잡혔습니다 (채움 {extent*100:.0f}%,"
+            f" 차량이면 {MIN_SILHOUETTE_EXTENT*100:.0f}% 이상). 지면 교정 문제가 아니라 실루엣 추출 한계입니다."
+        )
+        return result, blob, polygon
     if extent < MIN_SILHOUETTE_EXTENT:
         result.reasons.append(
             f"찾은 덩어리가 가늘고 흩어져 있습니다 "
@@ -285,28 +337,82 @@ def estimate_vehicle(
         return result, blob, polygon
     result.x_front = float(np.percentile(xs, 97))
     result.x_rear = float(np.percentile(xs, 3))
-    result.y_left = float(np.percentile(ys, 97))
-    result.y_right = float(np.percentile(ys, 3))
+    result.contact_spread_mm = round(float(np.percentile(ys, 97) - np.percentile(ys, 3)), 1)
 
-    # 화면 좌우 끝에 실루엣이 닿으면 그 방향 끝은 신뢰할 수 없다.
-    columns = np.nonzero(blob.any(axis=0))[0]
-    width = blob.shape[1]
-    if columns.size:
-        if columns.min() <= 2 or columns.max() >= width - 3:
-            near_front = abs(result.x_front) > abs(result.x_rear)
-            result.truncated_front = near_front
-            result.truncated_rear = not near_front
-            result.notes.append("차량 실루엣이 화면 가장자리에 닿아 한쪽 끝은 잘렸을 수 있습니다.")
+    # 폭: 사선 카메라 한 대는 먼 쪽 바퀴를 못 본다. 보이는 접지선은 **가까운 쪽 바퀴선**이므로
+    # 그것만 재고, 반대쪽은 가정 트랙폭만큼 밀어 세운다. 재지 못한 값을 잰 척하지 않는다.
+    camera_y = float(pose.center[1]) if pose is not None else -1.0
+    if camera_id in SIDE_CAMERAS and pose is not None:
+        # 접지선 점 중 **카메라 쪽 끝**을 가까운 바퀴선으로 본다. 바퀴 사이 구간에서는
+        # 실루엣의 최하단이 타이어가 아니라 사이드실·하부 그림자(지상 15~20 cm)여서,
+        # 그것을 지면으로 투영하면 카메라 반대쪽으로 밀린다. 중앙값을 쓰면 바퀴선이
+        # 팔레트 한가운데로 끌려온다(2026-09-18 확인: 중앙값 -111 mm, 실제 약 -925 mm).
+        near_y = float(np.percentile(ys, 5 if camera_y < 0 else 95))
+        limit = ground.pallet_width_mm / 2.0 + 200.0
+        on_camera_side = near_y < 200.0 if camera_y < 0 else near_y > -200.0
+        if not on_camera_side or abs(near_y) > limit:
+            result.reasons.append(
+                f"가까운 쪽 바퀴선이 y {near_y:+.0f} mm로 나왔습니다 —"
+                f" 카메라는 y {camera_y:+.0f} mm 쪽에 있으므로 주차기 안 차량이면"
+                f" y {'-' if camera_y < 0 else '+'}300~{'-' if camera_y < 0 else '+'}{limit:.0f} mm 사이여야 합니다."
+                " 문 밖·옆 차선 차량을 잡았거나 접지선이 차량 하부 그림자에 끌렸습니다."
+            )
+            return result, blob, polygon
+        far_y = near_y + (ASSUMED_TRACK_WIDTH_MM if camera_y < near_y else -ASSUMED_TRACK_WIDTH_MM)
+        result.y_left, result.y_right = max(near_y, far_y), min(near_y, far_y)
+        result.width_assumed = True
+        result.notes.append(
+            f"폭 {ASSUMED_TRACK_WIDTH_MM:.0f} mm는 **가정값**입니다 — 사선 카메라 한 대로는 먼 쪽 바퀴가"
+            f" 차체에 가려 보이지 않습니다. 측정한 것은 가까운 쪽 바퀴선 y {near_y:+.0f} mm뿐입니다."
+        )
+    else:
+        result.y_left = float(np.percentile(ys, 97))
+        result.y_right = float(np.percentile(ys, 3))
+
+    # 화면 좌우 끝에 실루엣이 닿으면 그쪽 끝은 **측정값이 아니라 하한**이다.
+    # 어느 world 끝이 잘렸는지는 추측하지 않는다 — 가장자리에 걸린 접지점의 실제 x를 본다.
+    # (예전에는 |x_front| > |x_rear| 로 짐작해서, 차가 안쪽 깊이 들어온 장면에서 반대쪽을
+    #  잘린 것으로 표시했다.)
+    left_touch, right_touch = _border_columns(blob)
+    if left_touch or right_touch:
+        border = blob.shape[1] - 1
+        edge_xs = [
+            x
+            for (u, _v), (x, _y) in zip(raw, world)
+            if (left_touch and u * blob.shape[1] <= 3)
+            or (right_touch and u * blob.shape[1] >= border - 3)
+        ]
+        for x in edge_xs:
+            if x >= centre_x:
+                result.truncated_front = True
+            else:
+                result.truncated_rear = True
+        if not edge_xs:  # 접지선이 가장자리에 없으면 상단(지붕)만 걸린 것 — 길이에는 영향 없음
+            result.notes.append("차량 윗부분이 화면 밖으로 나갔습니다 (길이·폭에는 영향 없음).")
+        ends = [name for name, cut in (("진입쪽(+x)", result.truncated_front), ("안쪽(-x)", result.truncated_rear)) if cut]
+        if ends:
+            result.notes.append(
+                f"{' · '.join(ends)} 끝이 화면 밖으로 잘렸습니다 — 그쪽 길이는 **최소값**입니다."
+            )
 
     length = result.length_mm or 0.0
     width_mm = result.width_mm or 0.0
-    if not PLAUSIBLE_LENGTH_MM[0] <= length <= PLAUSIBLE_LENGTH_MM[1]:
+    truncated = result.truncated_front or result.truncated_rear
+    if length > PLAUSIBLE_LENGTH_MM[1]:
+        result.reasons.append(
+            f"길이 추정값 {length:.0f} mm이 타당 범위 상한"
+            f"({PLAUSIBLE_LENGTH_MM[1]:.0f} mm)을 넘었습니다. 접지선에 그림자·다른 물체가 섞였습니다."
+        )
+    elif length < PLAUSIBLE_LENGTH_MM[0] and not truncated:
+        # 잘리지 않았는데도 짧으면 진짜 오검출이다. 잘린 경우는 하한이므로 짧은 게 정상이다.
         result.reasons.append(
             f"길이 추정값 {length:.0f} mm이 타당 범위"
             f"({PLAUSIBLE_LENGTH_MM[0]:.0f}~{PLAUSIBLE_LENGTH_MM[1]:.0f} mm)를 벗어났습니다."
             " 차량 일부만 보이거나 접지선에 그림자·다른 물체가 섞였습니다."
         )
-    if not PLAUSIBLE_WIDTH_MM[0] <= width_mm <= PLAUSIBLE_WIDTH_MM[1]:
+    if not result.width_assumed and (
+        width_mm > PLAUSIBLE_WIDTH_MM[1] or (width_mm < PLAUSIBLE_WIDTH_MM[0] and not truncated)
+    ):
         result.reasons.append(
             f"폭 추정값 {width_mm:.0f} mm이 타당 범위"
             f"({PLAUSIBLE_WIDTH_MM[0]:.0f}~{PLAUSIBLE_WIDTH_MM[1]:.0f} mm)를 벗어났습니다."
@@ -318,9 +424,11 @@ def estimate_vehicle(
         if centre is not None:
             # 위에서 내려다보는 카메라에서 실루엣의 최상단(지붕 윤곽)은 **먼 쪽 지붕 모서리**다.
             # 중앙선이나 가까운 쪽으로 잡으면 높이가 과대평가된다.
-            camera_y = float(pose.center[1])
-            far_y = max((result.y_left, result.y_right), key=lambda y: abs(y - camera_y))
-            centre = (centre[0], far_y)
+            look_y = max((result.y_left, result.y_right), key=lambda y: abs(y - float(pose.center[1])))
+            if result.width_assumed:
+                # 먼 쪽 y는 가정값이라 실루엣이 거기 없을 수 있다. 실제로 본 접지선(중앙)을 쓴다.
+                look_y = (result.y_left + result.y_right) / 2.0
+            centre = (centre[0], look_y)
             column_x = int(np.clip(_image_column_for(calib, centre, blob.shape), 0, blob.shape[1] - 1))
             column = np.nonzero(blob[:, column_x])[0]
             if column.size:

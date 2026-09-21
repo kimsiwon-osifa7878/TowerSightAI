@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Sequence
 
 from vehicle_box_test import draw, estimate as est
+from vehicle_box_test.detections import DetectionIndex
 from vehicle_box_test.geometry import DEFAULT_CALIB_PATH, SiteCalibration
 from vehicle_box_test.undistort import load_undistorts
 
@@ -56,7 +57,7 @@ def _on_screen(point: tuple[float, float], margin: float = 0.25) -> bool:
     return -margin <= point[0] <= 1.0 + margin and -margin <= point[1] <= 1.0 + margin
 
 
-def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, pose, meta: dict):
+def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, pose, meta: dict, detection=None):
     """추정 결과를 이미지에 새긴다. 실패면 한국어 사유를, 성공이면 치수를 적는다."""
     import cv2
     import numpy as np
@@ -71,11 +72,25 @@ def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, p
     draw.polyline(canvas, calib.world_to_image(right), draw.COLOR_RAIL, 1)
     draw.polyline(canvas, calib.world_to_image(ground.pallet_rect()), draw.COLOR_PALLET, 1, closed=True)
 
+    # 제품 AI가 같은 프레임에서 낸 차량 상자 (참고용)
+    if detection is not None:
+        draw.polyline(
+            canvas,
+            [(detection.x0, detection.y0), (detection.x1, detection.y0),
+             (detection.x1, detection.y1), (detection.x0, detection.y1)],
+            (255, 110, 200), 1, closed=True,
+        )
+        draw.label_at(
+            canvas, f"AI 차량 검출 {detection.confidence*100:.0f}%",
+            (detection.x0, detection.y0), size=max(width // 95, 13), color=(255, 150, 215),
+        )
+
     # 실루엣 외곽선
     if blob is not None and np.count_nonzero(blob):
         contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(canvas, contours, -1, (200, 200, 60), 2, cv2.LINE_AA)
 
+    truncated = result.truncated_front or result.truncated_rear
     footprint = result.footprint()
     if footprint is not None:
         base = calib.world_to_image(footprint)
@@ -107,15 +122,17 @@ def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, p
                 canvas, calib.world_to_image([(result.x_rear, y), (result.x_front, y)]), draw.COLOR_WHEEL, 2
             )
 
-        draw.label_at(canvas, "진입쪽 끝 (+x)", front_line[0], size=max(width // 85, 14), color=(160, 190, 255))
-        draw.label_at(canvas, "안쪽 끝 (-x)", rear_line[0], size=max(width // 85, 14), color=(255, 200, 150))
+        cut_front = " · 화면밖 잘림" if result.truncated_front else ""
+        cut_rear = " · 화면밖 잘림" if result.truncated_rear else ""
+        draw.label_at(canvas, f"진입쪽 끝 (+x){cut_front}", front_line[0], size=max(width // 85, 14), color=(160, 190, 255))
+        draw.label_at(canvas, f"안쪽 끝 (-x){cut_rear}", rear_line[0], size=max(width // 85, 14), color=(255, 200, 150))
 
         # 치수 화살표 (길이·폭)
         mid_y = y0 + (y1 - y0) * 0.15
         draw.arrow_with_length(
             canvas,
             *calib.world_to_image([(result.x_rear, mid_y), (result.x_front, mid_y)]),
-            f"길이 {result.length_mm:.0f} mm",
+            f"길이 {'≥ ' if truncated else ''}{result.length_mm:.0f} mm",
             draw.COLOR_BOX,
             size=max(width // 75, 15),
         )
@@ -123,22 +140,36 @@ def annotate(image, result: est.VehicleEstimate, blob, polygon, calib, ground, p
         draw.arrow_with_length(
             canvas,
             *calib.world_to_image([(mid_x, y0), (mid_x, y1)]),
-            f"폭 {result.width_mm:.0f} mm",
+            f"폭 {result.width_mm:.0f} mm{' (가정)' if result.width_assumed else ''}",
             draw.COLOR_WHEEL,
             size=max(width // 75, 15),
         )
 
     header = f"{CAMERA_LABEL.get(result.camera_id, result.camera_id)} · {meta.get('day','')} · {EVENT_LABEL.get(meta.get('event_kind',''), meta.get('event_kind',''))}"
-    draw.put_text(canvas, header, (int(width * 0.015), int(height * 0.955)), size=max(width // 75, 15))
+    draw.put_text(
+        canvas,
+        header,
+        (int(width * 0.015), int(height * 0.955)),
+        size=max(width // 75, 15),
+        alpha=draw.PANEL_ALPHA,
+    )
 
     if result.ok:
         lines = [
-            f"길이 {result.length_mm:.0f} mm",
-            f"폭 {result.width_mm:.0f} mm",
+            f"길이 {'≥ ' if truncated else ''}{result.length_mm:.0f} mm"
+            + (" (한쪽이 화면 밖 — 최소값)" if truncated else ""),
+            f"폭 {result.width_mm:.0f} mm" + (" — 가정값 (먼 쪽 바퀴 안 보임)" if result.width_assumed else ""),
             f"높이 {result.height_mm:.0f} mm" if result.height_mm else "높이 미산출 (자세 복원 불충분)",
-            f"진입쪽 끝 x {result.x_front:+.0f} mm · 안쪽 끝 x {result.x_rear:+.0f} mm",
-            f"중심 치우침 y {(result.y_left + result.y_right) / 2:+.0f} mm",
-            f"접지점 {result.contact_samples}개 · 실루엣 {result.silhouette_ratio*100:.1f}% (채움 {result.silhouette_extent*100:.0f}%)",
+            f"안쪽 끝 x {result.x_rear:+.0f} mm"
+            + ("  ← 화면 밖, 최소값" if result.truncated_rear else "  ← 진입 깊이 판정값"),
+            f"진입쪽 끝 x {result.x_front:+.0f} mm" + ("  ← 화면 밖, 최소값" if result.truncated_front else ""),
+            (
+                f"가까운 쪽 바퀴선 y {result.y_right if result.camera_id == 'opposite_side' else result.y_left:+.0f} mm (측정)"
+                if result.width_assumed
+                else f"중심 치우침 y {(result.y_left + result.y_right) / 2:+.0f} mm"
+            ),
+            f"접지점 {result.contact_samples}개 · 실루엣 {result.silhouette_ratio*100:.1f}% (채움 {result.silhouette_extent*100:.0f}%)"
+            + (f" · AI 검출 {result.detection_confidence*100:.0f}%" if result.detection_confidence else ""),
         ]
         if result.camera_id in ("rear_side", "opposite_side"):
             lines.append("※ 사선 카메라 한 대만으로는 폭이 부정확합니다 (먼 쪽 바퀴가 안 보임).")
@@ -159,10 +190,16 @@ def run(args: argparse.Namespace) -> int:
     site = SiteCalibration.load(Path(args.calib))
     backgrounds = load_backgrounds(data_root)
     sample_index = json.loads((data_root / "sample-index.json").read_text(encoding="utf-8"))
+    detections = DetectionIndex.load(data_root / "detection-index.json")
     frame_index = json.loads((data_root / "frame-index.json").read_text(encoding="utf-8"))
 
+    # 전면 카메라는 아직 지면 기준점이 없어 mm 판정을 못 한다. 실패 카드만 잔뜩 만들어
+    # 결과를 읽기 어렵게 하므로 기본적으로 대상에서 뺀다 (--exclude-camera 로 조정).
+    excluded = set(args.exclude_camera)
     targets: list[dict] = []
     for item in sample_index["items"]:
+        if item.get("camera_id") in excluded:
+            continue
         if item.get("kind") == "snapshot" and item.get("local_path"):
             targets.append(
                 {
@@ -186,6 +223,7 @@ def run(args: argparse.Namespace) -> int:
             continue
         step = len(frames) / count
         picked += [frames[min(int(i * step), len(frames) - 1)] for i in range(count)]
+    picked = [f for f in picked if f["camera_id"] not in excluded]
     for frame in picked:
         targets.append(
             {
@@ -217,11 +255,13 @@ def run(args: argparse.Namespace) -> int:
         out_path = out_root / "annotated" / out_name
 
         blocked: list[str] | None = None
-        if calib is None or len(calib.correspondences) < 4:
+        # 자세가 있으면 대응점은 필요 없다 — 지면 호모그래피를 자세에서 만들기 때문이다.
+        # (운영자가 `지면 기준점`에서 찍은 값은 대응점 없이 자세만 남긴다.)
+        if calib is None or (calib.pose is None and len(calib.correspondences) < 4):
             blocked = [
                 f"{CAMERA_LABEL.get(camera, camera)} 카메라의 지면 교정이 아직 없습니다.",
-                "레일·턴테이블 기준점을 아직 이 화각에서 읽지 못해 mm 단위 판정을 못 합니다.",
-                "체커보드 내부 파라미터 측정 또는 운영자 점 찍기 UI가 필요합니다.",
+                "이 화각의 팔레트 기준점이 없어 mm 단위 판정을 못 합니다.",
+                "운영자 콘솔 `지면 기준점`에서 팔레트 네 모서리를 찍어 저장하세요.",
             ]
         elif target["source"] != "snapshot":
             blocked = [
@@ -246,6 +286,9 @@ def run(args: argparse.Namespace) -> int:
         if background is None:
             continue
 
+        detection = (
+            detections.best(camera, target["captured_at"]) if target["source"] == "snapshot" else None
+        )
         result, blob, polygon = est.estimate_vehicle(
             image,
             background,
@@ -254,14 +297,17 @@ def run(args: argparse.Namespace) -> int:
             pose,
             camera_id=camera,
             source=target["source"],
+            detection=detection,
         )
+        if detection is None and target["source"] == "snapshot":
+            result.notes.append("이 시각에 제품 AI의 차량 검출이 없어 실루엣만으로 판단했습니다.")
         result.pose_error = round(pose.reprojection_error, 1) if pose is not None else 0.0
         if pose is not None and pose.borrowed_intrinsics:
             result.notes.append(
                 f"렌즈 내부 파라미터는 {pose.borrowed_intrinsics} 카메라 측정값을 빌려 썼습니다 (동일 기종)."
             )
 
-        canvas = annotate(image, result, blob, polygon, calib, site.ground, pose, target)
+        canvas = annotate(image, result, blob, polygon, calib, site.ground, pose, target, detection)
         cv2.imwrite(str(out_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88])
         result.annotated_path = str(out_path.relative_to(out_root))
         results.append({**target, **result.to_dict()})
@@ -307,11 +353,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="")
     parser.add_argument("--calib", default=str(DEFAULT_CALIB_PATH))
     parser.add_argument("--max-frames-per-clip", type=int, default=4)
+    parser.add_argument(
+        "--exclude-camera",
+        action="append",
+        default=None,
+        help="검증에서 뺄 카메라 (기본: front — 지면 기준점 없음)",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    return run(build_parser().parse_args(argv))
+    args = build_parser().parse_args(argv)
+    if args.exclude_camera is None:
+        args.exclude_camera = ["front"]
+    return run(args)
 
 
 if __name__ == "__main__":

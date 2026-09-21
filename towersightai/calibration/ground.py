@@ -70,7 +70,20 @@ class GroundPoseResult:
     intrinsics_camera_id: str
     intrinsics_borrowed: bool
     measured_at: str
+    #: Host that picked the points. A ground pose belongs to **that camera at that site**, not to
+    #: whichever machine holds the file — the offline lab analyses site images on the bench and
+    #: needs the site's pose. Recorded so the operator can see which installation it describes.
+    source_host: str = ""
+    #: Host that measured the lens file this pose was solved with. Kept apart from
+    #: ``intrinsics_camera_id`` so the file stays *findable*: the camera id resolves to
+    #: ``intrinsics/<id>.json``, the host is only a label. Folding the two into one string
+    #: produced names like ``opposite_side@bench`` that no loader could open (2026-09-18).
+    intrinsics_source_host: str = ""
     reviewed: bool = False
+
+    @property
+    def foreign(self) -> bool:
+        return bool(self.source_host) and self.source_host != socket.gethostname()
 
     @property
     def camera_position_mm(self) -> tuple[float, float, float]:
@@ -136,8 +149,17 @@ class GroundPoseResult:
         lines.append(f"· 방향 팬 {pan:+.1f}° · 틸트 {tilt:+.1f}°(아래로) · 롤 {roll:+.1f}°")
 
         mark = "✔" if not self.intrinsics_borrowed else "△"
-        source = f"{self.intrinsics_camera_id} 측정값을 빌려 씀" if self.intrinsics_borrowed else "자체 측정값"
+        origin = self.intrinsics_camera_id
+        if self.intrinsics_source_host:
+            origin = f"{origin} ({self.intrinsics_source_host})"
+        source = f"{origin} 측정값을 빌려 씀" if self.intrinsics_borrowed else "자체 측정값"
         lines.append(f"{mark} 렌즈 내부 파라미터 {source}")
+
+        if self.foreign:
+            lines.append(
+                f"· {self.source_host}에서 찍은 기준점입니다. 그 장비 카메라로 찍은 영상에 쓰는 값이며, "
+                "이 장비의 실카메라 화면에는 맞지 않습니다"
+            )
         return self.quality, tuple(lines)
 
     def summary(self) -> str:
@@ -170,8 +192,9 @@ class GroundPoseResult:
             "quality": self.quality,
             "intrinsics_camera_id": self.intrinsics_camera_id,
             "intrinsics_borrowed": self.intrinsics_borrowed,
+            "intrinsics_source_host": self.intrinsics_source_host,
             "measured_at": self.measured_at,
-            "source_host": socket.gethostname(),
+            "source_host": self.source_host or socket.gethostname(),
             "reviewed": self.reviewed,
             "safe_to_operate": False,
         }
@@ -229,6 +252,7 @@ def solve_ground_pose(
     rotation_degrees: int = 0,
     intrinsics_camera_id: str = "",
     intrinsics_borrowed: bool = False,
+    intrinsics_source_host: str = "",
     now: datetime | None = None,
 ) -> GroundPoseResult:
     """Solve the camera pose from four clicked deck corners plus the stopper landmark.
@@ -313,6 +337,7 @@ def solve_ground_pose(
         residual_mm=residual_mm,
         intrinsics_camera_id=intrinsics_camera_id or camera_id,
         intrinsics_borrowed=intrinsics_borrowed,
+        intrinsics_source_host=intrinsics_source_host,
         measured_at=stamp,
     )
 
@@ -396,6 +421,15 @@ def result_from_dict(data: Mapping[str, Any]) -> GroundPoseResult:
     if data.get("kind") != "camera_ground_pose":
         raise ValueError("not a camera ground pose file")
     pallet = data.get("pallet") or {}
+    # Files written before 2026-09-18 glued the measuring host into the camera id
+    # ("opposite_side@bench", or just the bare host name). Split it back apart on load so the
+    # lens file stays findable.
+    lens_camera = str(data.get("intrinsics_camera_id", ""))
+    lens_host = str(data.get("intrinsics_source_host", ""))
+    if "@" in lens_camera:
+        lens_camera, _, glued = lens_camera.partition("@")
+        lens_host = lens_host or glued
+
     return GroundPoseResult(
         camera_id=str(data["camera_id"]),
         image_width=int(data["image_width"]),
@@ -409,8 +443,10 @@ def result_from_dict(data: Mapping[str, Any]) -> GroundPoseResult:
         stopper_point=tuple(float(v) for v in data.get("stopper_point_normalized", (0.0, 0.0))),
         corner_world=tuple(tuple(float(v) for v in row) for row in data.get("corner_world_mm", ())),
         residual_mm=float(data.get("residual_mm", 0.0)),
-        intrinsics_camera_id=str(data.get("intrinsics_camera_id", "")),
+        intrinsics_camera_id=lens_camera,
         intrinsics_borrowed=bool(data.get("intrinsics_borrowed", False)),
+        intrinsics_source_host=lens_host,
         measured_at=str(data.get("measured_at", "")),
+        source_host=str(data.get("source_host", "")),
         reviewed=bool(data.get("reviewed", False)),
     )
