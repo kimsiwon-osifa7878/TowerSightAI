@@ -3231,3 +3231,119 @@ def test_hailo_health_worker_uploads_evidence_off_the_ui_thread(tmp_path: Path):
     assert seen[0] == "error"
     assert [report.reported for report in reports] == [True]
     assert reports[0].remote_dir == "/home/site/x"
+
+
+def test_hailo_recover_button_stops_inference_and_never_authorizes_ok(monkeypatch, tmp_path: Path):
+    from towersightai.inference.hailo_recovery import RecoveryResult
+
+    _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings)
+    _open_operator_menu(window)
+    window._show_operator_page("시스템 점검")
+    stopped: list[bool] = []
+    monkeypatch.setattr(OperatorWindow, "_stop_purpose_inference", lambda self: stopped.append(True))
+
+    # Declining the confirmation must change nothing.
+    monkeypatch.setattr(OperatorWindow, "_confirm_hailo_recovery", lambda self: False)
+    window.hailo_recover_button.click()
+    assert stopped == [] and window._hailo_recovery_running is False
+    assert window.hailo_recover_button.isEnabled() is True
+
+    monkeypatch.setattr(OperatorWindow, "_confirm_hailo_recovery", lambda self: True)
+    window.hailo_recover_button.click()
+
+    # Inference must stop first: the driver cannot be unloaded while a child holds /dev/hailo0.
+    assert stopped == [True]
+    assert window._hailo_recovery_running is True
+    assert window.hailo_recover_button.isEnabled() is False
+    assert len(window._hailo_recovery_workers) == 1
+    assert "복구 중" in window.warning_label.text()
+    assert "최종 OK는 차단" in window.warning_label.text()
+    assert window.model.can_show_final_ok is False
+
+    window._set_hailo_recovery_result(RecoveryResult(True, "Device Architecture: HAILO8"))
+    assert "복구 성공" in window.instruction_label.text()
+    assert "HAILO8" in window.system_test_log.toPlainText()
+    assert window.model.can_show_final_ok is False
+
+    window._set_hailo_recovery_result(RecoveryResult(False, "hailo_pci 모듈을 내리지 못했습니다"))
+    assert "복구 실패" in window.instruction_label.text()
+    assert window.model.can_show_final_ok is False
+
+    worker, thread = window._hailo_recovery_workers[0], window._hailo_recovery_threads[0]
+    window._cleanup_hailo_recovery_worker(thread, worker)
+    assert window._hailo_recovery_running is False
+    assert window.hailo_recover_button.isEnabled() is True
+    window.close()
+
+
+def test_hailo_auto_recovery_fires_after_two_minutes_of_error(monkeypatch, tmp_path: Path):
+    from towersightai.inference.hailo_health import HailoHealthSnapshot
+    import towersightai.ui.pyqt_app as ui_module
+
+    _qt_app()
+    monkeypatch.setattr(QThread, "start", lambda self: None)
+    settings = _settings()
+    settings.hailo_auto_recovery_enabled = True
+    settings.hailo_auto_recovery_after_seconds = 120.0
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(ui_module.time, "monotonic", lambda: clock["now"])
+    started: list[tuple] = []
+    monkeypatch.setattr(
+        OperatorWindow, "_start_hailo_recovery",
+        lambda self, *, automatic, attempt=0: started.append((automatic, attempt)),
+    )
+    error = HailoHealthSnapshot(status="error", summary="응답 없음")
+
+    window._set_hailo_health(error)
+    assert started == []  # one bad probe is not enough
+    clock["now"] += 60
+    window._set_hailo_health(error)
+    assert started == []
+    clock["now"] += 61
+    window._set_hailo_health(error)
+    assert started == [(True, 1)]  # 121 s of continuous error
+    assert window.model.can_show_final_ok is False
+
+    # Recovery brings it back: a healthy sample clears the pending error.
+    window._set_hailo_health(HailoHealthSnapshot(status="ok", summary="정상"))
+    clock["now"] += 300
+    window._set_hailo_health(error)
+    assert started == [(True, 1)]  # the clock restarted, so no immediate second attempt
+    window.close()
+
+
+def test_hailo_auto_recovery_is_off_without_settings_and_while_one_runs(monkeypatch):
+    from towersightai.inference.hailo_health import HailoHealthSnapshot
+    import towersightai.ui.pyqt_app as ui_module
+
+    _qt_app()
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(ui_module.time, "monotonic", lambda: clock["now"])
+    started: list[tuple] = []
+    monkeypatch.setattr(
+        OperatorWindow, "_start_hailo_recovery",
+        lambda self, *, automatic, attempt=0: started.append((automatic, attempt)),
+    )
+    # No settings at all: never auto-recover.
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=_settings().cameras))
+    error = HailoHealthSnapshot(status="error", summary="응답 없음")
+    for _ in range(10):
+        window._set_hailo_health(error)
+        clock["now"] += 60
+    assert started == []
+    window.close()
+
+    # A recovery already in flight must not be started again.
+    settings = _settings()
+    window = OperatorWindow(build_operator_display(state=ParkingState.IDLE, cameras=settings.cameras), settings)
+    window._hailo_recovery_running = True
+    for _ in range(10):
+        window._set_hailo_health(error)
+        clock["now"] += 60
+    assert started == []
+    assert window.model.can_show_final_ok is False
+    window.close()

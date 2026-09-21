@@ -310,6 +310,11 @@ class Settings:
     raw_storage: RawStorageConfig | dict | None = None
     ld2410: LD2410Config | dict | None = None
     vehicle_envelope: VehicleEnvelopeConfig | dict | None = None
+    # Hailo 장치가 error 로 이 시간 이상 지속되면 PCIe 재열거를 자동 시도한다(정비 동작).
+    hailo_auto_recovery_enabled: bool = True
+    hailo_auto_recovery_after_seconds: float = 120.0
+    hailo_auto_recovery_max_attempts: int = 3
+    hailo_auto_recovery_window_seconds: float = 3600.0
 
     def __post_init__(self) -> None:
         self.hailo_apps_workspace = self.hailo_apps_workspace.expanduser()
@@ -335,6 +340,14 @@ class Settings:
             self.vehicle_envelope = VehicleEnvelopeConfig()
         elif isinstance(self.vehicle_envelope, dict):
             self.vehicle_envelope = VehicleEnvelopeConfig(**self.vehicle_envelope)
+        for name, value in (
+            ("HAILO_AUTO_RECOVERY_AFTER_SECONDS", self.hailo_auto_recovery_after_seconds),
+            ("HAILO_AUTO_RECOVERY_WINDOW_SECONDS", self.hailo_auto_recovery_window_seconds),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.hailo_auto_recovery_max_attempts < 0:
+            raise ValueError("HAILO_AUTO_RECOVERY_MAX_ATTEMPTS must be zero or positive.")
         self._validate_safety_constraints()
 
     def _as_camera(self, camera: CameraConfig | dict) -> CameraConfig:

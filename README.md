@@ -179,6 +179,22 @@ NAS `hailo-incidents/<호스트>-<시각>/`에 올라갑니다. PCIe 링크 속�
 (`HAILO_INCIDENT_MIN_INTERVAL_SECONDS`). 끄려면 `HAILO_INCIDENT_UPLOAD_ENABLED=false`.
 수집은 **읽기 전용**이라 드라이버 재적재나 프로세스 종료 같은 조치는 하지 않습니다.
 
+**새 장비 최초 1회 — Hailo 장치 복구 등록** (안 하면 `시스템 점검`의 `Hailo 장치 복구` 버튼이 권한 없음으로 실패):
+
+```bash
+sudo tools/install_hailo_recover.sh
+sudo -n /usr/local/sbin/towersightai-hailo-recover --dry-run   # 확인
+```
+
+Hailo가 버스에서 떨어져 추론이 계속 실패하면 이 버튼으로 드라이버 재적재와 PCI 재열거를 수행합니다.
+AI 추론이 잠시 멈췄다가 자동으로 다시 시작되며, 복구에 성공해도 최종 OK는 계속 차단됩니다.
+
+같은 복구가 **자동으로도** 동작합니다. Hailo 상태가 `오류`로 2분 이상 이어지면 앱이 스스로 한 번
+시도하고, 한 시간에 최대 3회까지만 합니다. 계속 실패하면 더 시도하지 않고 사람이 보도록 남겨 둡니다.
+`run.sh`로 띄우든 자동 실행 서비스로 띄우든 동일하게 동작합니다. 끄려면 `.env`에
+`HAILO_AUTO_RECOVERY_ENABLED=false` 를 넣으세요. 간격과 횟수는 `HAILO_AUTO_RECOVERY_AFTER_SECONDS`,
+`HAILO_AUTO_RECOVERY_MAX_ATTEMPTS`, `HAILO_AUTO_RECOVERY_WINDOW_SECONDS` 로 조정합니다.
+
 **새 장비 최초 1회 — NAS 호스트 키 등록** (안 하면 `not found in known_hosts`로 업로드 실패):
 
 ```bash

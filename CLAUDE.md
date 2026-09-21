@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **472 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **489 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -460,7 +460,7 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 472 passed, hardware-free
+pytest -q                                     # 489 passed, hardware-free
 ./install_autorun.sh | ./start_autorun.sh | ./stop_autorun.sh | ./uninstall_autorun.sh  # 부팅 자동 실행 등록/시작/중지/해제
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
@@ -607,6 +607,21 @@ state, AI, or PLC contract exists for it yet.
   raw enhancement (`ld2410_sample` / `radar_window_*`) is deployed, radar episodes come only from
   `person_sample.ld2410` and are flagged `partial`. Days are keyed by `(source_host, day)`; host roles (현장/개발) live in `sites.json` and the dashboard
   shows field hosts only by default.
+- **Hailo auto-recovery**: the same re-enumerate also runs by itself once the health monitor has
+  reported `error` continuously for `HAILO_AUTO_RECOVERY_AFTER_SECONDS` (default 120 s).
+  `HailoAutoRecoveryPolicy` (pure, clock-injected) restarts that clock on every attempt and caps them
+  at `HAILO_AUTO_RECOVERY_MAX_ATTEMPTS` per `HAILO_AUTO_RECOVERY_WINDOW_SECONDS` (3 per hour), so a
+  dead M.2 or an unstable supply is never hidden by a retry storm. It lives inside the app, so any
+  launch path (`run.sh`, the autorun service) gets it; `HAILO_AUTO_RECOVERY_ENABLED=false` turns it off.
+  The incident bundle is uploaded when the status *first* turns error, before recovery changes the
+  device state, so evidence always survives.
+- **Hailo device recovery from the console**: `시스템 점검` has `Hailo 장치 복구`, which runs the PCIe
+  re-enumerate that used to be typed over SSH (`tools/hailo_recover.sh`: stop holders → `modprobe -r
+  hailo_pci` → PCI `remove` → `rescan` → `modprobe` → verify with `identify`). It needs one narrow sudoers
+  entry installed once per machine (`sudo tools/install_hailo_recover.sh`, which copies the script to a
+  root-owned `/usr/local/sbin/towersightai-hailo-recover` so the repo copy cannot become arbitrary root).
+  The UI stops inference first (the driver cannot unload while a child holds `/dev/hailo0`) and the usual
+  monitoring auto-start brings it back. Recovery is maintenance, never authorization: final OK stays blocked.
 - **Calibration results never go into git.** They travel over the NAS (`calibration/share.py`,
   `<folder>/calibration/<source_host>/<kind>/<camera>.json`). Each machine measures its own site, so a
   tracked result collides with the local file and makes `git pull` abort on the field device with

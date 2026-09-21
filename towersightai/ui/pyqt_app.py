@@ -42,6 +42,11 @@ from towersightai.inference.hailo_health import (
     log_hailo_health,
     make_subprocess_temp_probe,
 )
+from towersightai.inference.hailo_recovery import (
+    HailoAutoRecoveryPolicy,
+    RecoveryResult,
+    recover_hailo_device,
+)
 from towersightai.storage.hailo_incident import HailoIncidentReporter, IncidentReport
 from towersightai.runtime_logging import DEFAULT_RUNTIME_LOG, new_run_id
 from towersightai.state_machine.core import ParkingState
@@ -1069,6 +1074,17 @@ class IntrinsicsCalibrateWorker(QObject):
         self.finished.emit()
 
 
+class HailoRecoveryWorker(QObject):
+    """Run the PCIe re-enumerate recovery off the UI thread. Maintenance only, never authorization."""
+
+    result_ready = pyqtSignal(object)
+    finished = pyqtSignal()
+
+    def run(self) -> None:
+        self.result_ready.emit(recover_hailo_device())
+        self.finished.emit()
+
+
 class NasFileTransferWorker(QObject):
     """Upload operator-selected files into the NAS transfer folder off the UI thread.
 
@@ -1478,6 +1494,15 @@ class OperatorWindow(QMainWindow):
         self._hailo_health_workers: list[HailoHealthWorker] = []
         self._hailo_health_snapshot: HailoHealthSnapshot | None = None
         self._hailo_health_recorded_status = ""
+        self._hailo_recovery_threads: list[QThread] = []
+        self._hailo_recovery_workers: list[HailoRecoveryWorker] = []
+        self._hailo_recovery_running = False
+        self._hailo_auto_recovery = HailoAutoRecoveryPolicy(
+            enabled=settings.hailo_auto_recovery_enabled if settings is not None else False,
+            after_seconds=settings.hailo_auto_recovery_after_seconds if settings is not None else 120.0,
+            max_attempts=settings.hailo_auto_recovery_max_attempts if settings is not None else 0,
+            window_seconds=settings.hailo_auto_recovery_window_seconds if settings is not None else 3600.0,
+        )
         self._hailo_health_recorded_at: float | None = None
         # --- continuous parking-process engine (auto-started; PLC is simulated) ---
         self.operator_settings: OperatorRuntimeSettings = load_operator_settings()
@@ -1571,6 +1596,9 @@ class OperatorWindow(QMainWindow):
         for thread in self._system_test_threads:
             thread.quit()
             thread.wait(35000)
+        for thread in self._hailo_recovery_threads:
+            thread.quit()
+            thread.wait(95000)
         for thread in self._hailo_health_threads:
             thread.quit()
             thread.wait(15000)
@@ -2736,6 +2764,14 @@ class OperatorWindow(QMainWindow):
         )
         self.hailo_holder_kill_button.clicked.connect(self._terminate_hailo_holders)
         hailo_controls.addWidget(self.hailo_holder_kill_button)
+        self.hailo_recover_button = QPushButton("Hailo 장치 복구")
+        self.hailo_recover_button.setProperty("danger", "true")
+        self.hailo_recover_button.setToolTip(
+            "드라이버를 내렸다 올리고 PCI 장치를 재열거합니다. 실행 중인 AI 추론이 잠시 중단됩니다. "
+            "복구에 성공해도 안전 판정과 최종 OK에는 영향이 없습니다."
+        )
+        self.hailo_recover_button.clicked.connect(self._recover_hailo_device)
+        hailo_controls.addWidget(self.hailo_recover_button)
         hailo_controls.addStretch(1)
         body.addLayout(hailo_controls)
         self.system_test_log = QPlainTextEdit()
@@ -3160,7 +3196,24 @@ class OperatorWindow(QMainWindow):
         if hasattr(self, "hailo_holder_kill_button"):
             self.hailo_holder_kill_button.setEnabled(bool(snapshot.foreign_holders))
         self._record_hailo_health_row(snapshot)
+        self._consider_hailo_auto_recovery(snapshot)
 
+    def _consider_hailo_auto_recovery(self, snapshot: HailoHealthSnapshot) -> None:
+        """Re-enumerate a device that has been in error for long enough. Maintenance only.
+
+        The evidence bundle is already uploaded when the status first turns error, so recovery
+        never destroys the state a diagnosis needs.
+        """
+        if self._hailo_recovery_running:
+            return
+        decision = self._hailo_auto_recovery.observe(snapshot.status, time.monotonic())
+        if not decision.should_recover:
+            return
+        logging.getLogger("towersightai.hailo.recovery").warning(
+            "hailo-auto-recovery attempt=%s error-seconds=%.0f reason=%s",
+            decision.attempt, decision.error_seconds, decision.reason,
+        )
+        self._start_hailo_recovery(automatic=True, attempt=decision.attempt)
     def _record_hailo_health_row(self, snapshot: HailoHealthSnapshot) -> None:
         """Put the health snapshot in the daily JSONL so the NAS day carries the failure timeline.
 
@@ -3190,6 +3243,79 @@ class OperatorWindow(QMainWindow):
             self.system_test_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
         if hasattr(self, "hailo_health_label"):
             self.hailo_health_label.setText(self.hailo_health_label.text() + f"\n{message}")
+
+    def _recover_hailo_device(self, checked: bool = False) -> None:
+        """Reload the Hailo driver and re-enumerate the PCI device (the manual SSH recovery).
+
+        Stops inference first so the driver can be unloaded, then lets the usual monitoring
+        auto-start bring it back. Diagnostic/maintenance only: final OK stays blocked throughout.
+        """
+        del checked
+        if not self._operator_unlocked or self._hailo_recovery_running:
+            return
+        if not self._confirm_hailo_recovery():
+            return
+        self._start_hailo_recovery(automatic=False)
+
+    def _start_hailo_recovery(self, *, automatic: bool, attempt: int = 0) -> None:
+        """Shared path for the operator button and the automatic retry. Never authorizes anything."""
+        if self._hailo_recovery_running:
+            return
+        self._hailo_recovery_running = True
+        if hasattr(self, "hailo_recover_button"):
+            self.hailo_recover_button.setEnabled(False)
+        # The driver cannot be unloaded while a child holds /dev/hailo0.
+        self._stop_purpose_inference()
+        self._engine_last_start_attempt = time.monotonic()
+        origin = f"자동 복구 {attempt}회차" if automatic else "운영자 요청"
+        self._set_hailo_recovery_status(
+            f"Hailo 장치 복구 중({origin}): AI 추론을 멈추고 드라이버를 재적재합니다"
+        )
+        thread = QThread(self)
+        worker = HailoRecoveryWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result_ready.connect(self._set_hailo_recovery_result)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(
+            lambda worker=worker, thread=thread: self._cleanup_hailo_recovery_worker(thread, worker)
+        )
+        self._hailo_recovery_threads.append(thread)
+        self._hailo_recovery_workers.append(worker)
+        thread.start()
+
+    def _confirm_hailo_recovery(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Hailo 장치 복구",
+            "Hailo 드라이버를 내렸다 올리고 PCI 장치를 재열거합니다.\n"
+            "실행 중인 AI 추론이 중단되었다가 자동으로 다시 시작됩니다.\n"
+            "복구는 진단·정비 동작이며 최종 OK는 계속 차단됩니다. 계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer is QMessageBox.StandardButton.Yes
+
+    def _set_hailo_recovery_status(self, message: str) -> None:
+        self.warning_label.setText(f"{message}. 진단 전용이며 최종 OK는 차단됩니다.")
+        if hasattr(self, "system_test_log"):
+            self.system_test_log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+    def _set_hailo_recovery_result(self, result: RecoveryResult) -> None:
+        self._set_hailo_recovery_status(result.summary())
+        self.instruction_label.setText(
+            "Hailo 장치 복구 성공" if result.ok else "Hailo 장치 복구 실패"
+        )
+
+    def _cleanup_hailo_recovery_worker(self, thread: QThread, worker: HailoRecoveryWorker) -> None:
+        if thread in self._hailo_recovery_threads:
+            self._hailo_recovery_threads.remove(thread)
+        if worker in self._hailo_recovery_workers:
+            self._hailo_recovery_workers.remove(worker)
+        if not self._hailo_recovery_workers:
+            self._hailo_recovery_running = False
+            if hasattr(self, "hailo_recover_button"):
+                self.hailo_recover_button.setEnabled(True)
 
     def _terminate_hailo_holders(self, checked: bool = False) -> None:
         """Kill orphaned Hailo holders (never this app's own children). Diagnostic only."""

@@ -146,6 +146,16 @@ def settings_from_mapping(values: Mapping[str, str]) -> Settings:
         ui_camera_resolution=values.get("UI_CAMERA_RESOLUTION", "1280x720"),
         birdview_mode=values.get("BIRDVIEW_MODE", "ceiling"),
         vehicle_envelope=_vehicle_envelope_dict(values),
+        hailo_auto_recovery_enabled=_parse_bool(values.get("HAILO_AUTO_RECOVERY_ENABLED", "true")),
+        hailo_auto_recovery_after_seconds=_parse_float(
+            values.get("HAILO_AUTO_RECOVERY_AFTER_SECONDS", "120"), "HAILO_AUTO_RECOVERY_AFTER_SECONDS"
+        ),
+        hailo_auto_recovery_max_attempts=_parse_int(
+            values.get("HAILO_AUTO_RECOVERY_MAX_ATTEMPTS", "3"), "HAILO_AUTO_RECOVERY_MAX_ATTEMPTS"
+        ),
+        hailo_auto_recovery_window_seconds=_parse_float(
+            values.get("HAILO_AUTO_RECOVERY_WINDOW_SECONDS", "3600"), "HAILO_AUTO_RECOVERY_WINDOW_SECONDS"
+        ),
         ld2410={
             "enabled": _parse_bool(values.get("LD2410_TCP_ENABLED", "false")),
             "bind_host": values.get("LD2410_TCP_BIND_HOST", "0.0.0.0"),
