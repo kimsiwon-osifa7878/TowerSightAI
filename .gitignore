@@ -19,6 +19,9 @@ data/field-media/*
 # Calibration: the measurement *results* are small text and belong in version control so the
 # site device can get them with a pull. The capture sessions (hundreds of PNG frames) do not.
 data/calibration/intrinsics/sessions/
+# 캘리브레이션 결과는 git이 아니라 NAS로 공유한다(towersightai/calibration/share.py).
+# 저장소에 넣으면 장비마다 다른 현장 측정값과 충돌해 git pull이 막힌다.
+data/calibration/ground/
 data/calibration/**/*-verify.png
 data/calibration/checkerboard/
 data/analysis/
