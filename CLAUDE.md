@@ -38,7 +38,7 @@ RTSP URLs, credentials, or host paths into product code.
 - `docs/implementation/testing-strategy.md` manual checklist still names the legacy HEFs
   (`yolov5m_vehicles.hef`, `yolov5s_personface_reid.hef`) in the expected log content — the runtime uses
   `yolov8m.hef` with label filtering.
-- Current suite size: **450 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
+- Current suite size: **467 passed** (`pytest -q`, hardware-free). Update this figure when it drifts.
 
 ---
 
@@ -136,6 +136,7 @@ towersightai/
 
 tests/          # 450 hardware-free unit/UI/fake-data tests (conftest forces QT_QPA_PLATFORM=offscreen)
 tools/          # verify_operator_ui_screenshot.sh, verify_operator_ui_rotation.py
+*_autorun.sh    # boot autostart: systemd *user* service (GUI needs graphical-session.target)
 vehicle_box_test/  # 3D vehicle-box LAB (not a pytest suite, not imported by towersightai/)
 data/samples/   # sanitized sample images (test-car.png)
 docs/design/    # approved visual contracts (driver prototype, operator console proposals A/B)
@@ -459,7 +460,8 @@ sync when the engine returns to IDLE; `scheduled` keeps the day-granularity beha
 ## 9. Commands
 
 ```bash
-pytest -q                                     # 450 passed, hardware-free
+pytest -q                                     # 467 passed, hardware-free
+./install_autorun.sh | ./start_autorun.sh | ./stop_autorun.sh | ./uninstall_autorun.sh  # 부팅 자동 실행 등록/시작/중지/해제
 ./run.sh                                      # fullscreen operator UI (uses .venv + .env)
 ./run-window.sh                               # windowed
 towersightai-operator-ui --env .env --windowed

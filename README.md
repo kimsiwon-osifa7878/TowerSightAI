@@ -51,6 +51,27 @@ cp .env.example .env
 
 ## 2. 실행
 
+### 부팅 시 자동 실행 (권장)
+
+현장 장비가 재부팅되면 앱은 스스로 켜지지 않습니다. 아래 한 번으로 systemd 사용자 서비스에 등록하면
+데스크톱 세션이 뜰 때 자동으로 시작되고, 죽어도 10초 뒤 다시 살아납니다.
+
+```bash
+./install_autorun.sh     # 등록 (부팅 시 자동 실행)
+./start_autorun.sh       # 지금 시작
+./stop_autorun.sh        # 지금 중지 (등록은 유지)
+./uninstall_autorun.sh   # 등록 해제
+```
+
+자동 로그인이 꺼져 있으면 부팅해도 데스크톱 세션이 없어 화면이 뜨지 않습니다. `설정 > 사용자`에서
+자동 로그인을 켜 두세요. 상태와 로그는 이렇게 봅니다.
+
+```bash
+systemctl --user status towersightai.service
+journalctl --user -u towersightai.service -f
+```
+
+
 ```bash
 ./run.sh          # 현장 전체화면
 ./run-window.sh   # 개발/점검용 창모드
